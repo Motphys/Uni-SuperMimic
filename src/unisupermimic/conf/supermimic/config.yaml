@@ -36,6 +36,7 @@ algo:
   lr_decay_iters: 250000
   ckpt_every: 2000
   log_every: 50
+  log_backend: tensorboard
   amp: bf16
   compile: true
   test_hidden_dims: null

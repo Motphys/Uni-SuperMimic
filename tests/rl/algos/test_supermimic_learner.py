@@ -190,6 +190,7 @@ def _config() -> SuperMimicConfig:
         wm_only_iters=0,
         ckpt_every=1,
         log_every=1,
+        log_backend="no_print",
         amp="none",
         compile=False,
         test_hidden_dims=(8,),
