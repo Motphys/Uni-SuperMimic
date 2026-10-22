@@ -13,7 +13,6 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from unilab.rl.contracts.env import EnvProtocol
-from unilab.rl.logging.offpolicy import OffPolicyLogger
 
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
@@ -21,6 +20,7 @@ from unisupermimic.rl.contracts.supermimic import (
     State,
     get_supermimic_mdp,
 )
+from unisupermimic.rl.logging import SuperMimicLogger
 
 from . import networks
 from .geometry import unflatten_state
@@ -558,16 +558,12 @@ class SuperMimicLearner:
             self.load(resume)
         start_iteration = self.iteration
         self.stats = _empty_stats()
-        logger = OffPolicyLogger(
-            algo_name="SuperMimic",
+        logger = SuperMimicLogger(
+            env_name=type(self.env).__name__,
             max_iterations=self.cfg.iterations,
             num_envs=self.env.num_envs,
-            env_name=type(self.env).__name__,
-            obs_dim=self.mdp.obs_dim,
-            action_dim=self.mdp.num_joints,
             log_dir=str(self.log_dir),
             log_backend=self.cfg.log_backend,
-            refresh_per_second=1,
         )
         logger.start(status="Warming up...")
         try:
@@ -579,7 +575,6 @@ class SuperMimicLearner:
             if self.buffer.size < required_steps:
                 self.collect(required_steps - self.buffer.size)
             logger.log_buffer_fill(self.buffer.size, self.cfg.buffer_steps)
-            logger.log_collector(self.sim_steps, self.buffer.size)
             logger.start_training_timer()
 
             log_path = self.log_dir / "train_log.csv"
@@ -607,7 +602,6 @@ class SuperMimicLearner:
                     collect_steps = int(step_accumulator)
                     step_accumulator -= collect_steps
                     stats_mark = len(self.stats["r"])
-                    episode_mark = len(self.stats["ep_len"])
                     self.collect(collect_steps)
                     train_phase_start = time.time()
                     wm_loss = torch.zeros((), device=self.device)
@@ -616,11 +610,11 @@ class SuperMimicLearner:
                         wm_loss, wm_error = self.wm_update()
                     aggregate["wm"].append(wm_loss)
                     aggregate["wm8"].append(wm_error)
-                    metrics = {
-                        "Loss/aux_world_model": float(wm_loss),
-                        "Loss/aux_wm_err8": float(wm_error),
-                        "Loss/learning_rate": learning_rate,
-                    }
+                    pi_loss: float | None = None
+                    v_loss: float | None = None
+                    imag_rew: float | None = None
+                    pi_gradnorm: float | None = None
+                    imag_survival: float | None = None
                     if iteration >= self.cfg.wm_only_iters:
                         policy_loss, value_loss, imagined_reward, grad_norm, survival = (
                             self.policy_update()
@@ -630,15 +624,11 @@ class SuperMimicLearner:
                         aggregate["ir"].append(imagined_reward)
                         aggregate["gn"].append(grad_norm)
                         aggregate["surv"].append(survival)
-                        metrics.update(
-                            {
-                                "Loss/surrogate": float(policy_loss),
-                                "Loss/value": float(value_loss),
-                                "Loss/aux_imagined_reward": float(imagined_reward),
-                                "Loss/aux_imagined_survival": float(survival),
-                                "Train/actor_gradient_norm": float(grad_norm),
-                            }
-                        )
+                        pi_loss = float(policy_loss)
+                        v_loss = float(value_loss)
+                        imag_rew = float(imagined_reward)
+                        pi_gradnorm = float(grad_norm)
+                        imag_survival = float(survival)
                     train_time = time.time() - train_phase_start
                     self.iteration = iteration + 1
                     self.wall_time = time.time() - train_start
@@ -646,30 +636,32 @@ class SuperMimicLearner:
 
                     iter_rewards = self.stats["r"][stats_mark:]
                     mean_reward = self._mean(iter_rewards) if iter_rewards else None
-                    iter_ep_lens = self.stats["ep_len"][episode_mark:]
-                    if iter_ep_lens:
-                        logger.update_mean_episode_length(self._mean(iter_ep_lens))
-                        iter_term = sum(float(value) for value in self.stats["term"][episode_mark:])
-                        iter_done = sum(float(value) for value in self.stats["done"][episode_mark:])
-                        if iter_done > 0:
-                            logger.update_timeout_rate(1.0 - iter_term / iter_done)
-                    logger.log_collector(self.sim_steps, self.buffer.size)
+                    ep_len = self._mean(self.stats["ep_len"]) if self.stats["ep_len"] else None
+                    ep_ret_norm = self._mean(self.stats["ep_ret"]) if self.stats["ep_ret"] else None
+                    total_done = sum(float(value) for value in self.stats["done"])
+                    term_frac = (
+                        sum(float(value) for value in self.stats["term"]) / total_done
+                        if total_done > 0
+                        else None
+                    )
                     logger.log_step(
                         self.iteration,
-                        metrics=metrics,
-                        return_mean_ep100=mean_reward,
-                        reward_components=(
-                            {"tracking": mean_reward} if mean_reward is not None else None
-                        ),
-                        train_time=train_time,
+                        wm_loss=float(wm_loss),
+                        wm_err8=float(wm_error),
+                        pi_loss=pi_loss,
+                        v_loss=v_loss,
+                        imag_rew=imag_rew,
+                        imag_survival=imag_survival,
+                        pi_gradnorm=pi_gradnorm,
+                        lr=learning_rate,
+                        sim_rew=mean_reward,
+                        ep_len=ep_len,
+                        ep_ret_norm=ep_ret_norm,
+                        term_frac=term_frac,
+                        iter_sim_steps=collect_steps * self.env.num_envs,
+                        collect_time=train_phase_start - iteration_start,
+                        learn_time=train_time,
                         iteration_time=iteration_time,
-                        extra_info={
-                            "throughput_steps": collect_steps * self.env.num_envs,
-                            "batch_size_per_rank": self.cfg.wm_batch,
-                            "learner_replay_rows_per_iter": (
-                                self.cfg.wm_batches * self.cfg.wm_batch
-                            ),
-                        },
                     )
 
                     if self.iteration % self.cfg.log_every == 0:

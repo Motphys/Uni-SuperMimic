@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
 from unisupermimic.rl.contracts.supermimic import (
@@ -146,7 +147,13 @@ class FakeEnv:
             "f": current["f"].clone(),
             "ep_step": current["ep_step"].clone(),
             "done": done,
+            "term": torch.zeros_like(done),
         }
+        if bool(done.any()):
+            transition["ep_len"] = episode_steps[done].float()
+            transition["ep_ret_norm"] = reward[done] / (
+                episode_steps[done].float() * self.mdp.max_step_reward
+            )
         post_reset_state = next_state.clone()
         post_reset_state[done] = self.initial_state[done]
         post_reset_action = torch.where(done.unsqueeze(-1), torch.zeros_like(actions), actions)
@@ -294,3 +301,41 @@ def test_resume_rebuilds_warmup_history(tmp_path) -> None:
     resumed.train(resume=tmp_path / "last.pt")
 
     assert resumed.buffer.size == 6
+
+
+def test_tensorboard_backend_logs_real_metric_names(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), replace(_config(), log_backend="tensorboard"), tmp_path)
+    learner.train()
+
+    event_files = list(tmp_path.glob("events.out.tfevents.*"))
+    assert len(event_files) == 1
+    accumulator = EventAccumulator(str(tmp_path))
+    accumulator.Reload()
+    tags = set(accumulator.Tags()["scalars"])
+    expected = {
+        "Loss/world_model",
+        "Loss/world_model_err8",
+        "Loss/policy",
+        "Loss/value",
+        "Loss/imagined_reward",
+        "Loss/imagined_survival",
+        "Train/grad_norm",
+        "Train/learning_rate",
+        "Reward/sim_step_norm",
+        "Episode/length",
+        "Episode/return_norm",
+        "Episode/terminated_frac",
+        "Perf/iteration_time",
+        "Perf/collect_time",
+        "Perf/learning_time",
+        "Perf/it_per_s",
+        "Perf/sim_steps_per_s",
+    }
+    assert expected <= tags
+
+
+def test_no_print_backend_writes_no_events(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
+    learner.train()
+
+    assert not list(tmp_path.glob("events.out.tfevents.*"))
