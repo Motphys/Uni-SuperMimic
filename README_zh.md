@@ -58,6 +58,19 @@ uv run unisupermimic-train --help
 
 依赖变更后运行 `uv lock`。
 
+AMD ROCm 主机改用预生成的 ROCm lockfile 安装（同样的依赖钉版，torch 为
+ROCm 构建）：
+
+```bash
+make sync-rocm
+```
+
+CUDA-only 后端（mjwarp）在 ROCm 上不可用，请使用 MuJoCo host-bridge 后端
+训练（`task=g1_super_mimic/mujoco`）。`make sync-rocm` 会把
+`pyproject.toml`/`uv.lock` 换成 ROCm 配置档，切回默认配置档用
+`make sync-default`。维护者在依赖变更后用 `make lock-rocm` 重新生成
+ROCm lockfile。
+
 ### 准备资产
 
 ```bash

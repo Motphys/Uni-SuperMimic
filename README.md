@@ -58,6 +58,19 @@ uv run unisupermimic-train --help
 
 Run `uv lock` after changing dependencies.
 
+On AMD ROCm hosts, install from the pre-resolved ROCm lockfile instead (a ROCm
+PyTorch build with the same pinned dependency set):
+
+```bash
+make sync-rocm
+```
+
+CUDA-only backends (mjwarp) stay unsupported there; train with the MuJoCo
+host-bridge backend (`task=g1_super_mimic/mujoco`). `make sync-rocm` swaps
+`pyproject.toml`/`uv.lock` for the ROCm profile; run `make sync-default` to
+switch back. Maintainers regenerate the ROCm lockfile after dependency changes
+with `make lock-rocm`.
+
 ### Prepare Assets
 
 ```bash
