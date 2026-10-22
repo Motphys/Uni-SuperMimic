@@ -106,7 +106,11 @@ class SuperMimicLearner:
         self.device = torch.device(env.device)
         self.mdp = get_supermimic_mdp(env)
 
-        torch.backends.cuda.matmul.allow_tf32 = True
+        # TF32 only pays off for fp32 (amp="none") training: under bf16 autocast
+        # the heavy GEMMs already run in bf16, while on ROCm a TF32 bmm over the
+        # misaligned strided views produced by unflatten_state triggers per-call
+        # rocBLAS kernel selection costing ~100 ms per call.
+        torch.backends.cuda.matmul.allow_tf32 = cfg.amp == "none"
         torch.backends.cudnn.allow_tf32 = True
         torch.manual_seed(cfg.seed)
         networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
