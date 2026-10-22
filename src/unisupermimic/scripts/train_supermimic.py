@@ -11,10 +11,17 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 from unilab.base.config_adapter import EnvConfigAdapter, create_env
-from unilab.base.process_device import configure_backend_process_device
+from unilab.base.process_device import (
+    apply_collector_tensor_device_override,
+    configure_backend_process_device,
+)
 from unilab.training import ensure_registries, get_log_root, resolve_run_log_dir
 from unilab.training.experiment import write_run_config_snapshot
 from unilab.training.seed import apply_configured_training_seed
+from unilab.training.tensor_runtime import (
+    resolve_recorded_collector_tensor_device,
+    select_collector_tensor_device,
+)
 from unilab.utils.checkpoint import get_latest_run, normalize_checkpoint_value
 from unilab.utils.device import get_default_device
 
@@ -39,10 +46,18 @@ def build_learner_config(cfg: DictConfig) -> SuperMimicConfig:
     return SuperMimicConfig(**values)
 
 
-def build_env_override(cfg: DictConfig, *, eval_mode: bool = False) -> dict[str, Any]:
+def build_env_override(
+    cfg: DictConfig, *, eval_mode: bool = False, learner_device: str | None = None
+) -> dict[str, Any]:
     override: dict[str, Any] = EnvConfigAdapter(
         cfg, root_dir=Path.cwd(), algo_name="supermimic"
     ).build_task_env_cfg_override()
+    override = apply_collector_tensor_device_override(
+        override,
+        str(cfg.training.sim_backend),
+        collector_tensor_device=select_collector_tensor_device(cfg),
+        learner_device=learner_device,
+    )
     if not eval_mode:
         return override
     commands = dict(override["commands"])
@@ -110,6 +125,7 @@ def main(cfg: DictConfig) -> None:
         device = bound_device
     play_only = bool(cfg.training.play_only)
     checkpoint = resolve_supermimic_checkpoint(cfg) if play_only or cfg.algo.resume else None
+    env_override = build_env_override(cfg, eval_mode=play_only, learner_device=str(device))
     if play_only:
         assert checkpoint is not None
         resolve_sim2sim_config(
@@ -130,6 +146,9 @@ def main(cfg: DictConfig) -> None:
                 "task": str(cfg.training.task_name),
                 "sim_backend": str(cfg.training.sim_backend),
                 "device": str(device),
+                "collector_tensor_device": resolve_recorded_collector_tensor_device(
+                    str(cfg.training.sim_backend), env_override
+                ),
                 "seed": seed_info.to_dict(),
             },
             full_cfg=cfg,
@@ -141,7 +160,7 @@ def main(cfg: DictConfig) -> None:
         env = create_env(
             cfg,
             num_envs=_motion_count(cfg) if play_only else int(cfg.algo.num_envs),
-            env_cfg_override=build_env_override(cfg, eval_mode=play_only),
+            env_cfg_override=env_override,
         )
         if play_only:
             from unisupermimic.tasks.motion_tracking.g1.supermimic.evaluate import evaluate
