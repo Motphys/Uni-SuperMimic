@@ -99,6 +99,7 @@ class SuperMimicLearner:
         cfg: SuperMimicConfig,
         log_dir: str | Path,
         device: str | torch.device | None = None,
+        backend: str = "",
     ):
         if cfg.amp not in ("none", "bf16"):
             raise ValueError(f"amp must be 'none' or 'bf16', got {cfg.amp!r}")
@@ -109,6 +110,7 @@ class SuperMimicLearner:
 
         self.env = env
         self.cfg = cfg
+        self.backend = backend
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.env_device = torch.device(env.device)
@@ -586,6 +588,7 @@ class SuperMimicLearner:
         self.stats = _empty_stats()
         logger = SuperMimicLogger(
             env_name=type(self.env).__name__,
+            backend=self.backend,
             max_iterations=self.cfg.iterations,
             num_envs=self.env.num_envs,
             log_dir=str(self.log_dir),

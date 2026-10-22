@@ -180,7 +180,13 @@ def main(cfg: DictConfig) -> None:
             print(json.dumps(result, indent=2))
             return
 
-        learner = SuperMimicLearner(env, build_learner_config(cfg), log_dir, device=str(device))
+        learner = SuperMimicLearner(
+            env,
+            build_learner_config(cfg),
+            log_dir,
+            device=str(device),
+            backend=str(cfg.training.sim_backend),
+        )
         summary = learner.train(resume=checkpoint)
         print(json.dumps(summary, indent=2))
     finally:
