@@ -196,6 +196,17 @@ def _config() -> SuperMimicConfig:
     )
 
 
+def test_tf32_only_enabled_for_fp32_training(tmp_path) -> None:
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        SuperMimicLearner(FakeEnv(), _config(), tmp_path / "fp32")
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        SuperMimicLearner(FakeEnv(), replace(_config(), amp="bf16"), tmp_path / "bf16")
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
 
