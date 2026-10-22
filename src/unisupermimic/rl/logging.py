@@ -85,23 +85,25 @@ class SuperMimicLogger:
         self,
         *,
         env_name: str,
+        backend: str = "",
         max_iterations: int,
         num_envs: int,
         log_dir: str,
         log_backend: str = "tensorboard",
         refresh_per_second: int = 1,
     ) -> None:
-        backend = log_backend.lower()
-        if backend not in ("tensorboard", "none", "no_print"):
+        backend_mode = log_backend.lower()
+        if backend_mode not in ("tensorboard", "none", "no_print"):
             raise ValueError(
                 f"log_backend must be 'tensorboard', 'none', or 'no_print', got {log_backend!r}"
             )
         self.algo_name = "SuperMimic"
         self.env_name = env_name
+        self.backend = backend
         self.max_iterations = max_iterations
         self.num_envs = num_envs
 
-        self._no_print = backend == "no_print"
+        self._no_print = backend_mode == "no_print"
         self._unicode_console = _console_supports_unicode()
         self._console = Console(force_terminal=False if not self._unicode_console else None)
         self._interactive = self._console.is_terminal and not self._no_print
@@ -135,7 +137,7 @@ class SuperMimicLogger:
         self._tb_writer: Any | None = None
         self._finished = False
         self._closed = False
-        if backend == "tensorboard" and log_dir:
+        if backend_mode == "tensorboard" and log_dir:
             self._init_tensorboard(log_dir)
 
     def _init_tensorboard(self, log_dir: str) -> None:
@@ -461,6 +463,9 @@ class SuperMimicLogger:
         title.append(f" {self.algo_name} ", style="bold cyan")
         title.append("|", style="dim")
         title.append(f" {self.env_name} ", style="bold white")
+        if self.backend:
+            title.append("|", style="dim")
+            title.append(f" {self.backend} ", style="bold magenta")
         return Panel(
             Group(
                 self._progress,
@@ -506,7 +511,8 @@ class SuperMimicLogger:
             elapsed = time.time() - self._start_time if self._start_time else 0.0
             lines = [
                 "[bold green]Training complete[/]",
-                f"  Algo: [cyan]{self.algo_name}[/] | Env: [cyan]{self.env_name}[/]",
+                f"  Algo: [cyan]{self.algo_name}[/] | Env: [cyan]{self.env_name}[/]"
+                + (f" | Backend: [magenta]{self.backend}[/]" if self.backend else ""),
                 f"  Iterations: [yellow]{self._iteration}[/]/{self.max_iterations}",
                 f"  Wall time: [yellow]{_fmt_time(elapsed)}[/]",
             ]
