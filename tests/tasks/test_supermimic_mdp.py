@@ -213,6 +213,33 @@ def test_mdp_rejects_batched_default_joint_positions(library) -> None:
         MDP(kin, motion, torch.zeros(2, 29))
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_mdp_to_copies_tensors_without_touching_original(library) -> None:
+    kin, motion, mdp = library
+    assert mdp.to("cpu") is mdp
+    assert motion.to("cpu") is motion
+    assert kin.to("cpu") is kin
+
+    moved = mdp.to("mps")
+
+    assert moved is not mdp
+    assert moved.default_q.device.type == "mps"
+    assert moved.motion.root_p.device.type == "mps"
+    assert moved.motion.frame_bin.device.type == "mps"
+    assert moved.kin.off_p.device.type == "mps"
+    assert mdp.default_q.device.type == "cpu"
+    assert mdp.motion.root_p.device.type == "cpu"
+
+    frames = torch.tensor([0, 51, 102, 108], device="mps")
+    goal = moved.goal(frames, 2)
+    assert goal.device.type == "mps"
+    torch.testing.assert_close(goal.cpu(), mdp.goal(frames.cpu(), 2))
+    state = moved.motion.ref_state(frames)
+    zeros = torch.zeros(4, 29, device="mps")
+    reward = moved.reward(state, frames, zeros, zeros)
+    torch.testing.assert_close(reward.cpu(), torch.full((4,), 0.1), rtol=0, atol=2e-6)
+
+
 def test_perfect_tracking_reward_and_termination(library) -> None:
     _, motion, mdp = library
     frames = torch.tensor([0, 51, 102, 108])

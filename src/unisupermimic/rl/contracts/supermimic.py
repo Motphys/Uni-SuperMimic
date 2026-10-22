@@ -62,6 +62,10 @@ class SuperMimicMdpProtocol(Protocol):
 
     def valid_imagination_start(self, frames: torch.Tensor, horizon: int) -> torch.Tensor: ...
 
+    def to(self, device: str | torch.device) -> SuperMimicMdpProtocol:
+        """Return a copy on ``device`` for learner-side use off the env device."""
+        ...
+
 
 @runtime_checkable
 class SupportsSuperMimicProtocol(Protocol):

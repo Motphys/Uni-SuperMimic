@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 
 import torch
@@ -66,6 +67,18 @@ class G1Kinematics:
                 upper[index] = float(model.jnt_range[joint_id][1])
         self.q_lo = torch.tensor(lower, dtype=torch.float32, device=self.device)
         self.q_hi = torch.tensor(upper, dtype=torch.float32, device=self.device)
+
+    def to(self, device: str | torch.device) -> G1Kinematics:
+        """Return a copy on ``device``; the original instance is left untouched."""
+        device = torch.device(device)
+        if device == self.device:
+            return self
+        new = copy.copy(self)
+        new.device = device
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(new, name, value.to(device))
+        return new
 
     def forward(
         self,

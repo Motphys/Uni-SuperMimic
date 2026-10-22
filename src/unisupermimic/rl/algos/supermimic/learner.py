@@ -91,7 +91,13 @@ def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
 
 
 class SuperMimicLearner:
-    def __init__(self, env: EnvProtocol, cfg: SuperMimicConfig, log_dir: str | Path):
+    def __init__(
+        self,
+        env: EnvProtocol,
+        cfg: SuperMimicConfig,
+        log_dir: str | Path,
+        device: str | torch.device | None = None,
+    ):
         if cfg.amp not in ("none", "bf16"):
             raise ValueError(f"amp must be 'none' or 'bf16', got {cfg.amp!r}")
         if cfg.utd <= 0:
@@ -103,8 +109,15 @@ class SuperMimicLearner:
         self.cfg = cfg
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.device = torch.device(env.device)
-        self.mdp = get_supermimic_mdp(env)
+        self.env_device = torch.device(env.device)
+        self.device = self.env_device if device is None else torch.device(device)
+        # HOST_BRIDGE backends (e.g. MuJoCo) keep env tensors on CPU while the
+        # learner may run on an accelerator (MPS on macOS); when the two differ,
+        # the learner works on its own MDP copy and bridges tensors at the env
+        # boundary. On CUDA/ROCm the devices always match and nothing changes.
+        self._bridged = self.device != self.env_device
+        mdp = get_supermimic_mdp(env)
+        self.mdp = mdp.to(self.device) if self._bridged else mdp
 
         # TF32 only pays off for fp32 (amp="none") training: under bf16 autocast
         # the heavy GEMMs already run in bf16, while on ROCm a TF32 bmm over the
@@ -159,7 +172,13 @@ class SuperMimicLearner:
             json.dump(asdict(cfg), stream, indent=2)
 
     def _compile(self, function):
-        return torch.compile(function) if self.cfg.compile else function
+        if not self.cfg.compile:
+            return function
+        if self.device.type == "mps":
+            # Inductor Metal codegen is not usable on MPS; keep AOT graph
+            # capture without kernel generation.
+            return torch.compile(function, backend="aot_eager")
+        return torch.compile(function)
 
     def _make_world_model(self) -> WorldModel:
         kwargs = {
@@ -202,6 +221,8 @@ class SuperMimicLearner:
         if state is None:
             state = self.env.init_state()
         info: dict[str, torch.Tensor] = state.info[SUPERMIMIC_STATE_KEY]
+        if self._bridged:
+            info = {key: value.to(self.device) for key, value in info.items()}
         return info
 
     def _critic_input_dim(self) -> int:
@@ -297,8 +318,13 @@ class SuperMimicLearner:
             self.pi.goal_norm.update(goal)
             action = self.pi(self.obs_hist, goal)
             action = torch.clamp(action + self.cfg.action_noise * torch.randn_like(action), -20, 20)
-            step_state = self.env.step(action)
+            if self._bridged:
+                step_state = self.env.step(action.to(self.env_device))
+            else:
+                step_state = self.env.step(action)
             transition = step_state.info[SUPERMIMIC_TRANSITION_KEY]
+            if self._bridged:
+                transition = {key: value.to(self.device) for key, value in transition.items()}
             self.buffer.add(transition)
             initial = unflatten_state(transition["s"])
             next_state = unflatten_state(transition["s1"])

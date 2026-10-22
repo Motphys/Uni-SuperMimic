@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import math
 import os
@@ -132,6 +133,18 @@ class MotionLib:
             start = bin_start[bin_index]
             end = min(start + BIN_FRAMES, int(self.clip_end[clip]) + 1)
             self.frame_bin[start:end] = bin_index
+
+    def to(self, device: str | torch.device) -> MotionLib:
+        """Return a copy on ``device``; the original instance is left untouched."""
+        device = torch.device(device)
+        if device == self.device:
+            return self
+        new = copy.copy(self)
+        new.device = device
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(new, name, value.to(device))
+        return new
 
     def future_frames(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Return frames+1 through frames+K, clamped at each clip's last frame."""
