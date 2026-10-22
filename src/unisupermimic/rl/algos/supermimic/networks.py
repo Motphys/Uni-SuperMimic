@@ -77,7 +77,10 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Run an MLP under optional autocast, returning fp32 for state arithmetic."""
     if AMP_DTYPE is None:
         return net(x)
-    with torch.autocast("cuda", dtype=AMP_DTYPE):
+    device_type = x.device.type
+    if device_type not in ("cuda", "mps"):
+        return net(x)
+    with torch.autocast(device_type, dtype=AMP_DTYPE):
         return net(x).float()
 
 

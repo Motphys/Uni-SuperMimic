@@ -71,6 +71,10 @@ class FakeMdp:
         del horizon
         return torch.ones_like(frames, dtype=torch.bool)
 
+    def to(self, device: str | torch.device) -> FakeMdp:
+        self.moved_to = torch.device(device)
+        return self
+
 
 @dataclass
 class FakeState:
@@ -236,6 +240,38 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     ):
         assert metric.ndim == 0
         assert torch.isfinite(metric)
+
+
+def test_matching_explicit_device_disables_bridging(tmp_path) -> None:
+    env = FakeEnv()
+    learner = SuperMimicLearner(env, _config(), tmp_path, device="cpu")
+
+    assert learner._bridged is False
+    assert learner.mdp is env.mdp
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_bridged_learner_moves_training_to_mps(tmp_path) -> None:
+    env = FakeEnv()
+    learner = SuperMimicLearner(env, _config(), tmp_path, device="mps")
+
+    assert learner._bridged is True
+    assert learner.device == torch.device("mps")
+    assert learner.mdp.moved_to == torch.device("mps")
+
+    learner.collect(3)
+    wm_loss, _ = learner.wm_update()
+    policy_loss, value_loss, imagined_reward, grad_norm, survival = learner.policy_update()
+
+    assert learner.buffer.data["s"].device.type == "mps"
+    assert learner.obs_hist.device.type == "mps"
+    for metric in (wm_loss, policy_loss, value_loss, imagined_reward, grad_norm, survival):
+        assert metric.ndim == 0
+        assert torch.isfinite(metric)
+    # The env stays on its own device across the bridge.
+    assert env.state is not None
+    current = env.state.info[SUPERMIMIC_STATE_KEY]
+    assert current["s"].device.type == "cpu"
 
 
 def test_checkpoint_roundtrip_and_resume(tmp_path) -> None:

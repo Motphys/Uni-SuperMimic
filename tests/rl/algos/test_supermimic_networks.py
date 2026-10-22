@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
-from unisupermimic.rl.algos.supermimic.networks import Critic, Policy, RunningNorm, WorldModel
+from unisupermimic.rl.algos.supermimic import networks
+from unisupermimic.rl.algos.supermimic.networks import (
+    Critic,
+    Policy,
+    RunningNorm,
+    WorldModel,
+    mlp,
+    run_mlp,
+)
 from unisupermimic.rl.contracts.supermimic import State
 
 
@@ -109,3 +119,35 @@ def test_policy_and_critic_shapes_and_dtypes() -> None:
     assert value.shape == (batch_size,)
     assert action.dtype == value.dtype == torch.float32
     assert torch.count_nonzero(policy.dec[-1].bias) == 0
+
+
+def test_run_mlp_autocast_follows_input_device() -> None:
+    net = mlp(4, (8,), 1)
+    x = torch.randn(3, 4)
+    previous = networks.AMP_DTYPE
+    try:
+        networks.AMP_DTYPE = torch.bfloat16
+        with warnings.catch_warnings():
+            # CPU inputs must skip autocast silently (no "Disabling autocast").
+            warnings.simplefilter("error")
+            out = run_mlp(net, x)
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, net(x))
+    finally:
+        networks.AMP_DTYPE = previous
+
+
+def test_run_mlp_autocasts_on_mps() -> None:
+    if not torch.backends.mps.is_available():
+        return
+    net = mlp(4, (8,), 1).to("mps")
+    x = torch.randn(3, 4, device="mps")
+    previous = networks.AMP_DTYPE
+    try:
+        networks.AMP_DTYPE = torch.bfloat16
+        out = run_mlp(net, x)
+        assert out.dtype == torch.float32
+        assert out.device.type == "mps"
+        torch.testing.assert_close(out.cpu(), net.cpu()(x.cpu()), rtol=2e-2, atol=2e-3)
+    finally:
+        networks.AMP_DTYPE = previous

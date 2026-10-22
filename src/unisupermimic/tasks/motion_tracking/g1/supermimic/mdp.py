@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -93,6 +94,18 @@ class MDP:
         device = default_q.device
         self.obs_noise = OBS_NOISE.to(device)
         self.obs_scale = OBS_SCALE.to(device)
+
+    def to(self, device: str | torch.device) -> MDP:
+        """Return a copy on ``device``; the original instance is left untouched."""
+        device = torch.device(device)
+        if device == self.default_q.device:
+            return self
+        new = copy.copy(self)
+        new.kin = self.kin.to(device)
+        new.motion = self.motion.to(device)
+        for name in ("default_q", "soft_lo", "soft_hi", "obs_noise", "obs_scale"):
+            setattr(new, name, getattr(self, name).to(device))
+        return new
 
     def obs(
         self,
