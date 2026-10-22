@@ -276,13 +276,16 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
         algo_name="supermimic",
         strict=bool(cfg.training.sim2sim_strict),
     )
-    configure_backend_process_device(str(cfg.training.sim_backend), get_default_device())
+    device = get_default_device()
+    bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)
+    if bound_device is not None:
+        device = bound_device
     return cast(
         "SuperMimicManagerBasedRlEnv",
         create_env(
             cfg,
             num_envs=len(cfg.env.commands.motion.motion_files),
-            env_cfg_override=build_env_override(cfg, eval_mode=True),
+            env_cfg_override=build_env_override(cfg, eval_mode=True, learner_device=device),
         ),
     )
 

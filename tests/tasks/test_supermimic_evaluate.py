@@ -360,7 +360,9 @@ def test_make_eval_env_composes_backend_owner(monkeypatch, tmp_path, backend: st
     monkeypatch.setattr(training, "ensure_registries", lambda: None)
     monkeypatch.setattr(device, "get_default_device", lambda: "cpu")
     monkeypatch.setattr(
-        train, "build_env_override", lambda cfg, eval_mode: {"eval_mode": eval_mode}
+        train,
+        "build_env_override",
+        lambda cfg, eval_mode, learner_device=None: {"eval_mode": eval_mode},
     )
     monkeypatch.setattr(sim2sim, "resolve_sim2sim_config", lambda *args, **kwargs: cfg)
 

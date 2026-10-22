@@ -43,6 +43,7 @@ algo:
 training:
   task_name: G1SuperMimic
   sim_backend: mjwarp
+  collector_tensor_device: auto
   play_only: false
   no_play: true
   sim2sim_strict: true

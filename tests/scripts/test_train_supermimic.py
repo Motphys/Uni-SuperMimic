@@ -92,6 +92,37 @@ def test_eval_override_only_changes_evaluation_lifecycle() -> None:
     assert cfg.env.commands.motion.reset_noise is True
 
 
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [("mujoco", "cuda:3"), ("motrix", "cuda:3"), ("mjwarp", None)],
+)
+def test_collector_tensor_device_auto_follows_learner_device(
+    backend: str, expected: str | None
+) -> None:
+    override = build_env_override(_compose(backend), learner_device="cuda:3")
+
+    assert override.get("collector_tensor_device") == expected
+
+
+def test_collector_tensor_device_auto_routes_cpu_learner_to_cpu() -> None:
+    override = build_env_override(_compose("mujoco"), learner_device="cpu")
+
+    assert override["collector_tensor_device"] == "cpu"
+
+
+def test_collector_tensor_device_auto_is_noop_without_learner_device() -> None:
+    assert "collector_tensor_device" not in build_env_override(_compose("mujoco"))
+
+
+def test_collector_tensor_device_explicit_training_value_wins() -> None:
+    cfg = _compose("mujoco")
+    OmegaConf.update(cfg, "training.collector_tensor_device", "cuda")
+
+    override = build_env_override(cfg, learner_device="cpu")
+
+    assert override["collector_tensor_device"] == "cuda"
+
+
 def test_training_rejects_mismatched_mdp_discount() -> None:
     cfg = _compose()
     OmegaConf.update(cfg, "algo.gamma", 0.98)
