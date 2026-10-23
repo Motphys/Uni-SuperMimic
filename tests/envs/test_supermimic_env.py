@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 import torch
 from hydra.utils import instantiate
@@ -49,15 +50,38 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.robot import (
 )
 
 
-def _write_runtime_clip(path: Path) -> None:
+def _quat_mul_xyzw(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return np.array(
+        (
+            lx * rw + lw * rx + ly * rz - lz * ry,
+            ly * rw + lw * ry + lz * rx - lx * rz,
+            lz * rw + lw * rz + lx * ry - ly * rx,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+    )
+
+
+def _write_runtime_clip(path: Path, *, rotating: bool = False) -> None:
+    # A yaw rate after a fixed roll makes reference angular velocity nontrivial
+    # in both world and root/body frames, exposing frame-convention mistakes.
+    roll_quat = np.array((np.sin(0.1), 0.0, 0.0, np.cos(0.1)))
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
-        for _ in range(62):
-            writer.writerow([0.0, 0.0, 0.76, 0.0, 0.0, 0.0, 1.0, *default_joint_pos_list()])
+        for frame in range(62):
+            yaw = 0.2 + (0.003 * frame if rotating else 0.0)
+            yaw_quat = np.array((0.0, 0.0, np.sin(yaw / 2), np.cos(yaw / 2)))
+            quaternion = _quat_mul_xyzw(yaw_quat, roll_quat)
+            writer.writerow([0.0, 0.0, 0.76, *quaternion, *default_joint_pos_list()])
 
 
 def _runtime_cfg(
-    tmp_path: Path, *, eval_mode: bool = False, backend: str = "mjwarp"
+    tmp_path: Path,
+    *,
+    eval_mode: bool = False,
+    backend: str = "mjwarp",
+    rotating_clip: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
@@ -67,7 +91,7 @@ def _runtime_cfg(
 
     root = Path(__file__).parents[2]
     clip_path = tmp_path / "motion.csv"
-    _write_runtime_clip(clip_path)
+    _write_runtime_clip(clip_path, rotating=rotating_clip)
     registry.ensure_registries()
     GlobalHydra.instance().clear()
     with initialize_config_dir(
@@ -734,7 +758,9 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
 ) -> None:
     _require_backend_runtime(backend_name)
     env = make_supermimic_env(
-        _runtime_cfg(tmp_path, eval_mode=True, backend=backend_name),
+        # A rotating reference distinguishes world-frame motion angular velocity
+        # from MuJoCo's body-frame free-root qvel representation.
+        _runtime_cfg(tmp_path, eval_mode=True, backend=backend_name, rotating_clip=True),
         num_envs=2,
         backend_type=backend_name,
     )
