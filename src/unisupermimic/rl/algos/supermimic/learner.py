@@ -590,6 +590,8 @@ class SuperMimicLearner:
             env_name=type(self.env).__name__,
             backend=self.backend,
             max_iterations=self.cfg.iterations,
+            wm_only_iters=self.cfg.wm_only_iters,
+            start_iteration=start_iteration,
             num_envs=self.env.num_envs,
             log_dir=str(self.log_dir),
             log_backend=self.cfg.log_backend,

@@ -32,6 +32,20 @@ _SPARKLINE_TICKS = "▁▂▃▄▅▆▇█"
 _SPARKLINE_ASCII_TICKS = " .:-=+*#%@"
 _RATE_WINDOW = 50
 
+_PHASE_PREFILL = "prefill"
+_PHASE_WM = "wm"
+_PHASE_JOINT = "joint"
+_PHASE_LABELS = {_PHASE_WM: "WM-only", _PHASE_JOINT: "Joint"}
+
+
+def _device_info_line() -> str:
+    try:
+        from unilab.utils.device import get_device_info_line
+
+        return str(get_device_info_line())
+    except Exception:
+        return ""
+
 
 def _fmt_time(seconds: float) -> str:
     if seconds < 60:
@@ -87,6 +101,8 @@ class SuperMimicLogger:
         env_name: str,
         backend: str = "",
         max_iterations: int,
+        wm_only_iters: int = 0,
+        start_iteration: int = 0,
         num_envs: int,
         log_dir: str,
         log_backend: str = "tensorboard",
@@ -102,6 +118,8 @@ class SuperMimicLogger:
         self.backend = backend
         self.max_iterations = max_iterations
         self.num_envs = num_envs
+        self.wm_only_iters = min(max(int(wm_only_iters), 0), max_iterations)
+        self._device_info = _device_info_line()
 
         self._no_print = backend_mode == "no_print"
         self._unicode_console = _console_supports_unicode()
@@ -114,6 +132,7 @@ class SuperMimicLogger:
         self._start_time = 0.0
         self._iteration = 0
         self._status = ""
+        self._phase = _PHASE_PREFILL
         self._metrics: dict[str, float | None] = {key: None for key, _ in _METRIC_LABELS}
         self._reward_history: deque[float] = deque(maxlen=200)
         self._ep_len: float | None = None
@@ -124,15 +143,44 @@ class SuperMimicLogger:
         self._iteration_time = 0.0
         self._iteration_times: deque[float] = deque(maxlen=_RATE_WINDOW)
         self._iteration_steps: deque[int] = deque(maxlen=_RATE_WINDOW)
+        self._phase_times: dict[str, deque[float]] = {
+            _PHASE_WM: deque(maxlen=_RATE_WINDOW),
+            _PHASE_JOINT: deque(maxlen=_RATE_WINDOW),
+        }
         self._last_save = ""
 
+        # One bar per training phase, each with its own ETA: the WM-only and
+        # joint phases have very different per-iteration costs, so a single
+        # shared bar/ETA is misleading. Buffer prefill stays a status line.
         self._progress = Progress(
-            TextColumn("[yellow]iter {task.completed}/{task.total}"),
+            TextColumn("[yellow]{task.description} {task.completed}/{task.total}"),
             BarColumn(bar_width=None),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[magenta]{task.fields[eta]}"),
             expand=True,
         )
-        self._progress_task = self._progress.add_task("iter", total=max_iterations)
+        wm_total = self.wm_only_iters
+        joint_total = max_iterations - self.wm_only_iters
+        self._wm_task = (
+            self._progress.add_task(
+                _PHASE_LABELS[_PHASE_WM],
+                total=wm_total,
+                completed=min(start_iteration, wm_total),
+                eta="",
+            )
+            if wm_total > 0
+            else None
+        )
+        self._joint_task = (
+            self._progress.add_task(
+                _PHASE_LABELS[_PHASE_JOINT],
+                total=joint_total,
+                completed=max(start_iteration - self.wm_only_iters, 0),
+                eta="",
+            )
+            if joint_total > 0
+            else None
+        )
 
         self._tb_writer: Any | None = None
         self._finished = False
@@ -167,6 +215,8 @@ class SuperMimicLogger:
                 )
                 self._live.start(refresh=True)
         else:
+            if self._device_info:
+                self._console.print(self._device_info, style="dim")
             self._console.print(status, style="dim")
 
     def start_training_timer(self) -> float:
@@ -236,11 +286,27 @@ class SuperMimicLogger:
         self._collect_time = collect_time
         self._learn_time = learn_time
         self._iteration_time = iteration_time
+        # `iteration` is the 1-based completed count; the 0-based loop counter
+        # enters the joint phase at cfg.wm_only_iters.
+        phase = _PHASE_JOINT if iteration > self.wm_only_iters else _PHASE_WM
+        self._phase = phase
         if iteration_time > 0:
             self._iteration_times.append(iteration_time)
             self._iteration_steps.append(iter_sim_steps)
-        self._status = "Training"
-        self._progress.update(self._progress_task, completed=iteration)
+            self._phase_times[phase].append(iteration_time)
+        self._status = _PHASE_LABELS[phase]
+        if self._wm_task is not None:
+            self._progress.update(
+                self._wm_task,
+                completed=min(iteration, self.wm_only_iters),
+                eta=self._phase_eta(_PHASE_WM),
+            )
+        if self._joint_task is not None:
+            self._progress.update(
+                self._joint_task,
+                completed=max(iteration - self.wm_only_iters, 0),
+                eta=self._phase_eta(_PHASE_JOINT),
+            )
 
         scalars: dict[str, float] = {
             "Loss/world_model": wm_loss,
@@ -283,12 +349,19 @@ class SuperMimicLogger:
         total = sum(self._iteration_times)
         return sum(self._iteration_steps) / total if total > 0 else 0.0
 
-    def _estimate_eta(self) -> str:
-        if self._iteration <= 0 or not self._iteration_times:
+    def _phase_eta(self, phase: str) -> str:
+        """ETA for one phase from that phase's own iteration times."""
+        if phase == _PHASE_WM:
+            remaining = self.wm_only_iters - min(self._iteration, self.wm_only_iters)
+        else:
+            remaining = self.max_iterations - max(self._iteration, self.wm_only_iters)
+        if remaining <= 0:
+            return "done"
+        times = self._phase_times[phase]
+        if not times:
             return ""
-        mean_iter = sum(self._iteration_times) / len(self._iteration_times)
-        remaining = max(self.max_iterations - self._iteration, 0)
-        return _fmt_time(mean_iter * remaining)
+        mean_iter = sum(times) / len(times)
+        return f"ETA {_fmt_time(mean_iter * remaining)}"
 
     def _write_tb_scalars(self, scalars: list[tuple[str, Any]], global_step: int) -> None:
         """Write one iteration's scalars as a single event record.
@@ -347,9 +420,10 @@ class SuperMimicLogger:
         fields: list[tuple[str, str]] = [
             (f"{'⏱' if self._unicode_console else 'time'} {_fmt_time(elapsed)}", "green"),
         ]
-        eta = self._estimate_eta()
-        if eta:
-            fields.append((f"ETA {eta}", "bold magenta"))
+        if self._phase in _PHASE_LABELS:
+            eta = self._phase_eta(self._phase)
+            if eta:
+                fields.append((f"{_PHASE_LABELS[self._phase]} {eta}", "bold magenta"))
         if self._it_per_s > 0:
             fields.append((f"{self._it_per_s:.2f} it/s", "bold green"))
         if self._sim_steps_per_s > 0:
@@ -466,15 +540,22 @@ class SuperMimicLogger:
         if self.backend:
             title.append("|", style="dim")
             title.append(f" {self.backend} ", style="bold magenta")
-        return Panel(
-            Group(
-                self._progress,
-                self._build_header(),
+        rows = [
+            self._progress,
+            self._build_header(),
+        ]
+        if self._device_info:
+            rows.append(Text(self._device_info, style="dim", no_wrap=True, overflow="ellipsis"))
+        rows.extend(
+            [
                 Text(""),
                 grid,
                 Text(""),
                 self._build_timing_table(),
-            ),
+            ]
+        )
+        return Panel(
+            Group(*rows),
             title=title,
             border_style="bright_blue",
             padding=(0, 1),
@@ -516,6 +597,8 @@ class SuperMimicLogger:
                 f"  Iterations: [yellow]{self._iteration}[/]/{self.max_iterations}",
                 f"  Wall time: [yellow]{_fmt_time(elapsed)}[/]",
             ]
+            if self._device_info:
+                lines.append(f"  [dim]{self._device_info}[/]")
             final = ", ".join(
                 f"{label}={_fmt_number(value)}"
                 for key, label in _METRIC_LABELS
