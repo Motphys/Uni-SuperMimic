@@ -373,10 +373,7 @@ class SuperMimicCommand(CommandTerm):
                 selected_q,
             )
         q = torch.clamp(q, self.kin.q_lo, self.kin.q_hi)
-        # MuJoCo free-root qvel stores angular velocity in the root/body frame,
-        # while SuperMimic motion state and UniLab root-state consumers use world.
-        w_local = (rotation.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
-        root_state = torch.cat((p + self._env_origins, mat_to_quat(rotation), v, w_local), dim=-1)
+        root_state = torch.cat((p + self._env_origins, mat_to_quat(rotation), v, w), dim=-1)
         self.robot.write_motion_state_tensor_to_sim(
             root_state=root_state,
             position=q,
