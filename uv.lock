@@ -3382,7 +3382,7 @@ wheels = [
 
 [[package]]
 name = "unilab"
-version = "1.5.0"
+version = "1.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3417,9 +3417,9 @@ dependencies = [
     { name = "viser" },
     { name = "wandb" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/7b/b4a70ae7df33b83cdd415e7887b009edeffe73fd014c5c9d41e8c53b9584/unilab-1.5.0.tar.gz", hash = "sha256:13cde0defe41882236f2deab719d94543cfc5b5f6785b98f25d0435e82fbeb14", size = 756605, upload-time = "2026-10-22T04:00:10.4Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/1a/54b7024b01758748b40a4871a0662c53de566808d77f952fb7c9c760ca46/unilab-1.5.1.tar.gz", hash = "sha256:2bc7c0c7fe878e74d3c4ff9145151109275776f566916309410b452a22571c9e", size = 761659, upload-time = "2026-10-24T07:39:56.618Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/e2/7d8ef3f610a30160b6aa2c3f13692f78e3359cf4959149e409c2025b107c/unilab-1.5.0-py3-none-any.whl", hash = "sha256:c7a3a2a5e7829f541eafaa86edc71370300d01501412a98cf57b9bfef3f36a09", size = 887504, upload-time = "2026-10-22T04:00:08.237Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/e0/78d294e08599e22a6e832d3cabe22b251cfe820e65826cdc77d986b7416f/unilab-1.5.1-py3-none-any.whl", hash = "sha256:8aebd8ed11e8a58562200c9083b9de351ac64b77306f42dd6fb10e9f3c194e01", size = 892695, upload-time = "2026-10-24T07:39:55.016Z" },
 ]
 
 [package.optional-dependencies]
@@ -3437,14 +3437,17 @@ mujoco = [
 
 [[package]]
 name = "unisim-core"
-version = "2.1.0"
+version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8e/54/8bbfa4f671b4c26002983afeb88f24e548816de3ccb29112ac4b8ca9ae66/unisim_core-2.1.0.tar.gz", hash = "sha256:4353d0e01214954181a30b6e00442cf3f5e3bb45fba551cee2e6f35440db1d2d", size = 699562, upload-time = "2026-10-21T14:47:45.451Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/dc/5c8b56a04996cc3f47767ac4c3c665c0eae131a188f1554525ff7514a9ed/unisim_core-2.1.1.tar.gz", hash = "sha256:f3c9bc2497b3ef85ec984cf38f8a8ce5cfd24b900db2734685575c5bb8cef2ed", size = 699580, upload-time = "2026-10-22T10:26:44.017Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/99/b532c452a8544eb508ff3b6009146aa24f44e09c5c43e63aaf46153b8490/unisim_core-2.1.1-py3-none-any.whl", hash = "sha256:fee2dcecb8ceb60ee2532a9e7d15f66daf1c1213d990fe4a607aef92130f6bf2", size = 746595, upload-time = "2026-10-22T10:26:42.255Z" },
+]
 
 [package.optional-dependencies]
 motrix = [
@@ -3477,7 +3480,7 @@ requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37" },
     { name = "mujoco", specifier = "~=3.11.0" },
     { name = "pillow", specifier = ">=10" },
-    { name = "unilab", extras = ["mjwarp", "mujoco", "motrix"], specifier = ">=1.5.0" },
+    { name = "unilab", extras = ["mjwarp", "mujoco", "motrix"], specifier = ">=1.5.1" },
 ]
 
 [package.metadata.requires-dev]
