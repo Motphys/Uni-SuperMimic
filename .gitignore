@@ -15,6 +15,7 @@ dist/
 logs/
 runs/
 outputs/
+/data/
 *.pt
 src/unisupermimic/assets/robots/g1/assets/
 src/unisupermimic/assets/motions/

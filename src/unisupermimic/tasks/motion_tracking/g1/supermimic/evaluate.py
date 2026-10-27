@@ -262,7 +262,7 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
     from unilab.utils.device import get_default_device
 
     import unisupermimic
-    from unisupermimic.scripts.train_supermimic import build_env_override
+    from unisupermimic.scripts.train_supermimic import _motion_count, build_env_override
     from unisupermimic.sim2sim import resolve_sim2sim_config
 
     config_dir = Path(unisupermimic.__file__).resolve().parent / "conf" / "supermimic"
@@ -284,7 +284,7 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
         "SuperMimicManagerBasedRlEnv",
         create_env(
             cfg,
-            num_envs=len(cfg.env.commands.motion.motion_files),
+            num_envs=_motion_count(cfg),
             env_cfg_override=build_env_override(cfg, eval_mode=True, learner_device=device),
         ),
     )
