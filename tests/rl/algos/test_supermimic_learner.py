@@ -375,3 +375,42 @@ def test_no_print_backend_writes_no_events(tmp_path) -> None:
     learner.train()
 
     assert not list(tmp_path.glob("events.out.tfevents.*"))
+
+
+def test_nonfinite_actor_metric_aborts_before_checkpoint(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
+    learner.policy_update = lambda: (
+        torch.tensor(float("nan")),
+        torch.zeros(()),
+        torch.zeros(()),
+        torch.zeros(()),
+        torch.ones(()),
+    )
+    with pytest.raises(FloatingPointError, match="non-finite pi_loss"):
+        learner.train()
+    assert not (tmp_path / "last.pt").exists()
+
+
+def test_nonfinite_world_model_metric_aborts_before_checkpoint(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
+    learner.wm_update = lambda: (torch.tensor(float("nan")), torch.zeros(()))
+    with pytest.raises(FloatingPointError, match="non-finite wm_loss"):
+        learner.train()
+    assert not (tmp_path / "last.pt").exists()
+
+
+def test_early_nonfinite_world_model_batch_cannot_be_masked_by_later_batches(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), replace(_config(), wm_batches=2), tmp_path)
+    calls = 0
+
+    def wm_update() -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        return torch.tensor(float("nan") if calls == 1 else 0.0), torch.zeros(())
+
+    learner.wm_update = wm_update
+    with pytest.raises(FloatingPointError, match="non-finite wm_loss"):
+        learner.train()
+    assert calls == 1
+    assert not (tmp_path / "ckpt_000001.pt").exists()
+    assert not (tmp_path / "last.pt").exists()

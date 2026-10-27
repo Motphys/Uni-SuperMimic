@@ -114,8 +114,8 @@ class MotionLib:
             )
 
         root_rotation_t = self.root_R.transpose(-1, -2)
-        self.root_v_local = (root_rotation_t @ self.root_v.unsqueeze(-1)).squeeze(-1)
-        self.root_w_local = (root_rotation_t @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        self.root_v_local = (root_rotation_t * self.root_v.unsqueeze(-2)).sum(-1)
+        self.root_w_local = (root_rotation_t * self.root_w.unsqueeze(-2)).sum(-1)
         self.root_gz = self.root_R[:, 2, 2]
 
         bin_clip, bin_start = [], []
@@ -157,10 +157,10 @@ class MotionLib:
         future = self.future_frames(frames, num_frames)
         heading = yaw_mat(self.root_R[frames])
         heading_t = heading.transpose(-1, -2).unsqueeze(1)
-        position_delta = (
-            heading_t @ (self.root_p[future] - self.root_p[frames].unsqueeze(1)).unsqueeze(-1)
-        ).squeeze(-1)
-        rotation = mat_to_6d(heading_t @ self.root_R[future])
+        delta = self.root_p[future] - self.root_p[frames].unsqueeze(1)
+        position_delta = (heading_t * delta.unsqueeze(-2)).sum(-1)
+        future_rotation = self.root_R[future]
+        rotation = mat_to_6d((heading_t.unsqueeze(-1) * future_rotation.unsqueeze(-3)).sum(-2))
         features = torch.cat(
             (
                 position_delta,

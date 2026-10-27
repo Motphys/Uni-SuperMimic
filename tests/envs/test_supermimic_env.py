@@ -16,7 +16,7 @@ from unilab.envs.manager_based_rl_env import ManagerBasedRlEnvCfg
 from unilab.managers import EventTermCfg, ManagerRng, SceneEntityCfg
 
 import unisupermimic.tasks.motion_tracking.g1.supermimic.env as supermimic_env_module
-from unisupermimic.rl.algos.supermimic.geometry import flatten_state
+from unisupermimic.rl.algos.supermimic.geometry import flatten_state, quat_to_mat, unflatten_state
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
     SUPERMIMIC_TRANSITION_KEY,
@@ -341,6 +341,29 @@ def test_episode_return_update_bootstraps_only_truncation() -> None:
     torch.testing.assert_close(stats["ep_len"], ep_step[:3].float())
     torch.testing.assert_close(stats["ep_ret_norm"], ep_ret[:3] / (ep_step[:3] * MAX_STEP_REWARD))
     assert set(stats) == {"ep_len", "ep_ret_norm"}
+
+
+def test_simultaneous_duplicate_bins_use_order_independent_mean() -> None:
+    def updated(order: list[int]) -> torch.Tensor:
+        scores = torch.tensor([1.0, 2.0, 3.0])
+        bins = torch.tensor([1, 1, 2, 0])[order]
+        returns = torch.tensor([0.1, 0.9, 0.4, 10.0])[order]
+        done = torch.tensor([True, True, True, False])[order]
+        update_start_bin_returns(
+            scores,
+            bins,
+            torch.ones(4, dtype=torch.long),
+            returns,
+            returns,
+            done,
+            done,
+            0.99,
+        )
+        return scores
+
+    expected = torch.tensor([1.0, 0.8 * 2.0 + 0.2 * 0.5, 0.8 * 3.0 + 0.2 * 0.4])
+    torch.testing.assert_close(updated([0, 1, 2, 3]), expected)
+    torch.testing.assert_close(updated([1, 0, 3, 2]), expected)
 
 
 def test_episode_return_update_without_done_rows_is_a_no_op() -> None:
@@ -785,3 +808,37 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
     finally:
         env.close()
         env.backend.close()
+
+
+@pytest.mark.slow
+def test_mujoco_poststep_public_root_matches_native_qpos_qvel(tmp_path: Path) -> None:
+    from unisim.backend.mujoco.backend import MuJoCoBackend
+
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, eval_mode=True, backend="mujoco"),
+        num_envs=2,
+        backend_type="mujoco",
+    )
+    backend = env.backend
+    assert isinstance(backend, MuJoCoBackend)
+    try:
+        env.reset_to_frames(torch.tensor([0, 0], dtype=torch.int64, device=env.device))
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        for _ in range(5):
+            step = env.step(torch.zeros((2, 29), device=env.device))
+            assert not bool(step.info[SUPERMIMIC_TRANSITION_KEY]["done"].any())
+            p, R, v, w, _, _ = unflatten_state(step.info[SUPERMIMIC_TRANSITION_KEY]["s1"])
+            phys = np.asarray(backend.get_physics_state())
+            nq = backend.nq
+            q = torch.as_tensor(phys[:, 1:8].copy(), device=env.device, dtype=p.dtype)
+            qvel = torch.as_tensor(
+                phys[:, 1 + nq : 7 + nq].copy(), device=env.device, dtype=p.dtype
+            )
+            torch.testing.assert_close(p + command._env_origins, q[:, :3], rtol=0, atol=2e-5)
+            torch.testing.assert_close(R, quat_to_mat(q[:, 3:7]), rtol=0, atol=2e-5)
+            torch.testing.assert_close(v, qvel[:, :3], rtol=0, atol=2e-5)
+            torch.testing.assert_close(w, (R @ qvel[:, 3:6, None]).squeeze(-1), rtol=0, atol=2e-5)
+    finally:
+        env.close()
+        backend.close()
