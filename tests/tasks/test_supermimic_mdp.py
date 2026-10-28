@@ -191,6 +191,12 @@ def test_compact_library_matches_full_motion(library, tmp_path) -> None:
         mdp.critic_features(state, frames, context),
     )
 
+    frames_2d = frames.reshape(2, 2)
+    for actual, expected in zip(compact.body_state(frames_2d), motion.body_state(frames_2d)):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(compact.ref_state(frames_2d), motion.ref_state(frames_2d)):
+        torch.testing.assert_close(actual, expected)
+
 
 def test_future_goal_clamps_at_clip_boundaries(library) -> None:
     _, motion, mdp = library

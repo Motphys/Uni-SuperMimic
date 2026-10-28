@@ -264,12 +264,12 @@ class MotionLib:
             )
         reference = self._ref[frames].float()
         return self.kin.forward(
-            reference[:, :3],
-            quat_to_mat(reference[:, 3:7]),
-            reference[:, 36:39],
-            reference[:, 39:42],
-            reference[:, 7:36],
-            reference[:, 42:71],
+            reference[..., :3],
+            quat_to_mat(reference[..., 3:7]),
+            reference[..., 36:39],
+            reference[..., 39:42],
+            reference[..., 7:36],
+            reference[..., 42:71],
         )
 
     def to(self, device: str | torch.device) -> MotionLib:
@@ -325,12 +325,12 @@ class MotionLib:
         if self.compact:
             reference = self._ref[frames].float()
             return (
-                reference[:, :3],
-                quat_to_mat(reference[:, 3:7]),
-                reference[:, 36:39],
-                reference[:, 39:42],
-                reference[:, 7:36],
-                reference[:, 42:71],
+                reference[..., :3],
+                quat_to_mat(reference[..., 3:7]),
+                reference[..., 36:39],
+                reference[..., 39:42],
+                reference[..., 7:36],
+                reference[..., 42:71],
             )
         return (
             self.root_p[frames],
