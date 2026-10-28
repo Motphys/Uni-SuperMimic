@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
@@ -13,6 +14,7 @@ from unilab.base.config_materialization import apply_cfg_overrides
 from unilab.envs.manager_based_rl_env import ManagerBasedRlEnvCfg
 
 from unisupermimic.scripts.train_supermimic import (
+    _motion_count,
     build_env_override,
     build_learner_config,
     main,
@@ -90,6 +92,23 @@ def test_eval_override_only_changes_evaluation_lifecycle() -> None:
     assert override["observations"]["policy"]["enable_corruption"] is False
     assert cfg.env.commands.motion.eval_mode is False
     assert cfg.env.commands.motion.reset_noise is True
+
+
+def test_motion_count_reads_compact_metadata(tmp_path: Path) -> None:
+    cfg = _compose()
+    path = tmp_path / "compact.pt"
+    torch.save(
+        {
+            "ref": torch.zeros((5, 71), dtype=torch.float16),
+            "names": ["first", "second"],
+            "starts": [0, 2],
+            "lengths": [2, 3],
+        },
+        path,
+    )
+    OmegaConf.update(cfg, "env.commands.motion.motion_files", [str(path)])
+
+    assert _motion_count(cfg) == 2
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,7 @@ from unisupermimic.sim2sim import (
     policy_load_dim_guard,
     resolve_sim2sim_config,
 )
+from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import compact_motion_clip_count
 
 
 def build_learner_config(cfg: DictConfig) -> SuperMimicConfig:
@@ -106,6 +107,8 @@ def _motion_count(cfg: DictConfig) -> int:
     files = OmegaConf.select(cfg, "env.commands.motion.motion_files")
     if files is None or len(files) == 0:
         raise ValueError("SuperMimic evaluation requires a nonempty motion library")
+    if len(files) == 1 and str(files[0]).endswith(".pt"):
+        return compact_motion_clip_count(str(files[0]))
     return len(files)
 
 

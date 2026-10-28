@@ -7,6 +7,7 @@ import csv
 import pytest
 import torch
 
+from unisupermimic.rl.algos.supermimic.geometry import mat_to_quat
 from unisupermimic.rl.contracts.supermimic import SuperMimicMdpProtocol
 from unisupermimic.tasks.motion_tracking.g1.supermimic.kinematics import G1Kinematics
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import (
@@ -137,6 +138,64 @@ def test_motion_resampling_fk_and_bins(library) -> None:
     torch.testing.assert_close(motion.q[1, 0], torch.tensor(default_joint_pos_list()[0] + 0.0006))
     torch.testing.assert_close(motion.qd[1], torch.full((29,), 0.03))
     torch.testing.assert_close(motion.root_w, torch.zeros_like(motion.root_w))
+
+
+def test_compact_library_matches_full_motion(library, tmp_path) -> None:
+    from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import (
+        compact_motion_clip_count,
+    )
+
+    kin, motion, mdp = library
+    reference = torch.cat(
+        (
+            motion.root_p,
+            mat_to_quat(motion.root_R),
+            motion.q,
+            motion.root_v,
+            motion.root_w,
+            motion.qd,
+        ),
+        dim=-1,
+    )
+    path = tmp_path / "compact.pt"
+    torch.save(
+        {
+            "ref": reference,
+            "names": motion.names,
+            "starts": motion.clip_start.tolist(),
+            "lengths": motion.clip_len.tolist(),
+        },
+        path,
+    )
+    compact = MotionLib([str(path)], kin, "cpu")
+    compact_mdp = MDP(kin, compact, mdp.default_q)
+    frames = torch.tensor([0, 49, 100, 105])
+
+    assert compact_motion_clip_count(str(path)) == 2
+    assert compact.num_bins == motion.num_bins
+    assert compact.frame_bin.tolist() == motion.frame_bin.tolist()
+    torch.testing.assert_close(compact.goal(frames, 4), motion.goal(frames, 4))
+    for actual, expected in zip(compact.body_state(frames), motion.body_state(frames)):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(compact.ref_state(frames), motion.ref_state(frames)):
+        torch.testing.assert_close(actual, expected)
+    state = motion.ref_state(frames)
+    action = torch.zeros((len(frames), 29))
+    context = torch.zeros((len(frames), 33))
+    torch.testing.assert_close(
+        compact_mdp.reward(state, frames, action, action),
+        mdp.reward(state, frames, action, action),
+    )
+    torch.testing.assert_close(
+        compact_mdp.critic_features(state, frames, context),
+        mdp.critic_features(state, frames, context),
+    )
+
+    frames_2d = frames.reshape(2, 2)
+    for actual, expected in zip(compact.body_state(frames_2d), motion.body_state(frames_2d)):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(compact.ref_state(frames_2d), motion.ref_state(frames_2d)):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_future_goal_clamps_at_clip_boundaries(library) -> None:
