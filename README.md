@@ -227,16 +227,16 @@ Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Eval
 
 ### BONES-SEED library (129,487 clips)
 
-Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16; data pipeline in PR [#12](https://github.com/Motphys/Uni-SuperMimic/pull/12)): one RTX 5090, 12000 iterations, 2.55 h learner wall time. Evaluation covers a random 10,000-clip subset of the kept library (deterministic full-clip rollouts, seed=0); the LAFAN1 row is a same-machine baseline re-run with identical settings.
+Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16): one RTX 4090 (48 GB), 12000 iterations, 1.69 h learner wall time. Evaluation covers the complete kept library — one environment per clip, deterministic full-clip rollouts (a one-shot full-library eval needs a 48 GB card; on smaller cards, evaluate a subset instead). The LAFAN1 row is a baseline run with identical settings.
 
 | policy | eval set | norm_return | frame-weighted | failed clips |
 |---|---|---:|---:|---:|
-| BONES-SEED ckpt_012000.pt | 10,000 random kept clips | 0.9262 | 0.9281 | 30 / 10,000 (0.3%) |
-| LAFAN1 ckpt_012000.pt (same-machine baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
+| BONES-SEED ckpt_012000.pt | all 129,487 kept clips | 0.9243 | 0.9267 | 350 / 129,487 (0.27%) |
+| LAFAN1 ckpt_012000.pt (baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
 
-![BONES-SEED vs LAFAN1 same-machine training curves through iteration 12000](docs/assets/boneseed_curve.png)
+![BONES-SEED vs LAFAN1: full-library evaluation and training curves through iteration 12000](docs/assets/boneseed_curve.png)
 
-Per-clip distribution on the 10k subset: median 0.9520, P10 0.8360, P90 0.9858. BONES-SEED converges much faster (early-termination 0.83% vs 29.4% at iteration 2000) and finishes +7.3 pt higher in sim tracking reward.
+Per-clip distribution on BONES-SEED: median 0.9528, P10 0.8337, P90 0.9841. BONES-SEED converges much faster (early-termination 0.83% vs 29.4% at iteration 2000) and finishes higher on both training reward and evaluation return. An independent RTX 5090 run reproduces these numbers (0.9262 on a random 10,000-clip subset, within 0.002 of the full-library value).
 
 ## Tests
 

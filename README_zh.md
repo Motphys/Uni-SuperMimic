@@ -227,16 +227,16 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 ### BONES-SEED 动作库（129,487 段）
 
-相同配置在 BONES-SEED G1 紧凑动作库（过滤后 129,487 段、4730 万帧、6.72 GB fp16，数据管线见 PR [#12](https://github.com/Motphys/Uni-SuperMimic/pull/12)）上验证：单张 RTX 5090、12000 轮、learner 墙钟 2.55 小时。评估为从过滤后库中随机抽取的 10,000 段（seed=0，确定性整段回放）；LAFAN1 行为同机同配置的基线重跑。
+相同配置在 BONES-SEED G1 紧凑动作库（过滤后 129,487 段、4730 万帧、6.72 GB fp16）上验证：单张 RTX 4090（48 GB）、12000 轮、learner 墙钟 1.69 小时。评估覆盖过滤后全库——每段一个并行环境、确定性整段回放（一次性全库评估需要 48 GB 显存；显存更小的卡请改用子集评估）。LAFAN1 行为相同配置的基线 run。
 
 | 策略 | 评估集 | norm_return | frame-weighted | 失败段数 |
 |---|---|---:|---:|---:|
-| BONES-SEED ckpt_012000.pt | 随机 10,000 段 | 0.9262 | 0.9281 | 30 / 10,000（0.3%） |
-| LAFAN1 ckpt_012000.pt（同机基线） | 全部 40 段 | 0.8336 | 0.8366 | 0 / 40 |
+| BONES-SEED ckpt_012000.pt | 全部 129,487 段 | 0.9243 | 0.9267 | 350 / 129,487（0.27%） |
+| LAFAN1 ckpt_012000.pt（基线） | 全部 40 段 | 0.8336 | 0.8366 | 0 / 40 |
 
-![截至 12000 轮的 BONES-SEED 与 LAFAN1 同机训练曲线](docs/assets/boneseed_curve.png)
+![截至 12000 轮的 BONES-SEED 与 LAFAN1 全库评估和训练曲线](docs/assets/boneseed_curve.png)
 
-10k 子集逐段分布：中位数 0.9520，P10 0.8360，P90 0.9858。BONES-SEED 收敛显著更快（2000 轮时早停率 0.83%，LAFAN1 同期 29.4%），最终仿真跟踪奖励高 7.3 pt。
+BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEED 收敛显著更快（2000 轮时早停率 0.83%，LAFAN1 同期 29.4%），训练奖励与评估回报均更高。另一次独立 RTX 5090 run 复现了这些数字（随机 1 万段子集 0.9262，与全库结果相差小于 0.002）。
 
 ## 测试
 
