@@ -37,10 +37,11 @@ def flattened_qpos(state: torch.Tensor) -> torch.Tensor:
 
 
 def reference_qpos(motion: Any, frames: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        (motion.root_p[frames], mat_to_quat(motion.root_R[frames]), motion.q[frames]),
-        dim=-1,
-    )
+    if hasattr(motion, "ref_state"):
+        root_p, root_R, _, _, q, _ = motion.ref_state(frames)
+    else:
+        root_p, root_R, q = motion.root_p[frames], motion.root_R[frames], motion.q[frames]
+    return torch.cat((root_p, mat_to_quat(root_R), q), dim=-1)
 
 
 @torch.inference_mode()
@@ -95,7 +96,10 @@ def rollout_qpos(
     if start_frame >= len(states):
         raise ValueError("start exceeds the completed rollout")
     policy_qpos = flattened_qpos(torch.stack(states)).numpy()
-    frame_ids = torch.tensor(frames, dtype=torch.long, device=motion.root_p.device)
+    motion_device = getattr(motion, "device", None)
+    if motion_device is None:
+        motion_device = motion.root_p.device
+    frame_ids = torch.tensor(frames, dtype=torch.long, device=motion_device)
     reference = reference_qpos(motion, frame_ids).cpu().numpy()
     return reference[start_frame:], policy_qpos[start_frame:]
 

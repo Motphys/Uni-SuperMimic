@@ -28,6 +28,7 @@ dependencies = [
 unisupermimic-train = "unisupermimic.scripts.train_supermimic:hydra_main"
 unisupermimic-eval = "unisupermimic.tasks.motion_tracking.g1.supermimic.evaluate:main"
 unisupermimic-video = "unisupermimic.tasks.motion_tracking.g1.supermimic.render:main"
+unisupermimic-boneseed = "unisupermimic.data.boneseed:main"
 
 [project.entry-points."unilab.tasks"]
 unisupermimic = "unisupermimic.tasks"

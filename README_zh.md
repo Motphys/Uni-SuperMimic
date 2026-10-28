@@ -71,34 +71,100 @@ CUDA-only 后端（mjwarp）在 ROCm 上不可用，请使用 MuJoCo host-bridge
 `make sync-default`。维护者在依赖变更后用 `make lock-rocm` 重新生成
 ROCm lockfile。
 
-### 准备资产
+### 准备资产并选择数据集
+
+两种训练方式使用同一个 G1 机器人模型，但**只需下载你准备用于训练的数据集**。LAFAN1 和 BONES-SEED 是两个独立选项，选择其中一个并不需要下载另一个。
+
+### 共享 G1 机器人资产
+
+如果只使用 BONES-SEED，可以只准备机器人，不下载任何 LAFAN1 动作：
 
 ```bash
-# 从 Hugging Face 下载 LAFAN1/G1 数据，生成并校验 MJCF
+uv run tools/prepare_supermimic_assets.py --robot-only
+
+# 可选：离线校验已有的机器人资产
+uv run tools/prepare_supermimic_assets.py --robot-only --validate-only
+```
+
+### 选项 A：LAFAN1
+
+适合默认的 40 段动作训练。以下命令会同时准备共享机器人和 LAFAN1/G1 动作，无需再执行上面的 `--robot-only` 命令：
+
+```bash
 uv run tools/prepare_supermimic_assets.py
 
-# 已有资产时，只做离线校验
+# 离线校验机器人和全部 LAFAN1 动作
 uv run tools/prepare_supermimic_assets.py --validate-only
 ```
 
-资产来源为 `lvhaidong/LAFAN1_Retargeting_Dataset`。完整资产应包含 40 段 CSV、264705 个源帧，每帧 36 列。mesh、URDF、CSV、日志和 checkpoint 均被 `.gitignore` 排除。
+数据源为 `lvhaidong/LAFAN1_Retargeting_Dataset`。完整动作集包含 40 段 CSV、264705 个源帧，每帧 36 列。
+
+### 选项 B：BONES-SEED
+
+适合大规模动作训练。如果共享机器人尚未准备好，先执行上面的 `--robot-only` 命令，然后运行：
+
+```bash
+# 完整 BONES-SEED 流程：下载 -> 转换 -> 过滤 -> 打包
+uv run unisupermimic-boneseed all --workers 16
+
+# 已有原始 CSV 时，可断点续跑或单独执行各阶段
+uv run unisupermimic-boneseed convert --workers 16
+uv run unisupermimic-boneseed filter --workers 16
+uv run unisupermimic-boneseed pack
+```
+
+该流程与 `SuperMimic-Reproduced` 一致：把 120 fps CSV 重采样为带 MuJoCo 正运动学结果的 50 Hz NPZ，执行名称与可行性过滤，再将保留的 clip 打包为 71 维 fp16 运动库。数据源是 Hugging Face `bones-studio/seed` 的 `g1.tar.gz`。
+
+默认原始 CSV 目录为 `data/raw/bones_seed`，NPZ 与 manifest 目录为 `data/npz/bones_seed`，训练库输出为 `data/library/bones_seed_compact.pt`。转换会跳过已有 NPZ，`--overwrite` 可强制重建，`--limit` 可先做小规模试跑。参考全量结果约有 12.95 万段运动，fp16 库约 6.7 GB 并常驻训练设备，原始 CSV 和中间 NPZ 还需要额外磁盘空间。
+
+mesh、URDF、动作文件、日志、checkpoint 和生成的数据集目录均被 `.gitignore` 排除；数据集许可证仍归各自所有者。
 
 ## 训练
 
-以下命令从仓库根目录运行；使用 CUDA 时，把 `CUDA_VISIBLE_DEVICES` 改为实际空闲 GPU。
+以下命令从仓库根目录运行；使用 CUDA 时，把 `CUDA_VISIBLE_DEVICES` 改为实际空闲 GPU。两个数据集都使用 `unisupermimic-train`，通过运动文件配置选择对应的训练入口。
+
+### 使用 LAFAN1 训练
+
+LAFAN1 是默认数据集，无需覆盖运动文件：
 
 ```bash
-# 默认：mjwarp、4096 个并行环境、12000 iterations
+# mjwarp、4096 个并行环境、12000 iterations
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_mjwarp_001
 
-# 从同一 run 的 last.pt 续训到 16000 iterations
+# 从该 LAFAN1 run 的 last.pt 续训到 16000 iterations
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   algo.resume=true \
   algo.load_run=runs/supermimic_mjwarp_001 \
   algo.checkpoint=last.pt \
   algo.iterations=16000
+```
 
+### 使用 BONES-SEED 训练
+
+生成紧凑运动库后，通过 `env.commands.motion.motion_files` 显式选择它。该参数会替换默认的 LAFAN1 列表，而不是把两个数据集合并：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  training.log_dir=runs/supermimic_boneseed_001
+
+# 使用相同的数据集配置续训 BONES-SEED run
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  algo.resume=true \
+  algo.load_run=runs/supermimic_boneseed_001 \
+  algo.checkpoint=last.pt \
+  algo.iterations=16000
+```
+
+带引号的 Hydra 列表里是一个运动库文件，不代表只有一段动作；实际 clip 信息从库中读取。通过 `unisupermimic-train` 续训或评估 BONES-SEED run 时，也要保留这个数据集覆盖参数。
+
+### 后端与其他选项
+
+后端选择与数据集选择相互独立。以下示例使用默认 LAFAN1；如需 BONES-SEED，在命令中加上面的运动文件覆盖参数即可：
+
+```bash
 # 通过 task owner 选择 MuJoCo
 uv run unisupermimic-train \
   task=g1_super_mimic/mujoco \
@@ -149,6 +215,8 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 ## 结果
 
+### LAFAN1 动作库（40 段）
+
 配置：PyPI `unilab 1.5.0`、mjwarp、4096 个训练环境。评估覆盖 40 段 LAFAN1/G1 运动；`norm_return` 是 clip 宏平均，`frame-weighted` 按帧数加权。
 
 | checkpoint | norm_return | frame-weighted | 失败段数 |
@@ -156,6 +224,19 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 | ckpt_012000.pt | 0.827227 | 0.829952 | 0 / 40 |
 
 ![截至 12000 轮的训练与评估曲线](docs/assets/success_curve.png)
+
+### BONES-SEED 动作库（129,487 段）
+
+相同配置在 BONES-SEED G1 紧凑动作库（过滤后 129,487 段、4730 万帧、6.72 GB fp16，数据管线见 PR [#12](https://github.com/Motphys/Uni-SuperMimic/pull/12)）上验证：单张 RTX 5090、12000 轮、learner 墙钟 2.55 小时。评估为从过滤后库中随机抽取的 10,000 段（seed=0，确定性整段回放）；LAFAN1 行为同机同配置的基线重跑。
+
+| 策略 | 评估集 | norm_return | frame-weighted | 失败段数 |
+|---|---|---:|---:|---:|
+| BONES-SEED ckpt_012000.pt | 随机 10,000 段 | 0.9262 | 0.9281 | 30 / 10,000（0.3%） |
+| LAFAN1 ckpt_012000.pt（同机基线） | 全部 40 段 | 0.8336 | 0.8366 | 0 / 40 |
+
+![截至 12000 轮的 BONES-SEED 与 LAFAN1 同机训练曲线](docs/assets/boneseed_curve.png)
+
+10k 子集逐段分布：中位数 0.9520，P10 0.8360，P90 0.9858。BONES-SEED 收敛显著更快（2000 轮时早停率 0.83%，LAFAN1 同期 29.4%），最终仿真跟踪奖励高 7.3 pt。
 
 ## 测试
 
@@ -168,4 +249,4 @@ uv run tools/prepare_supermimic_assets.py --validate-only
 
 ## License
 
-本仓库代码采用 [Apache-2.0](LICENSE)。参考实现的 MIT 许可及原始版权声明完整保存在 [LICENSES/MIT-supermimic.txt](LICENSES/MIT-supermimic.txt)，另见 [NOTICE](NOTICE)。UniLab、UniSim、MuJoCo/mjwarp、MotrixSim 和数据集分别遵循其上游许可；本仓库不重新许可这些外部依赖或下载资产。
+本仓库代码采用 [Apache-2.0](LICENSE)。参考实现的 MIT 许可及原始版权声明完整保存在 [LICENSES/MIT-supermimic.txt](LICENSES/MIT-supermimic.txt) 和 [LICENSES/MIT-supermimic-reproduced.txt](LICENSES/MIT-supermimic-reproduced.txt)，另见 [NOTICE](NOTICE)。UniLab、UniSim、MuJoCo/mjwarp、MotrixSim 和数据集分别遵循其上游许可；本仓库不重新许可这些外部依赖或下载资产。

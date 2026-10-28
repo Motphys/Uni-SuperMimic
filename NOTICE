@@ -6,7 +6,9 @@ UniLab and UniSim are separate upstream projects licensed under Apache-2.0.
 
 The implementation was developed with reference to the SuperMimic reference
 code in supermimic_vibed, whose MIT license and original copyright notice are
-preserved in LICENSES/MIT-supermimic.txt.
+preserved in LICENSES/MIT-supermimic.txt. The BONES-SEED data pipeline was
+adapted from SuperMimic-Reproduced; its MIT license and copyright notice are
+preserved in LICENSES/MIT-supermimic-reproduced.txt.
 
 SuperMimic paper:
 "SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable

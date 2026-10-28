@@ -71,34 +71,100 @@ host-bridge backend (`task=g1_super_mimic/mujoco`). `make sync-rocm` swaps
 switch back. Maintainers regenerate the ROCm lockfile after dependency changes
 with `make lock-rocm`.
 
-### Prepare Assets
+### Prepare Assets and Choose a Dataset
+
+Both training modes use the same G1 robot model, but **you only need to download the dataset you plan to train on**. LAFAN1 and BONES-SEED are independent choices; downloading one does not require downloading the other.
+
+### Shared G1 Robot Assets
+
+If you plan to use BONES-SEED only, prepare the robot without downloading LAFAN1 motions:
 
 ```bash
-# Download LAFAN1/G1 data from Hugging Face, then generate and validate MJCF.
+uv run tools/prepare_supermimic_assets.py --robot-only
+
+# Optional: validate an existing robot-only installation offline.
+uv run tools/prepare_supermimic_assets.py --robot-only --validate-only
+```
+
+### Option A: LAFAN1
+
+Use this option for the default 40-clip setup. The command prepares the shared robot and downloads the LAFAN1/G1 motions, so no separate robot-only command is needed:
+
+```bash
 uv run tools/prepare_supermimic_assets.py
 
-# Validate existing assets offline.
+# Validate both the robot and all LAFAN1 motions offline.
 uv run tools/prepare_supermimic_assets.py --validate-only
 ```
 
-Assets come from `lvhaidong/LAFAN1_Retargeting_Dataset`. A complete asset set contains 40 CSV files with 264,705 source frames and 36 columns per frame. Meshes, URDF, CSV files, logs, and checkpoints are excluded by `.gitignore`.
+The source is `lvhaidong/LAFAN1_Retargeting_Dataset`. A complete motion set contains 40 CSV files with 264,705 source frames and 36 columns per frame.
+
+### Option B: BONES-SEED
+
+Use this option for the large-scale setup. Prepare the shared robot with `--robot-only` first if it is not already installed, then run:
+
+```bash
+# Full BONES-SEED pipeline: download -> convert -> filter -> pack.
+uv run unisupermimic-boneseed all --workers 16
+
+# If raw CSVs are already downloaded, resume or run individual stages.
+uv run unisupermimic-boneseed convert --workers 16
+uv run unisupermimic-boneseed filter --workers 16
+uv run unisupermimic-boneseed pack
+```
+
+Following `SuperMimic-Reproduced`, the pipeline resamples 120 fps CSV to 50 Hz NPZ with MuJoCo forward kinematics, applies name and feasibility filters, and packs retained clips into a 71-dimensional fp16 library. The source is Hugging Face `bones-studio/seed`, file `g1.tar.gz`.
+
+Paths default to `data/raw/bones_seed` for raw CSV, `data/npz/bones_seed` for NPZ and manifests, and `data/library/bones_seed_compact.pt` for the training library. Conversion skips existing NPZ files unless `--overwrite` is set; `--limit` supports a small trial. The reference full-set result has about 129.5k clips and a roughly 6.7 GB fp16 library, which is resident on the training device. Raw CSV and intermediate NPZ require additional disk space.
+
+Meshes, URDF, motion files, logs, checkpoints, and generated dataset directories are excluded by `.gitignore`. Dataset licenses remain with their respective owners.
 
 ## Training
 
-Run the following commands from the repository root and set `CUDA_VISIBLE_DEVICES` to an available GPU when using CUDA.
+Run commands from the repository root and set `CUDA_VISIBLE_DEVICES` to an available GPU. Both datasets use `unisupermimic-train`; the motion-file configuration selects the training entry.
+
+### Train with LAFAN1
+
+LAFAN1 is the default dataset, so no motion-file override is needed:
 
 ```bash
-# Default: mjwarp, 4096 parallel environments, 12000 iterations.
+# mjwarp, 4096 parallel environments, 12000 iterations.
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_mjwarp_001
 
-# Resume from last.pt in the same run and train to 16000 iterations.
+# Resume this LAFAN1 run from last.pt and train to 16000 iterations.
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   algo.resume=true \
   algo.load_run=runs/supermimic_mjwarp_001 \
   algo.checkpoint=last.pt \
   algo.iterations=16000
+```
 
+### Train with BONES-SEED
+
+After building the compact library, select it explicitly with `env.commands.motion.motion_files`. This replaces the default LAFAN1 list rather than adding to it:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  training.log_dir=runs/supermimic_boneseed_001
+
+# Resume the BONES-SEED run with the same dataset selection.
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  algo.resume=true \
+  algo.load_run=runs/supermimic_boneseed_001 \
+  algo.checkpoint=last.pt \
+  algo.iterations=16000
+```
+
+The quoted Hydra list contains one library file, not one motion clip; clip metadata is read from the library. Keep this dataset override when resuming or evaluating a BONES-SEED run through `unisupermimic-train`.
+
+### Backend and Other Options
+
+The backend selection is independent of the dataset. For example, the following commands use the default LAFAN1 library; add the BONES-SEED motion-file override to use that library instead:
+
+```bash
 # Select MuJoCo through the task owner.
 uv run unisupermimic-train \
   task=g1_super_mimic/mujoco \
@@ -149,6 +215,8 @@ By default, the reference root XY is aligned with the policy to highlight whole-
 
 ## Results
 
+### LAFAN1 library (40 clips)
+
 Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Evaluation covers 40 LAFAN1/G1 motions. `norm_return` is the macro average across clips; `frame-weighted` is weighted by clip length.
 
 | checkpoint | norm_return | frame-weighted | failed clips |
@@ -161,6 +229,19 @@ backend, and dependency version differ from the `mjwarp` result above.
 
 ![Training and evaluation curves through iteration 12000](docs/assets/success_curve.png)
 
+### BONES-SEED library (129,487 clips)
+
+Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16; data pipeline in PR [#12](https://github.com/Motphys/Uni-SuperMimic/pull/12)): one RTX 5090, 12000 iterations, 2.55 h learner wall time. Evaluation covers a random 10,000-clip subset of the kept library (deterministic full-clip rollouts, seed=0); the LAFAN1 row is a same-machine baseline re-run with identical settings.
+
+| policy | eval set | norm_return | frame-weighted | failed clips |
+|---|---|---:|---:|---:|
+| BONES-SEED ckpt_012000.pt | 10,000 random kept clips | 0.9262 | 0.9281 | 30 / 10,000 (0.3%) |
+| LAFAN1 ckpt_012000.pt (same-machine baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
+
+![BONES-SEED vs LAFAN1 same-machine training curves through iteration 12000](docs/assets/boneseed_curve.png)
+
+Per-clip distribution on the 10k subset: median 0.9520, P10 0.8360, P90 0.9858. BONES-SEED converges much faster (early-termination 0.83% vs 29.4% at iteration 2000) and finishes +7.3 pt higher in sim tracking reward.
+
 ## Tests
 
 ```bash
@@ -172,4 +253,4 @@ uv run tools/prepare_supermimic_assets.py --validate-only
 
 ## License
 
-The repository code is released under [Apache-2.0](LICENSE). The reference implementation's MIT license and original copyright notice are preserved in [LICENSES/MIT-supermimic.txt](LICENSES/MIT-supermimic.txt); see also [NOTICE](NOTICE). UniLab, UniSim, MuJoCo/mjwarp, MotrixSim, and the datasets retain their respective upstream licenses. This repository does not relicense those external dependencies or downloaded assets.
+The repository code is released under [Apache-2.0](LICENSE). The reference implementations' MIT licenses and original copyright notices are preserved in [LICENSES/MIT-supermimic.txt](LICENSES/MIT-supermimic.txt) and [LICENSES/MIT-supermimic-reproduced.txt](LICENSES/MIT-supermimic-reproduced.txt); see also [NOTICE](NOTICE). UniLab, UniSim, MuJoCo/mjwarp, MotrixSim, and the datasets retain their respective upstream licenses. This repository does not relicense those external dependencies or downloaded assets.

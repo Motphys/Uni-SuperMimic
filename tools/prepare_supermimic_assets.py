@@ -46,12 +46,12 @@ GROUND_FRICTION = 0.3
 TIMESTEP = 0.005
 
 
-def download_assets() -> None:
+def download_assets(*, include_motions: bool = True) -> None:
     from huggingface_hub import HfApi, hf_hub_download
 
     remote_files = set(HfApi().list_repo_files(REPO_ID, repo_type="dataset"))
     motion_paths = sorted(path for path in remote_files if re.fullmatch(r"g1/[^/]+\.csv", path))
-    if len(motion_paths) != EXPECTED_CLIPS:
+    if include_motions and len(motion_paths) != EXPECTED_CLIPS:
         raise RuntimeError(
             f"Expected {EXPECTED_CLIPS} remote motion clips, found {len(motion_paths)}"
         )
@@ -82,8 +82,9 @@ def download_assets() -> None:
             downloaded += 1
 
         fetch(URDF_REMOTE_PATH, URDF_PATH)
-        for remote_path in motion_paths:
-            fetch(remote_path, MOTION_DIR / PurePosixPath(remote_path).name)
+        if include_motions:
+            for remote_path in motion_paths:
+                fetch(remote_path, MOTION_DIR / PurePosixPath(remote_path).name)
         for mesh_name in required_mesh_names(URDF_PATH):
             remote_path = f"robot_description/g1/meshes/{mesh_name}"
             if remote_path not in remote_files:
@@ -429,11 +430,17 @@ def main() -> None:
         action="store_true",
         help="Validate local assets without downloading or regenerating",
     )
+    parser.add_argument(
+        "--robot-only",
+        action="store_true",
+        help="Prepare or validate only the shared G1 robot assets, without LAFAN1 motions",
+    )
     args = parser.parse_args()
     if not args.validate_only:
-        download_assets()
+        download_assets(include_motions=not args.robot_only)
         generate_robot_xml()
-    validate_motions()
+    if not args.robot_only:
+        validate_motions()
     validate_robot()
     validate_scene()
     print("SuperMimic asset preparation and validation passed")

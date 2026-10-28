@@ -119,7 +119,7 @@ class MDP:
         rotation_t = rotation.transpose(-1, -2)
         default_offset = context[..., 1:30]
         gravity = -rotation[..., 2, :]
-        relative_rotation = mat_to_6d(rotation_t @ self.motion.root_R[frames])
+        relative_rotation = mat_to_6d(rotation_t @ self.motion.ref_state(frames)[1])
         return torch.cat(
             (
                 joint_pos - self.default_q - default_offset,
@@ -177,18 +177,20 @@ class MDP:
             joint_pos,
             joint_vel,
         )
-        ref_p, ref_R = motion.root_p[frames], motion.root_R[frames]
+        ref_p, ref_R = motion.ref_state(frames)[:2]
+        reference_body_p, reference_body_R, reference_body_v, reference_body_w = motion.body_state(
+            frames
+        )
         delta_rotation = yaw_mat(rotation @ ref_R.transpose(-1, -2))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
         ref_body_p = anchor.unsqueeze(-2) + (
-            delta_rotation.unsqueeze(-3)
-            @ (motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
+            delta_rotation.unsqueeze(-3) @ (reference_body_p - ref_p.unsqueeze(-2)).unsqueeze(-1)
         ).squeeze(-1)
-        ref_body_R = delta_rotation.unsqueeze(-3) @ motion.body_R[frames]
+        ref_body_R = delta_rotation.unsqueeze(-3) @ reference_body_R
         error_pos = ((ref_body_p - body_p) ** 2).sum(-1).mean(-1)
         error_ori = rot_angle_sq(ref_body_R, body_R).mean(-1)
-        error_linvel = ((motion.body_v[frames] - body_v) ** 2).sum(-1).mean(-1)
-        error_angvel = ((motion.body_w[frames] - body_w) ** 2).sum(-1).mean(-1)
+        error_linvel = ((reference_body_v - body_v) ** 2).sum(-1).mean(-1)
+        error_angvel = ((reference_body_w - body_w) ** 2).sum(-1).mean(-1)
         error_root_pos = ((ref_p - position) ** 2).sum(-1)
         error_root_ori = rot_angle_sq(ref_R, rotation)
         tracking = (
@@ -220,7 +222,7 @@ class MDP:
     def termination(self, state: State, frames: torch.Tensor) -> torch.Tensor:
         """Return hard termination from root height and tilt deviations."""
         position, rotation = state[0], state[1]
-        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
         error_height = (ref_p[..., 2] - position[..., 2]).abs()
         error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         return (error_height > self.cfg.term_height) | (error_tilt > self.cfg.term_tilt)
@@ -234,7 +236,7 @@ class MDP:
     ) -> torch.Tensor:
         """Return the differentiable imagined-rollout termination probability."""
         position, rotation = state[0], state[1]
-        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
         error_height = (ref_p[..., 2] - position[..., 2]).abs()
         error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         alive = (1 - torch.sigmoid((error_height - self.cfg.term_height) / height_temperature)) * (
@@ -252,7 +254,7 @@ class MDP:
         motion = self.motion
         position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
         heading_t = yaw_mat(rotation).transpose(-1, -2)
-        ref_p, ref_R = motion.root_p[frames], motion.root_R[frames]
+        ref_p, ref_R, _, _, ref_q, _ = motion.ref_state(frames)
         body_p = self.kin.forward(
             position,
             rotation,
@@ -265,7 +267,7 @@ class MDP:
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
         ref_body_p = anchor.unsqueeze(-2) + (
             delta_rotation.unsqueeze(-3)
-            @ (motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
+            @ (motion.body_state(frames)[0] - ref_p.unsqueeze(-2)).unsqueeze(-1)
         ).squeeze(-1)
         body_error = (
             (heading_t.unsqueeze(-3) @ (ref_body_p - body_p).unsqueeze(-1)).squeeze(-1).flatten(-2)
@@ -275,7 +277,7 @@ class MDP:
         return torch.cat(
             (
                 invariant_features(state),
-                motion.q[frames] - joint_pos,
+                ref_q - joint_pos,
                 body_error,
                 root_error,
                 relative_rotation,

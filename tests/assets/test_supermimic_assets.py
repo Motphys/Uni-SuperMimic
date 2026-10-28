@@ -178,3 +178,21 @@ def test_preparation_script_uses_expected_remote_and_ignored_locations():
     assert prepare.ROBOT_XML.name == "supermimic.xml"
     assert prepare.SCENE_XML.name == "scene_supermimic.xml"
     assert prepare.MOTION_DIR.name == "lafan1_supermimic"
+
+
+def test_robot_only_preparation_skips_motion_download_and_validation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        prepare,
+        "download_assets",
+        lambda *, include_motions: calls.append(("download", include_motions)),
+    )
+    monkeypatch.setattr(prepare, "generate_robot_xml", lambda: calls.append("generate"))
+    monkeypatch.setattr(prepare, "validate_motions", lambda: calls.append("motions"))
+    monkeypatch.setattr(prepare, "validate_robot", lambda: calls.append("robot"))
+    monkeypatch.setattr(prepare, "validate_scene", lambda: calls.append("scene"))
+    monkeypatch.setattr("sys.argv", ["prepare_supermimic_assets.py", "--robot-only"])
+
+    prepare.main()
+
+    assert calls == [("download", False), "generate", "robot", "scene"]
