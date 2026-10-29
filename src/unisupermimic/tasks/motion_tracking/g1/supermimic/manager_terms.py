@@ -90,7 +90,12 @@ def update_start_bin_returns(
     )
     returns = ep_disc_ret[done] + bootstrap
     bins = start_bin[done]
-    bin_G.index_put_((bins,), 0.8 * bin_G[bins] + 0.2 * returns)
+    unique_bins, inverse, counts = torch.unique(bins, return_inverse=True, return_counts=True)
+    summed_returns = torch.zeros_like(unique_bins, dtype=returns.dtype).scatter_add_(
+        0, inverse, returns
+    )
+    mean_returns = summed_returns / counts
+    bin_G[unique_bins] = 0.8 * bin_G[unique_bins] + 0.2 * mean_returns
     return {
         "ep_len": lengths,
         "ep_ret_norm": ep_ret[done] / (lengths * MAX_STEP_REWARD),

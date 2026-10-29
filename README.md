@@ -223,6 +223,10 @@ Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Eval
 |---|---:|---:|---:|
 | ckpt_012000.pt | 0.827227 | 0.829952 | 0 / 40 |
 
+A separate [Radeon AI PRO R9700 / native MuJoCo reproduction](docs/r9700-native-mujoco-reproduction.md)
+reports its full 24-checkpoint sweep and 40-clip evaluation. Its hardware,
+backend, and dependency version differ from the `mjwarp` result above.
+
 ![Training and evaluation curves through iteration 12000](docs/assets/success_curve.png)
 
 ### BONES-SEED library (129,487 clips)

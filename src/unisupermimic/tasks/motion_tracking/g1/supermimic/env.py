@@ -68,6 +68,15 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         }
         return super().apply_action(actions, state)
 
+    def update_state(self, state: TorchEnvState) -> TorchEnvState:
+        # Native mj_step may leave tracked body sensors one substep behind qpos/qvel.
+        # Refresh before the Manager packs the first post-physics read packet.
+        from unisim.backend.mujoco.backend import MuJoCoBackend
+
+        if isinstance(self.backend, MuJoCoBackend):
+            self.backend._sync_tracked_body_state()
+        return super().update_state(state)
+
     def _update_state_in_read_phase(self, state: TorchEnvState) -> TorchEnvState:
         updated = super()._update_state_in_read_phase(state)
         if self._pre_action is None:
