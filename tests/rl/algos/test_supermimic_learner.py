@@ -240,6 +240,8 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     ):
         assert metric.ndim == 0
         assert torch.isfinite(metric)
+    assert learner._v_init
+    assert learner._v_std >= 0.01
 
 
 def test_matching_explicit_device_disables_bridging(tmp_path) -> None:
