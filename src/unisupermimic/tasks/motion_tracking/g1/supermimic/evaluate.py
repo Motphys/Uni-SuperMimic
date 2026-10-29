@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -40,6 +41,18 @@ EVAL_CSV_FIELDS = (
 DEFAULT_EVAL_NUM_ENVS = 16_384
 
 
+def _resolve_policy_device(
+    env_device: torch.device,
+    device: str | torch.device | None,
+    requested: str | torch.device,
+) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    if sys.platform == "darwin" and env_device.type == "cpu" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device(env_device if device is None else device)
+
+
 def load_policy(
     env: SuperMimicManagerBasedRlEnv,
     checkpoint: dict,
@@ -70,6 +83,7 @@ def evaluate(
     env: SuperMimicManagerBasedRlEnv,
     checkpoint: dict,
     device: str | torch.device | None = None,
+    policy_device: str | torch.device = "auto",
 ) -> dict:
     """Evaluate every motion once from its first frame without observation/action noise."""
     mdp = cast(MDP, env.supermimic_mdp)
@@ -77,7 +91,12 @@ def evaluate(
     args = checkpoint["args"]
     goal_frames = int(args["goal_frames"])
     hist = int(args["hist"])
-    policy = load_policy(env, checkpoint, device)
+    inference_device = _resolve_policy_device(torch.device(env.device), device, policy_device)
+    if inference_device.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS policy inference was requested but MPS is not available")
+    policy = load_policy(env, checkpoint, inference_device)
+    if inference_device.type == "mps":
+        networks.AMP_DTYPE = None
 
     num_clips = len(motion.names)
     num_envs = int(env.num_envs)
@@ -110,7 +129,8 @@ def evaluate(
             info["xi"][env_ids],
             info["f"][env_ids],
         )
-        history[env_ids] = obs.unsqueeze(1).expand(-1, hist, -1)
+        policy_env_ids = env_ids.to(inference_device)
+        history[policy_env_ids] = obs.unsqueeze(1).expand(-1, hist, -1).to(inference_device)
 
     while bool((assigned >= 0).any()):
         obs = mdp.obs(
@@ -118,14 +138,14 @@ def evaluate(
             current["a_prev"],
             current["xi"],
             current["f"],
-        )
+        ).to(inference_device)
         if history is None:
             history = obs.unsqueeze(1).repeat(1, hist, 1)
         else:
             history = torch.cat((history[:, 1:], obs.unsqueeze(1)), dim=1)
-        goal = mdp.goal(current["f"], goal_frames)
+        goal = mdp.goal(current["f"], goal_frames).to(inference_device)
         action = policy(history, goal)
-        state = env.step(action)
+        state = env.step(action.to(env.device))
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
         active = assigned >= 0
         active_ids = active.nonzero(as_tuple=False).flatten()
@@ -358,6 +378,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
     )
+    parser.add_argument(
+        "--policy_device",
+        default="auto",
+        help="policy inference device; auto selects MPS for CPU environments on macOS",
+    )
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--every", type=int, default=1)
     parser.add_argument("--poll_seconds", type=float, default=60.0)
@@ -382,7 +407,7 @@ def main(argv: list[str] | None = None) -> None:
                 env_action_dim=env.action_manager.total_action_dim,
                 algo_name="supermimic",
             ):
-                result = evaluate(env, checkpoint, device=device)
+                result = evaluate(env, checkpoint, device=device, policy_device=args.policy_device)
             print(
                 json.dumps(
                     {key: value for key, value in result.items() if key != "per_clip"}, indent=1
