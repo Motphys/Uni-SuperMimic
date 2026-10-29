@@ -180,7 +180,7 @@ Use the same `task=g1_super_mimic/<backend>` override when resuming or evaluatin
 
 ## Evaluation
 
-Evaluation creates one environment per motion, starts from its first frame, disables observation and action noise, and runs the complete clip. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
+Evaluation starts every motion from its first frame, disables observation and action noise, and runs the complete clip. Finished environments are recycled for pending clips, with longer clips scheduled first to avoid a long idle batch tail. The standalone evaluator uses at most 16,384 parallel environments by default; use `unisupermimic-eval --num_envs N` to fit a smaller GPU. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
@@ -227,7 +227,7 @@ Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Eval
 
 ### BONES-SEED library (129,487 clips)
 
-Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16): one RTX 4090 (48 GB), 12000 iterations, 1.69 h learner wall time. Evaluation covers the complete kept library — one environment per clip, deterministic full-clip rollouts (a one-shot full-library eval needs a 48 GB card; on smaller cards, evaluate a subset instead). The LAFAN1 row is a baseline run with identical settings.
+Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16): one RTX 4090 (48 GB), 12000 iterations, 1.69 h learner wall time. Evaluation covers the complete kept library with deterministic full-clip rollouts. The recorded result was produced by the original one-environment-per-clip evaluator; current evaluation recycles finished environments instead. The LAFAN1 row is a baseline run with identical settings.
 
 | policy | eval set | norm_return | frame-weighted | failed clips |
 |---|---|---:|---:|---:|

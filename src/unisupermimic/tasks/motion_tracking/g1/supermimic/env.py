@@ -130,11 +130,13 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         return obs, info
 
     def reset_to_frames(
-        self, frames: torch.Tensor
+        self,
+        frames: torch.Tensor,
+        env_ids: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        """Reset every environment to its requested motion-library frame."""
-        self._supermimic_command.request_frames(frames)
-        return self.reset()
+        """Reset every or selected environment to requested motion-library frames."""
+        self._supermimic_command.request_frames(frames, env_ids=env_ids)
+        return self.reset(env_ids)
 
 
 SUPPORTED_BACKENDS = ("mjwarp", "mujoco", "motrix")

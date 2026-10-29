@@ -180,7 +180,7 @@ uv run unisupermimic-train \
 
 ## 评估
 
-评估为每段运动创建一个环境，从首帧开始，关闭观测/动作噪声，跑完整个 clip。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
+评估从每段动作的首帧开始，关闭观测/动作噪声，并跑完整个 clip。已结束的环境会被回收给待评估动作；调度器优先启动较长 clip，避免固定 batch 出现长空闲尾巴。独立评估器默认最多使用 16,384 个并行环境，可用 `unisupermimic-eval --num_envs N` 适配较小 GPU。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
@@ -227,7 +227,7 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 ### BONES-SEED 动作库（129,487 段）
 
-相同配置在 BONES-SEED G1 紧凑动作库（过滤后 129,487 段、4730 万帧、6.72 GB fp16）上验证：单张 RTX 4090（48 GB）、12000 轮、learner 墙钟 1.69 小时。评估覆盖过滤后全库——每段一个并行环境、确定性整段回放（一次性全库评估需要 48 GB 显存；显存更小的卡请改用子集评估）。LAFAN1 行为相同配置的基线 run。
+相同配置在 BONES-SEED G1 紧凑动作库（过滤后 129,487 段、4730 万帧、6.72 GB fp16）上验证：单张 RTX 4090（48 GB）、12000 轮、learner 墙钟 1.69 小时。评估覆盖过滤后全库并使用确定性整段回放。下表结果由早期的“每段一个并行环境”评估器产生；当前评估器会回收已结束环境。LAFAN1 行为相同配置的基线 run。
 
 | 策略 | 评估集 | norm_return | frame-weighted | 失败段数 |
 |---|---|---:|---:|---:|
