@@ -70,18 +70,18 @@ class FakeEnv:
                 "done": torch.tensor([False, False, False]),
             },
             {
-                "r": torch.tensor([0.05, 0.1, 0.1]),
-                "term": torch.tensor([True, False, False]),
-                "done": torch.tensor([True, False, False]),
+                "r": torch.tensor([0.1, 0.1, 0.05]),
+                "term": torch.tensor([False, False, True]),
+                "done": torch.tensor([False, False, True]),
             },
             {
-                "r": torch.tensor([50.0, 0.05, 0.1]),
-                "term": torch.tensor([True, False, False]),
-                "done": torch.tensor([True, True, False]),
+                "r": torch.tensor([0.1, 0.05, 50.0]),
+                "term": torch.tensor([False, False, True]),
+                "done": torch.tensor([False, True, True]),
             },
             {
-                "r": torch.tensor([50.0, 50.0, 0.05]),
-                "term": torch.tensor([True, True, False]),
+                "r": torch.tensor([0.05, 50.0, 50.0]),
+                "term": torch.tensor([False, False, True]),
                 "done": torch.tensor([True, True, True]),
             },
         )

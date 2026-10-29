@@ -97,7 +97,7 @@ def evaluate(
     returns = torch.zeros(num_clips, device=env.device)
     steps = torch.zeros(num_clips, dtype=torch.int64, device=env.device)
     failed = torch.zeros(num_clips, dtype=torch.bool, device=env.device)
-    assigned = torch.arange(num_envs, dtype=torch.int64, device=env.device)
+    assigned = clip_order[:num_envs].to(env.device)
     next_clip = num_envs
     history = None
 
