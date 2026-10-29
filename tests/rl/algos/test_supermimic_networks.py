@@ -67,6 +67,25 @@ def test_running_norm_tracks_feature_statistics() -> None:
     assert normalized.dtype == torch.float32
 
 
+def test_running_norm_no_sync_matches_host_path() -> None:
+    host = RunningNorm(2, max_count=5)
+    host.no_sync = False
+    syncless = RunningNorm(2, max_count=5)
+    syncless.no_sync = True
+    torch.manual_seed(0)
+    values = [torch.randn(3, 2) for _ in range(4)]
+
+    for value in values:
+        host.update(value)
+        syncless.update(value)
+
+    # Freeze kicks in once ``max_count`` is crossed (3 -> 6), so the fourth update is a no-op.
+    assert host.count.item() == 6
+    torch.testing.assert_close(syncless.mean, host.mean)
+    torch.testing.assert_close(syncless.var, host.var)
+    torch.testing.assert_close(syncless.count, host.count)
+
+
 def test_world_model_zero_init_step_is_identity() -> None:
     num_joints = 3
     context_dim = 4

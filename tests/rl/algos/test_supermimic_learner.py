@@ -245,6 +245,76 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
         assert torch.isfinite(metric)
 
 
+def test_no_sync_and_host_sampling_return_full_batch(tmp_path) -> None:
+    cfg = _config()
+    for no_sync in (False, True):
+        learner = SuperMimicLearner(
+            FakeEnv(), replace(cfg, no_sync=no_sync), tmp_path / f"no_sync_{no_sync}"
+        )
+        learner.collect(4)
+        starts, histories = learner._sample_valid_starts(cfg.pi_batch)
+        for value in list(starts.values()) + list(histories.values()):
+            assert value.shape[0] == cfg.pi_batch
+
+
+def test_pi_ema_disabled_by_default(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
+    assert learner.pi_avg is None
+
+
+def test_ema_policy_averages_weights(tmp_path) -> None:
+    decay = 0.995
+    learner = SuperMimicLearner(
+        FakeEnv(), replace(_config(), pi_ema=decay), tmp_path
+    )
+    learner.collect(3)
+    learner.policy_update()  # first call initializes the average to the live weights
+    previous = {name: parameter.detach().clone() for name, parameter in learner.pi.named_parameters()}
+
+    learner.policy_update()
+
+    for name, parameter in learner.pi.named_parameters():
+        expected = decay * previous[name] + (1 - decay) * parameter.detach()
+        torch.testing.assert_close(learner.pi_avg.module.state_dict()[name], expected)
+
+
+def test_ema_policy_checkpoint_and_resume(tmp_path) -> None:
+    cfg = replace(_config(), pi_ema=0.995)
+    learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path)
+    learner.collect(3)
+    learner.policy_update()
+
+    learner.save()
+    checkpoint = torch.load(tmp_path / "last.pt", weights_only=True)
+    assert set(checkpoint) == {
+        "wm",
+        "pi",
+        "pi_live",
+        "critic",
+        "opt_wm",
+        "opt_pi",
+        "opt_v",
+        "iteration",
+        "wall_time",
+        "sim_steps",
+        "args",
+        "saved_at",
+    }
+    live = learner.pi.state_dict()
+    averaged = learner.pi_avg.module.state_dict()
+    for name, value in live.items():
+        torch.testing.assert_close(checkpoint["pi_live"][name], value)
+    for name, value in averaged.items():
+        torch.testing.assert_close(checkpoint["pi"][name], value)
+
+    resumed = SuperMimicLearner(FakeEnv(), replace(cfg, iterations=1), tmp_path / "resumed")
+    resumed.load(tmp_path / "last.pt")
+    for name, value in live.items():
+        torch.testing.assert_close(resumed.pi.state_dict()[name], value)
+    for name, value in averaged.items():
+        torch.testing.assert_close(resumed.pi_avg.module.state_dict()[name], value)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_collect_and_updates_run_with_fused_adam_on_cuda(tmp_path) -> None:
     learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path, device="cuda")

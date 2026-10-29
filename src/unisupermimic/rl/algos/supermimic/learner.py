@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import torch
 import torch.nn as nn
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from unilab.rl.contracts.env import EnvProtocol
 
 from unisupermimic.rl.contracts.supermimic import (
@@ -44,7 +45,9 @@ class SuperMimicConfig:
     wm_batches: int = 10
     wm_batch: int = 2048
     pi_batch: int = 4096
-    lr: float = 2e-4
+    lr: float = 4e-4
+    no_sync: bool = True
+    pi_ema: float = 0.0
     gamma: float = 0.99
     lam: float = 0.95
     action_noise: float = 0.1
@@ -131,6 +134,7 @@ class SuperMimicLearner:
         torch.backends.cudnn.allow_tf32 = True
         torch.manual_seed(cfg.seed)
         networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
+        networks.RunningNorm.no_sync = cfg.no_sync
 
         self.wm = self._make_world_model().to(self.device)
         self.pi = self._make_policy().to(self.device)
@@ -138,6 +142,15 @@ class SuperMimicLearner:
         if cfg.test_hidden_dims is not None:
             self.critic.net = mlp(self.critic.norm.mean.numel(), cfg.test_hidden_dims, 1).to(
                 self.device
+            )
+        self.pi_avg = None
+        if cfg.pi_ema > 0:
+            # Polyak average of the policy weights; checkpoints and evaluation use it while the
+            # raw ``self.pi`` keeps being trained. Buffers (running normalizers) are averaged too.
+            self.pi_avg = AveragedModel(
+                self.pi,
+                multi_avg_fn=get_ema_multi_avg_fn(cfg.pi_ema),
+                use_buffers=True,
             )
         fused_adam = self.device.type == "cuda"
         self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
@@ -366,6 +379,18 @@ class SuperMimicLearner:
     def _sample_valid_starts(
         self, batch_size: int
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        if self.cfg.no_sync:
+            # Fixed-size selection without reading the valid count on the host: oversample by 2x,
+            # stable-sort the valid starts first, and keep the leading ``batch_size``. Only starts
+            # within ``horizon`` frames of a clip end are invalid (< 1 %), so 2x is enough.
+            start, history = self.buffer.sample_starts(2 * batch_size, self.cfg.hist)
+            valid = self.mdp.valid_imagination_start(start["f"], self.cfg.horizon)
+            indices = torch.sort((~valid).to(torch.uint8), stable=True).indices[:batch_size]
+            return (
+                {key: value[indices] for key, value in start.items()},
+                {key: value[indices] for key, value in history.items()},
+            )
+
         starts = []
         histories = []
         count = 0
@@ -452,8 +477,18 @@ class SuperMimicLearner:
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
             nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
-            if torch.isfinite(grad_norm):
+            if self.cfg.no_sync:
+                # Skip a non-finite update without reading the norm on the host: zero the
+                # gradients on-device instead of branching on ``torch.isfinite``.
+                finite = torch.isfinite(grad_norm)
+                for parameter in self.pi.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.copy_(torch.where(finite, parameter.grad, 0.0))
                 self.opt_pi.step()
+            elif torch.isfinite(grad_norm):
+                self.opt_pi.step()
+            if self.pi_avg is not None:
+                self.pi_avg.update_parameters(self.pi)
         finally:
             _set_requires_grad(self.wm, True)
             _set_requires_grad(self.critic, True)
@@ -534,15 +569,20 @@ class SuperMimicLearner:
         )
 
     def _checkpoint(self, include_optimizers: bool) -> dict[str, Any]:
+        policy_state = (
+            self.pi_avg.module.state_dict() if self.pi_avg is not None else self.pi.state_dict()
+        )
         checkpoint = {
             "wm": self.wm.state_dict(),
-            "pi": self.pi.state_dict(),
+            "pi": policy_state,
             "iteration": self.iteration,
             "wall_time": self.wall_time,
             "sim_steps": self.sim_steps,
             "args": asdict(self.cfg),
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if self.pi_avg is not None:
+            checkpoint["pi_live"] = self.pi.state_dict()
         if include_optimizers:
             checkpoint.update(
                 {
@@ -571,7 +611,12 @@ class SuperMimicLearner:
                 f"SuperMimic resume requires a full last.pt checkpoint; missing {missing} in {path}"
             )
         self.wm.load_state_dict(checkpoint["wm"])
-        self.pi.load_state_dict(checkpoint["pi"])
+        if "pi_live" in checkpoint:
+            self.pi.load_state_dict(checkpoint["pi_live"])
+        else:
+            self.pi.load_state_dict(checkpoint["pi"])
+        if self.pi_avg is not None:
+            self.pi_avg.module.load_state_dict(checkpoint["pi"])
         self.critic.load_state_dict(checkpoint["critic"])
         self.opt_wm.load_state_dict(checkpoint["opt_wm"])
         self.opt_pi.load_state_dict(checkpoint["opt_pi"])

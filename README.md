@@ -238,6 +238,21 @@ Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.
 
 Per-clip distribution on BONES-SEED: median 0.9528, P10 0.8337, P90 0.9841. BONES-SEED converges much faster (early-termination 0.83% vs 29.4% at iteration 2000) and finishes higher on both training reward and evaluation return. An independent RTX 5090 run reproduces these numbers (0.9262 on a random 10,000-clip subset, within 0.002 of the full-library value).
 
+### BONES-SEED with EMA and no-sync training (8000 iterations)
+
+Building on the fused 3×3 rotations and fused Adam already in this repository, an EMA policy (`pi_ema: 0.995`), no host-device syncs (`no_sync: true`), and `lr: 4e-4` reach a higher return in two-thirds of the iterations on the same one RTX 4090 (48 GB). Every checkpoint is evaluated on the complete 129,487-clip library.
+
+| checkpoint | iterations | norm_return | frame-weighted | failed clips |
+|---|---|---:|---:|---:|
+| ckpt_002000.pt | 2000 | 0.8092 | 0.8187 | 1901 / 129,487 (1.47%) |
+| ckpt_004000.pt | 4000 | 0.9125 | 0.9165 | 660 / 129,487 (0.51%) |
+| ckpt_006000.pt | 6000 | 0.9306 | 0.9342 | 206 / 129,487 (0.16%) |
+| ckpt_008000.pt | 8000 | 0.9395 | 0.9433 | 193 / 129,487 (0.15%) |
+
+![EMA + no-sync + lr: full-library evaluation and training reward through iteration 8000](docs/assets/boneseed_optimized_curve.png)
+
+At 8000 iterations this configuration already exceeds the 12000-iteration baseline on normalized return (0.9395 vs 0.9243) and halves the number of failed clips (193 vs 350).
+
 ## Tests
 
 ```bash
