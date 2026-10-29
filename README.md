@@ -7,10 +7,18 @@
 <p align="center">
   <a href="https://arxiv.org/abs/2610.28480"><img src="https://img.shields.io/badge/paper-arXiv--2610.28480-red" alt="Paper"></a>
   <a href="https://pypi.org/project/unilab/"><img src="https://img.shields.io/pypi/v/unilab" alt="UniLab PyPI"></a>
+  <a href="#bones-seed-library-129487-clips"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED: 129,487 clips"></a>
+  <a href="#results"><img src="https://img.shields.io/badge/single%20GPU-%7E40%20min-green" alt="Single GPU: about 40 minutes"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License"></a>
 </p>
 
-UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://supermimic.github.io) on **UniLab** for Unitree G1 whole-body tracking of LAFAN1 motions, with **mjwarp, MuJoCo, and Motrix** backends. It includes a differentiable world model, a goal-conditioned policy, a Manager-Based task, tools for 40 motion assets, and entry points for training and deterministic full-library evaluation.
+UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://supermimic.github.io) on **UniLab** for Unitree G1 whole-body tracking, with **mjwarp, MuJoCo, and Motrix** backends. It includes a differentiable world model, a goal-conditioned policy, a Manager-Based task, pipelines for the 40-clip LAFAN1 set and the 129,487-clip BONES-SEED compact library, and entry points for training and deterministic full-library evaluation.
+
+### Highlights
+
+- **BONES-SEED at scale**: download, convert, filter, pack, train on, and deterministically evaluate a 129,487-clip / 47.3M-frame motion library from one repository.
+- **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow, reaching a strong BONES-SEED checkpoint in about 40 minutes; the complete 12,000-iteration validation run is reported below.
+- **Three simulation backends**: switch between mjwarp, MuJoCo, and Motrix without changing the policy or dataset configuration.
 
 <p align="center">
   <a href="docs/assets/supermimic_comparison.mp4"><img src="docs/assets/supermimic_comparison.gif" alt="SuperMimic policy and reference motion comparison" width="95%"></a>
@@ -37,6 +45,7 @@ unisupermimic/
 │   │   └── registry.py             # G1SuperMimic registration
 │   ├── scripts/train_supermimic.py # Training, resume, and evaluation entry point
 │   ├── conf/supermimic/            # Hydra configuration
+│   ├── data/boneseed.py            # BONES-SEED download/convert/filter/pack CLI
 │   ├── assets/robots/g1/           # G1 MJCF; meshes/URDF are downloaded and untracked
 │   ├── assets/motions/             # LAFAN1 CSV files, downloaded and untracked
 │   └── sim2sim.py                  # Policy I/O, network shape, and asset identity checks
