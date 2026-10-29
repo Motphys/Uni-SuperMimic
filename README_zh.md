@@ -7,10 +7,18 @@
 <p align="center">
   <a href="https://arxiv.org/abs/2610.28480"><img src="https://img.shields.io/badge/paper-arXiv--2610.28480-red" alt="论文"></a>
   <a href="https://pypi.org/project/unilab/"><img src="https://img.shields.io/pypi/v/unilab" alt="UniLab PyPI"></a>
+  <a href="#bones-seed-动作库129487-段"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED：129,487 段动作"></a>
+  <a href="#结果"><img src="https://img.shields.io/badge/%E5%8D%95%E5%8D%A1-%E7%BA%A640%20%E5%88%86%E9%92%9F-green" alt="单卡：约 40 分钟"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 许可"></a>
 </p>
 
-UniSuperMimic 是 [SuperMimic](https://supermimic.github.io) 在 **UniLab** 上的独立下游复现，支持 **mjwarp、MuJoCo 和 Motrix** 后端，面向 Unitree G1 的 LAFAN1 全身运动跟踪。仓库包含可微世界模型、目标条件策略、Manager-Based 任务、40 段运动资产工具，以及训练和确定性全库评估入口。
+UniSuperMimic 是 [SuperMimic](https://supermimic.github.io) 在 **UniLab** 上的独立下游复现，支持 **mjwarp、MuJoCo 和 Motrix** 后端，面向 Unitree G1 全身运动跟踪。仓库包含可微世界模型、目标条件策略、Manager-Based 任务、覆盖 40 段 LAFAN1 与 129,487 段 BONES-SEED 紧凑动作库的数据管线，以及训练和确定性全库评估入口。
+
+### 特性亮点
+
+- **大规模 BONES-SEED**：在同一个仓库内完成 129,487 段、4730 万帧动作库的下载、转换、过滤、打包、训练和确定性评估。
+- **单卡高效**：mjwarp、MuJoCo 和 Motrix 三个后端都支持高效单卡工作流，约 40 分钟即可得到表现良好的 BONES-SEED checkpoint；下方同时给出 12000 轮完整验证结果。
+- **三种仿真后端**：策略和数据集配置不变，可在 mjwarp、MuJoCo、Motrix 之间切换。
 
 <p align="center">
   <a href="docs/assets/supermimic_comparison.mp4"><img src="docs/assets/supermimic_comparison.gif" alt="SuperMimic 与参考动作对比" width="95%"></a>
@@ -37,6 +45,7 @@ unisupermimic/
 │   │   └── registry.py             # G1SuperMimic 注册
 │   ├── scripts/train_supermimic.py # 训练、续训和 eval 入口
 │   ├── conf/supermimic/            # Hydra 配置
+│   ├── data/boneseed.py            # BONES-SEED 下载/转换/过滤/打包命令行入口
 │   ├── assets/robots/g1/           # G1 MJCF；mesh/URDF 下载后不纳入 git
 │   ├── assets/motions/             # LAFAN1 CSV，下载后不纳入 git
 │   └── sim2sim.py                  # 策略 I/O、网络形状和资产身份校验
