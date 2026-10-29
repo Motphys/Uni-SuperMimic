@@ -27,7 +27,9 @@ dependencies = [
     "pillow>=10",
     # torch and its ROCm triton are direct requirements here (not only via
     # unilab) because uv applies tool.uv.sources to direct dependencies only.
+    # triton-rocm supplies the AMD backend; triton supplies the Python core.
     "torch>=2.9,<2.15",
+    "triton==3.8.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "triton-rocm==3.8.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
