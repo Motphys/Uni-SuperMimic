@@ -88,6 +88,14 @@ def skew(vector: torch.Tensor) -> torch.Tensor:
     )
 
 
+def matmul(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    return (first.unsqueeze(-1) * second.unsqueeze(-3)).sum(-2)
+
+
+def matvec(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    return (matrix * vector.unsqueeze(-2)).sum(-1)
+
+
 def so3_exp(vector: torch.Tensor) -> torch.Tensor:
     theta2 = (vector * vector).sum(-1, keepdim=True)
     theta = torch.sqrt(theta2 + 1e-12)
@@ -96,7 +104,7 @@ def so3_exp(vector: torch.Tensor) -> torch.Tensor:
     b = torch.where(small, 0.5 - theta2 / 24, (1 - torch.cos(theta)) / (theta2 + 1e-12))
     skew_matrix = skew(vector)
     eye = torch.eye(3, device=vector.device, dtype=vector.dtype).expand(skew_matrix.shape)
-    return eye + a[..., None] * skew_matrix + b[..., None] * (skew_matrix @ skew_matrix)
+    return eye + a[..., None] * skew_matrix + b[..., None] * matmul(skew_matrix, skew_matrix)
 
 
 def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
@@ -173,9 +181,9 @@ def invariant_features(state: State) -> torch.Tensor:
     return torch.cat(
         (
             position[..., 2:3],
-            mat_to_6d(heading.transpose(-1, -2) @ rotation),
-            (rotation_t @ lin_vel.unsqueeze(-1)).squeeze(-1),
-            (rotation_t @ ang_vel.unsqueeze(-1)).squeeze(-1),
+            mat_to_6d(matmul(heading.transpose(-1, -2), rotation)),
+            matvec(rotation_t, lin_vel),
+            matvec(rotation_t, ang_vel),
             joint_pos,
             joint_vel,
         ),
@@ -189,6 +197,8 @@ __all__ = [
     "invariant_features",
     "mat_to_6d",
     "mat_to_quat",
+    "matmul",
+    "matvec",
     "quat_slerp",
     "quat_to_mat",
     "quat_to_rotvec",

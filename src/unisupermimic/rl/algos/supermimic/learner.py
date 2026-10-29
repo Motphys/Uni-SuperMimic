@@ -139,9 +139,12 @@ class SuperMimicLearner:
             self.critic.net = mlp(self.critic.norm.mean.numel(), cfg.test_hidden_dims, 1).to(
                 self.device
             )
-        self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
-        self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
-        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        fused_adam = self.device.type == "cuda"
+        self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
+        self.opt_pi = torch.optim.Adam(
+            self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
+        )
+        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
 
         self.buffer = ReplayBuffer(
             cfg.buffer_steps,

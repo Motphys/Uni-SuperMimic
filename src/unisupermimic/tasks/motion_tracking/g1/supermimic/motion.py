@@ -12,6 +12,8 @@ import torch
 
 from unisupermimic.rl.algos.supermimic.geometry import (
     mat_to_6d,
+    matmul,
+    matvec,
     quat_slerp,
     quat_to_mat,
     so3_log,
@@ -301,8 +303,8 @@ class MotionLib:
             root_R = quat_to_mat(reference[..., 3:7])
             root_v = reference[..., 36:39]
             root_w = reference[..., 39:42]
-            root_v_local = (root_R.transpose(-1, -2) @ root_v.unsqueeze(-1)).squeeze(-1)
-            root_w_local = (root_R.transpose(-1, -2) @ root_w.unsqueeze(-1)).squeeze(-1)
+            root_v_local = matvec(root_R.transpose(-1, -2), root_v)
+            root_w_local = matvec(root_R.transpose(-1, -2), root_w)
             q, qd = reference[..., 7:36], reference[..., 42:71]
             current_p = self._ref[frames, :3].float()
         else:
@@ -314,8 +316,8 @@ class MotionLib:
             q, qd = self.q[future], self.qd[future]
             current_p = self.root_p[frames]
         heading_t = yaw_mat(current_rotation).transpose(-1, -2).unsqueeze(1)
-        position_delta = (heading_t @ (root_p - current_p.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
-        rotation = mat_to_6d(heading_t @ root_R)
+        position_delta = matvec(heading_t, root_p - current_p.unsqueeze(1))
+        rotation = mat_to_6d(matmul(heading_t, root_R))
         features = torch.cat(
             (position_delta, rotation, root_v_local, root_w_local, q, qd * 0.1), -1
         )
