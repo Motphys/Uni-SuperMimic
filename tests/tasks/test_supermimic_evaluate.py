@@ -162,6 +162,21 @@ class FakePolicy:
         return torch.zeros(history.shape[0], self.num_joints)
 
 
+@pytest.mark.parametrize(
+    ("platform", "mps_available", "expected"),
+    (("darwin", True, "mps"), ("darwin", False, "cpu"), ("linux", True, "cpu")),
+)
+def test_policy_device_auto_preserves_platform_compatibility(
+    monkeypatch, platform: str, mps_available: bool, expected: str
+) -> None:
+    monkeypatch.setattr(supermimic_evaluate.sys, "platform", platform)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps_available)
+
+    device = supermimic_evaluate._resolve_policy_device(torch.device("cpu"), None, "auto")
+
+    assert device == torch.device(expected)
+
+
 def test_evaluate_first_done_history_and_return_aggregation(monkeypatch) -> None:
     FakePolicy.instances = []
     monkeypatch.setattr(networks, "Policy", FakePolicy)
@@ -179,7 +194,7 @@ def test_evaluate_first_done_history_and_return_aggregation(monkeypatch) -> None
         },
     }
 
-    result = supermimic_evaluate.evaluate(env, checkpoint, device="cpu")
+    result = supermimic_evaluate.evaluate(env, checkpoint, device="cpu", policy_device="cpu")
 
     assert result["n_failed"] == 1
     assert result["failed"] == ["hard"]
@@ -314,7 +329,7 @@ def test_evaluate_recycles_environments_for_pending_clips(monkeypatch) -> None:
             "policy_hidden": [8],
         },
     }
-    result = supermimic_evaluate.evaluate(RecyclingEnv(), checkpoint)
+    result = supermimic_evaluate.evaluate(RecyclingEnv(), checkpoint, policy_device="cpu")
 
     assert len(reset_calls) == 3
     torch.testing.assert_close(reset_calls[0][0], torch.tensor([10, 20]))
