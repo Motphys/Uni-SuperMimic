@@ -222,6 +222,9 @@ def test_tf32_only_enabled_for_fp32_training(tmp_path) -> None:
 def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
 
+    optimizers = (learner.opt_wm, learner.opt_pi, learner.opt_v)
+    assert all(optimizer.defaults["fused"] is False for optimizer in optimizers)
+
     learner.collect(3)
     wm_loss, wm_error = learner.wm_update()
     policy_loss, value_loss, imagined_reward, grad_norm, survival = learner.policy_update()
@@ -240,6 +243,23 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     ):
         assert metric.ndim == 0
         assert torch.isfinite(metric)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_collect_and_updates_run_with_fused_adam_on_cuda(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path, device="cuda")
+
+    assert learner.device.type == "cuda"
+    optimizers = (learner.opt_wm, learner.opt_pi, learner.opt_v)
+    assert all(optimizer.defaults["fused"] is True for optimizer in optimizers)
+
+    learner.collect(3)
+    wm_loss, _ = learner.wm_update()
+    policy_loss, value_loss, _, _, _ = learner.policy_update()
+
+    assert torch.isfinite(wm_loss)
+    assert torch.isfinite(policy_loss)
+    assert torch.isfinite(value_loss)
 
 
 def test_matching_explicit_device_disables_bridging(tmp_path) -> None:
