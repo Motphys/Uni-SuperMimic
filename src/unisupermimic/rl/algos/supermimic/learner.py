@@ -142,6 +142,10 @@ class SuperMimicLearner:
         self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
         self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        self._v_mean = torch.zeros((), device=self.device)
+        self._v_std = torch.ones((), device=self.device)
+        self._v_ema = 0.01
+        self._v_init = False
 
         self.buffer = ReplayBuffer(
             cfg.buffer_steps,
@@ -441,8 +445,11 @@ class SuperMimicLearner:
             reward_sum = (continuation * rewards).detach().sum(0)
             detached_rewards, detached_dones = rewards.detach(), dones.detach()
             if not self.cfg.no_critic:
-                objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * self.critic(
+                bootstrap = self.critic(
                     self._critic_input_fn(state, frames, normalized_context, goal)
+                )
+                objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
+                    bootstrap * self._v_std + self._v_mean
                 )
             loss = -objective.mean()
             self.opt_pi.zero_grad(set_to_none=True)
@@ -487,7 +494,7 @@ class SuperMimicLearner:
                 ).view(self.cfg.horizon + 1, batch_size, -1)
             self.critic.norm.update(critic_input)
             with torch.no_grad():
-                values = self.critic(critic_input)
+                values = self.critic(critic_input) * self._v_std + self._v_mean
                 target = values[-1]
                 targets = []
                 for index in range(self.cfg.horizon - 1, -1, -1):
@@ -496,6 +503,20 @@ class SuperMimicLearner:
                     ) * ((1 - self.cfg.lam) * values[index + 1] + self.cfg.lam * target)
                     targets.append(target)
                 targets = torch.stack(targets[::-1])
+                target_mean = targets.mean()
+                target_std = targets.std().clamp(min=1e-2)
+                if not self._v_init:
+                    self._v_mean = target_mean.detach()
+                    self._v_std = target_std.detach()
+                    self._v_init = True
+                else:
+                    self._v_mean = (1 - self._v_ema) * self._v_mean + self._v_ema * target_mean
+                    self._v_std = (
+                        ((1 - self._v_ema) * self._v_std**2 + self._v_ema * target_std**2)
+                        .sqrt()
+                        .clamp(min=1e-2)
+                    )
+                targets = ((targets - self._v_mean) / self._v_std).clamp(-20.0, 20.0)
             flat_input = critic_input[:-1].reshape(-1, critic_input.shape[-1])
             flat_targets = targets.reshape(-1)
             num_samples = flat_input.shape[0]
