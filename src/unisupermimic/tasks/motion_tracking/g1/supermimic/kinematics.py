@@ -7,7 +7,12 @@ from collections.abc import Sequence
 
 import torch
 
-from unisupermimic.rl.algos.supermimic.geometry import axis_angle_to_mat, quat_to_mat
+from unisupermimic.rl.algos.supermimic.geometry import (
+    axis_angle_to_mat,
+    matmul,
+    matvec,
+    quat_to_mat,
+)
 
 from .robot import G1_JOINT_NAMES, TRACKED_BODIES
 
@@ -99,12 +104,12 @@ class G1Kinematics:
             parent_index = self.parent[index]
             joint_index = self.joint_idx[index]
             parent_rotation = rotations[parent_index]
-            position = positions[parent_index] + (
-                parent_rotation @ self.off_p[index].unsqueeze(-1)
-            ).squeeze(-1)
-            offset_rotation = parent_rotation @ self.off_R[index]
-            rotation = offset_rotation @ axis_angle_to_mat(self.axes[index], q[..., joint_index])
-            axis_world = (offset_rotation @ self.axes[index].unsqueeze(-1)).squeeze(-1)
+            position = positions[parent_index] + matvec(parent_rotation, self.off_p[index])
+            offset_rotation = matmul(parent_rotation, self.off_R[index])
+            rotation = matmul(
+                offset_rotation, axis_angle_to_mat(self.axes[index], q[..., joint_index])
+            )
+            axis_world = matvec(offset_rotation, self.axes[index])
             angular_velocity = (
                 angular_velocities[parent_index]
                 + axis_world * qd[..., joint_index : joint_index + 1]

@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from unisupermimic.rl.contracts.supermimic import State
 
-from .geometry import invariant_features, so3_exp, so3_log, yaw_mat
+from .geometry import invariant_features, matmul, matvec, so3_exp, so3_log, yaw_mat
 
 
 def mlp(
@@ -122,10 +122,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (next_position - position).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ next_rotation),
-                (rotation_t @ (next_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (next_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), next_position - position),
+                so3_log(matmul(rotation_t, next_rotation)),
+                matvec(rotation_t, next_lin_vel - lin_vel),
+                matvec(rotation_t, next_ang_vel - ang_vel),
                 next_joint_pos - joint_pos,
                 next_joint_vel - joint_vel,
             ),
@@ -148,10 +148,10 @@ class WorldModel(nn.Module):
         d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
-        next_position = position + (heading @ d_position.unsqueeze(-1)).squeeze(-1)
-        next_rotation = rotation @ so3_exp(d_rotation)
-        next_lin_vel = lin_vel + (rotation @ d_lin_vel.unsqueeze(-1)).squeeze(-1)
-        next_ang_vel = ang_vel + (rotation @ d_ang_vel.unsqueeze(-1)).squeeze(-1)
+        next_position = position + matvec(heading, d_position)
+        next_rotation = matmul(rotation, so3_exp(d_rotation))
+        next_lin_vel = lin_vel + matvec(rotation, d_lin_vel)
+        next_ang_vel = ang_vel + matvec(rotation, d_ang_vel)
         return (
             next_position,
             next_rotation,
@@ -177,12 +177,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (predicted_position - position).unsqueeze(-1)).squeeze(
-                    -1
-                ),
-                so3_log(rotation_t @ predicted_rotation),
-                (rotation_t @ (predicted_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (predicted_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), predicted_position - position),
+                so3_log(matmul(rotation_t, predicted_rotation)),
+                matvec(rotation_t, predicted_lin_vel - lin_vel),
+                matvec(rotation_t, predicted_ang_vel - ang_vel),
                 predicted_joint_pos - joint_pos,
                 predicted_joint_vel - joint_vel,
             ),

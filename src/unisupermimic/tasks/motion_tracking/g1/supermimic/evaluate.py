@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from omegaconf import OmegaConf
 
 from unisupermimic.rl.algos.supermimic import networks
 from unisupermimic.rl.algos.supermimic.geometry import unflatten_state
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
     SUPERMIMIC_TRANSITION_KEY,
+    State,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.env import SUPPORTED_BACKENDS
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import MAX_STEP_REWARD, MDP
@@ -35,6 +37,7 @@ EVAL_CSV_FIELDS = (
     "n_failed",
     "failed",
 )
+DEFAULT_EVAL_NUM_ENVS = 16_384
 
 
 def load_policy(
@@ -77,20 +80,39 @@ def evaluate(
     policy = load_policy(env, checkpoint, device)
 
     num_clips = len(motion.names)
-    if env.num_envs != num_clips:
+    num_envs = int(env.num_envs)
+    if num_envs > num_clips:
         raise ValueError(
-            f"SuperMimic evaluation requires one environment per clip: "
-            f"got {env.num_envs} environments for {num_clips} clips"
+            f"SuperMimic evaluation environment count must not exceed clips: "
+            f"got {num_envs} environments for {num_clips} clips"
         )
-    _, reset_info = env.reset_to_frames(motion.clip_start.clone())
+
+    # Recycle finished environments. Starting the longest clips first makes the
+    # final batch contain the shortest clips, so the fixed-size backend batch has
+    # almost no idle tail after the last pending clip has been scheduled.
+    clip_order = motion.clip_len.argsort(descending=True, stable=True)
+    ordered_starts = motion.clip_start[clip_order].clone()
+    _, reset_info = env.reset_to_frames(ordered_starts[:num_envs].clone())
     current = reset_info[SUPERMIMIC_STATE_KEY]
     returns = torch.zeros(num_clips, device=env.device)
     steps = torch.zeros(num_clips, dtype=torch.int64, device=env.device)
-    finished = torch.zeros(num_clips, dtype=torch.bool, device=env.device)
-    failed = torch.zeros_like(finished)
+    failed = torch.zeros(num_clips, dtype=torch.bool, device=env.device)
+    assigned = torch.arange(num_envs, dtype=torch.int64, device=env.device)
+    next_clip = num_envs
     history = None
 
-    while not bool(finished.all()):
+    def reset_history(info: dict[str, torch.Tensor], env_ids: torch.Tensor) -> None:
+        assert history is not None
+        state = cast(State, tuple(value[env_ids] for value in unflatten_state(info["s"])))
+        obs = mdp.obs(
+            state,
+            info["a_prev"][env_ids],
+            info["xi"][env_ids],
+            info["f"][env_ids],
+        )
+        history[env_ids] = obs.unsqueeze(1).expand(-1, hist, -1)
+
+    while bool((assigned >= 0).any()):
         obs = mdp.obs(
             unflatten_state(current["s"]),
             current["a_prev"],
@@ -105,13 +127,29 @@ def evaluate(
         action = policy(history, goal)
         state = env.step(action)
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
-
-        alive = ~finished
-        returns += torch.where(alive, transition["r"], torch.zeros_like(transition["r"]))
-        steps += alive
-        failed |= alive & transition["term"]
-        finished |= alive & transition["done"]
+        active = assigned >= 0
+        active_ids = active.nonzero(as_tuple=False).flatten()
+        active_clips = assigned[active_ids]
+        returns[active_clips] += transition["r"][active_ids]
+        steps[active_clips] += 1
+        failed[active_clips] |= transition["term"][active_ids]
         current = state.info[SUPERMIMIC_STATE_KEY]
+
+        completed = (transition["done"] & active).nonzero(as_tuple=False).flatten()
+        reset_count = min(completed.numel(), num_clips - next_clip)
+        if reset_count:
+            reset_ids = completed[:reset_count]
+            reset_clips = clip_order[next_clip : next_clip + reset_count].to(assigned.device)
+            _, reset_info = env.reset_to_frames(
+                ordered_starts[next_clip : next_clip + reset_count],
+                env_ids=reset_ids,
+            )
+            current = reset_info[SUPERMIMIC_STATE_KEY]
+            reset_history(current, reset_ids)
+            assigned[reset_ids] = reset_clips
+            next_clip += reset_count
+        if reset_count < completed.numel():
+            assigned[completed[reset_count:]] = -1
 
     max_returns = (motion.clip_len - 1).float() * MAX_STEP_REWARD
     normalized = returns / max_returns
@@ -254,7 +292,11 @@ def watch(
         time.sleep(poll_seconds)
 
 
-def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBasedRlEnv:
+def make_eval_env(
+    run_dir: Path,
+    backend: str = "mjwarp",
+    num_envs: int | None = None,
+) -> SuperMimicManagerBasedRlEnv:
     from hydra import compose, initialize_config_dir
     from unilab.base.config_adapter import create_env
     from unilab.base.process_device import configure_backend_process_device
@@ -270,6 +312,19 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         cfg = compose(config_name="config", overrides=overrides)
     ensure_registries()
+    run_config = run_dir / "run_config.json"
+    if run_config.is_file():
+        contract = json.loads(run_config.read_text(encoding="utf-8")).get("contract_snapshot", {})
+        source_motion_files = contract.get("env.commands.motion.motion_files")
+        if source_motion_files is not None:
+            OmegaConf.update(cfg, "env.commands.motion.motion_files", source_motion_files)
+    clip_count = _motion_count(cfg)
+    if num_envs is None:
+        num_envs = min(clip_count, DEFAULT_EVAL_NUM_ENVS)
+    if not isinstance(num_envs, int) or isinstance(num_envs, bool) or num_envs <= 0:
+        raise ValueError(f"evaluation num_envs must be a positive integer, got {num_envs!r}")
+    if num_envs > clip_count:
+        raise ValueError(f"evaluation num_envs must not exceed clip count {clip_count}: {num_envs}")
     resolve_sim2sim_config(
         run_dir,
         cfg,
@@ -284,7 +339,7 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
         "SuperMimicManagerBasedRlEnv",
         create_env(
             cfg,
-            num_envs=_motion_count(cfg),
+            num_envs=num_envs,
             env_cfg_override=build_env_override(cfg, eval_mode=True, learner_device=device),
         ),
     )
@@ -294,6 +349,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dir", type=Path)
     parser.add_argument("--ckpt", type=Path)
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=None,
+        help="maximum parallel environments; defaults to min(clip count, 16384)",
+    )
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
     )
@@ -311,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.ckpt is None and args.run_dir is None:
         _argument_parser().error("one of --run_dir or --ckpt is required")
     run_dir = args.ckpt.parent if args.ckpt is not None else args.run_dir
-    env = make_eval_env(run_dir, backend=args.backend)
+    env = make_eval_env(run_dir, backend=args.backend, num_envs=args.num_envs)
     try:
         if args.ckpt is not None:
             device = torch.device(env.device)
