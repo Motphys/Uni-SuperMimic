@@ -34,6 +34,10 @@ def mlp(
 class RunningNorm(nn.Module):
     """Running mean and variance, frozen once ``max_count`` is reached."""
 
+    # When True, the freeze test and the buffer update run on-device (``torch.where``)
+    # instead of a host-side ``if``, avoiding a CPU<->GPU sync in the training loop.
+    no_sync: bool = False
+
     def __init__(self, dim: int, max_count: float = 2e8, eps: float = 1e-2):
         super().__init__()
         self.mean: torch.Tensor
@@ -48,20 +52,28 @@ class RunningNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1, x.shape[-1]).float()
-        if self.count >= self.max_count:
+        if not self.no_sync and self.count >= self.max_count:
             return
         batch_count = x.shape[0]
         batch_mean = x.mean(0)
         batch_var = x.var(0, unbiased=False)
         total = self.count + batch_count
         delta = batch_mean - self.mean
-        self.mean += delta * batch_count / total
-        self.var = (
+        mean = self.mean + delta * batch_count / total
+        var = (
             self.var * self.count
             + batch_var * batch_count
             + delta**2 * self.count * batch_count / total
         ) / total
-        self.count = total
+        if self.no_sync:
+            live = self.count < self.max_count
+            self.mean.copy_(torch.where(live, mean, self.mean))
+            self.var.copy_(torch.where(live, var, self.var))
+            self.count.copy_(torch.where(live, total, self.count))
+        else:
+            self.mean.copy_(mean)
+            self.var.copy_(var)
+            self.count.copy_(total)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
