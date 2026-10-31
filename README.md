@@ -206,6 +206,35 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+### Viser Batch Playback
+
+Add `--viser` to direct checkpoint evaluation to inspect multiple deterministic rollouts in a browser. This reuses UniLab's Viser renderer, so neither a local display nor `MUJOCO_GL` is required:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --viser \
+  --viser_max_envs 16 \
+  --viser_port 8080
+```
+
+The evaluator reads `run_config.json` beside the checkpoint and reuses its recorded motion library, so no separate motion-file override is needed. The example above selects the run's LAFAN1 library. To render BONES-SEED instead, select a BONES-SEED checkpoint; its run configuration automatically selects `data/library/bones_seed_compact.pt`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_001/ckpt_012000.pt \
+  --viser \
+  --viser_max_envs 16
+```
+
+If `run_config.json` is absent, evaluation falls back to the default LAFAN1 library.
+
+Open <http://localhost:8080>. The **Controls** panel switches between the batch grid and a single environment, and provides pause, single-step, and speed controls. Viser mode creates at most 16 simulation environments by default; use `--num_envs N` to change the runtime batch size and `--viser_max_envs N` to cap the number visible in the grid. Finished environments load pending clips and restart their assigned clips after the library is exhausted. Additional options include `--render_spacing`, `--viser_display single`, `--viser_env_idx`, `--start_paused`, and `--speed`. Press Ctrl+C in the terminal to stop the server.
+
+For a remote GPU server, forward the port before opening the browser: `ssh -L 8080:localhost:8080 <server>`. Viser playback is interactive and does not write an MP4; use the video exporter below for file output.
+
 ## Video Export
 
 The following command rolls out `jumps1_subject1` continuously from a checkpoint, trims the result to the jumping segment from 6–14 seconds, and writes a 25 fps comparison MP4:

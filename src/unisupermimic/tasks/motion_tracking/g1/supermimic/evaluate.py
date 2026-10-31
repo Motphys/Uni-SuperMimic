@@ -190,6 +190,149 @@ def evaluate(
     }
 
 
+class SuperMimicPlaybackSession:
+    """Deterministic batched rollouts behind UniLab's viewer session contract."""
+
+    def __init__(
+        self,
+        env: SuperMimicManagerBasedRlEnv,
+        checkpoint: dict,
+        device: str | torch.device | None = None,
+        policy_device: str | torch.device = "auto",
+    ) -> None:
+        self.env = env
+        self.mdp = cast(MDP, env.supermimic_mdp)
+        self.motion = self.mdp.motion
+        self.inference_device = _resolve_policy_device(
+            torch.device(env.device), device, policy_device
+        )
+        if self.inference_device.type == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("MPS policy inference was requested but MPS is not available")
+        self.policy = load_policy(env, checkpoint, self.inference_device)
+        if self.inference_device.type == "mps":
+            networks.AMP_DTYPE = None
+        args = checkpoint["args"]
+        self.goal_frames = int(args["goal_frames"])
+        self.hist = int(args["hist"])
+        self.num_envs = int(env.num_envs)
+        num_clips = len(self.motion.names)
+        if self.num_envs > num_clips:
+            raise ValueError(
+                f"SuperMimic playback environment count must not exceed clips: "
+                f"got {self.num_envs} environments for {num_clips} clips"
+            )
+        self.clip_order = self.motion.clip_len.argsort(descending=True, stable=True).to(env.device)
+        self.clip_starts = self.motion.clip_start.to(env.device)
+        self.assigned = self.clip_order[: self.num_envs].clone()
+        self.next_clip = self.num_envs
+        self.current: dict[str, torch.Tensor] | None = None
+        self.history: torch.Tensor | None = None
+
+    def reset(self) -> dict[str, torch.Tensor]:
+        self.assigned = self.clip_order[: self.num_envs].clone()
+        self.next_clip = self.num_envs
+        _, info = self.env.reset_to_frames(self.clip_starts[self.assigned].clone())
+        current = cast(dict[str, torch.Tensor], info[SUPERMIMIC_STATE_KEY])
+        self.current = current
+        self.history = None
+        return current
+
+    def _reset_history(self, env_ids: torch.Tensor) -> None:
+        assert self.current is not None
+        assert self.history is not None
+        state = cast(State, tuple(value[env_ids] for value in unflatten_state(self.current["s"])))
+        obs = self.mdp.obs(
+            state,
+            self.current["a_prev"][env_ids],
+            self.current["xi"][env_ids],
+            self.current["f"][env_ids],
+        )
+        policy_env_ids = env_ids.to(self.inference_device)
+        self.history[policy_env_ids] = (
+            obs.unsqueeze(1).expand(-1, self.hist, -1).to(self.inference_device)
+        )
+
+    @torch.inference_mode()
+    def step_once(self) -> None:
+        assert self.current is not None
+        current = self.current
+        obs = self.mdp.obs(
+            unflatten_state(current["s"]),
+            current["a_prev"],
+            current["xi"],
+            current["f"],
+        ).to(self.inference_device)
+        if self.history is None:
+            self.history = obs.unsqueeze(1).repeat(1, self.hist, 1)
+        else:
+            self.history = torch.cat((self.history[:, 1:], obs.unsqueeze(1)), dim=1)
+        goal = self.mdp.goal(current["f"], self.goal_frames).to(self.inference_device)
+        action = self.policy(self.history, goal)
+        state = self.env.step(action.to(self.env.device))
+        transition = state.info[SUPERMIMIC_TRANSITION_KEY]
+        self.current = state.info[SUPERMIMIC_STATE_KEY]
+
+        completed = transition["done"].nonzero(as_tuple=False).flatten()
+        if completed.numel() == 0:
+            return
+        reset_clips = self.assigned[completed].clone()
+        pending_count = min(completed.numel(), len(self.motion.names) - self.next_clip)
+        if pending_count:
+            reset_clips[:pending_count] = self.clip_order[
+                self.next_clip : self.next_clip + pending_count
+            ]
+            self.next_clip += pending_count
+        _, info = self.env.reset_to_frames(self.clip_starts[reset_clips].clone(), env_ids=completed)
+        self.current = info[SUPERMIMIC_STATE_KEY]
+        self.assigned[completed] = reset_clips
+        self._reset_history(completed)
+
+    def advance(self, controls: Any) -> bool:
+        if not controls.consume_step_permission():
+            return False
+        self.step_once()
+        return True
+
+    def physics_state(self) -> Any:
+        return self.env.get_physics_state_snapshot()
+
+    @property
+    def info(self) -> dict[str, Any]:
+        state = getattr(self.env, "state", None)
+        info = getattr(state, "info", None)
+        return info if isinstance(info, dict) else {}
+
+
+def run_viser_evaluation(
+    env: SuperMimicManagerBasedRlEnv,
+    checkpoint: dict,
+    *,
+    device: str | torch.device | None = None,
+    policy_device: str | torch.device = "auto",
+    port: int = 8080,
+    max_visible_envs: int = 16,
+    env_idx: int = 0,
+    display_mode: str = "all",
+    render_spacing: float = 1.0,
+    start_paused: bool = False,
+    speed: float = 1.0,
+) -> None:
+    from unilab.visualization.viser_playback import run_viser_playback
+
+    session = SuperMimicPlaybackSession(env, checkpoint, device=device, policy_device=policy_device)
+    run_viser_playback(
+        session,
+        port=port,
+        max_visible_envs=max_visible_envs,
+        env_idx=env_idx,
+        display_mode=display_mode,
+        render_spacing=render_spacing,
+        start_paused=start_paused,
+        speed=speed,
+        entrypoint="unisupermimic-eval --viser",
+    )
+
+
 def _checkpoint_iteration(path: Path) -> int:
     try:
         return int(path.stem.removeprefix("ckpt_"))
@@ -316,6 +459,8 @@ def make_eval_env(
     run_dir: Path,
     backend: str = "mjwarp",
     num_envs: int | None = None,
+    *,
+    default_num_envs: int = DEFAULT_EVAL_NUM_ENVS,
 ) -> SuperMimicManagerBasedRlEnv:
     from hydra import compose, initialize_config_dir
     from unilab.base.config_adapter import create_env
@@ -340,7 +485,7 @@ def make_eval_env(
             OmegaConf.update(cfg, "env.commands.motion.motion_files", source_motion_files)
     clip_count = _motion_count(cfg)
     if num_envs is None:
-        num_envs = min(clip_count, DEFAULT_EVAL_NUM_ENVS)
+        num_envs = min(clip_count, default_num_envs)
     if not isinstance(num_envs, int) or isinstance(num_envs, bool) or num_envs <= 0:
         raise ValueError(f"evaluation num_envs must be a positive integer, got {num_envs!r}")
     if num_envs > clip_count:
@@ -373,7 +518,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--num_envs",
         type=int,
         default=None,
-        help="maximum parallel environments; defaults to min(clip count, 16384)",
+        help="maximum parallel environments; defaults to min(clip count, 16384), or 16 with Viser",
     )
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
@@ -383,6 +528,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         default="auto",
         help="policy inference device; auto selects MPS for CPU environments on macOS",
     )
+    parser.add_argument("--viser", action="store_true", help="serve batched playback in a browser")
+    parser.add_argument("--viser_port", type=int, default=8080)
+    parser.add_argument("--viser_max_envs", type=int, default=16, help="maximum visible envs")
+    parser.add_argument("--viser_env_idx", type=int, default=0, help="initial single-view env slot")
+    parser.add_argument("--viser_display", choices=("all", "single"), default="all")
+    parser.add_argument("--render_spacing", type=float, default=1.0)
+    parser.add_argument("--start_paused", action="store_true")
+    parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--every", type=int, default=1)
     parser.add_argument("--poll_seconds", type=float, default=60.0)
@@ -393,11 +546,19 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     from unisupermimic.sim2sim import policy_load_dim_guard
 
-    args = _argument_parser().parse_args(argv)
+    parser = _argument_parser()
+    args = parser.parse_args(argv)
     if args.ckpt is None and args.run_dir is None:
-        _argument_parser().error("one of --run_dir or --ckpt is required")
+        parser.error("one of --run_dir or --ckpt is required")
+    if args.viser and args.ckpt is None:
+        parser.error("--viser requires --ckpt")
     run_dir = args.ckpt.parent if args.ckpt is not None else args.run_dir
-    env = make_eval_env(run_dir, backend=args.backend, num_envs=args.num_envs)
+    env = make_eval_env(
+        run_dir,
+        backend=args.backend,
+        num_envs=args.num_envs,
+        default_num_envs=args.viser_max_envs if args.viser else DEFAULT_EVAL_NUM_ENVS,
+    )
     try:
         if args.ckpt is not None:
             device = torch.device(env.device)
@@ -407,6 +568,21 @@ def main(argv: list[str] | None = None) -> None:
                 env_action_dim=env.action_manager.total_action_dim,
                 algo_name="supermimic",
             ):
+                if args.viser:
+                    run_viser_evaluation(
+                        env,
+                        checkpoint,
+                        device=device,
+                        policy_device=args.policy_device,
+                        port=args.viser_port,
+                        max_visible_envs=args.viser_max_envs,
+                        env_idx=args.viser_env_idx,
+                        display_mode=args.viser_display,
+                        render_spacing=args.render_spacing,
+                        start_paused=args.start_paused,
+                        speed=args.speed,
+                    )
+                    return
                 result = evaluate(env, checkpoint, device=device, policy_device=args.policy_device)
             print(
                 json.dumps(
@@ -427,7 +603,16 @@ def main(argv: list[str] | None = None) -> None:
         cast(Any, env.backend).close()
 
 
-__all__ = ["EVAL_CSV_FIELDS", "evaluate", "load_policy", "main", "make_eval_env", "watch"]
+__all__ = [
+    "EVAL_CSV_FIELDS",
+    "SuperMimicPlaybackSession",
+    "evaluate",
+    "load_policy",
+    "main",
+    "make_eval_env",
+    "run_viser_evaluation",
+    "watch",
+]
 
 if __name__ == "__main__":
     main()
