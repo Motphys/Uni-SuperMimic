@@ -230,7 +230,7 @@ Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Eval
 
 | checkpoint | norm_return | frame-weighted | failed clips |
 |---|---:|---:|---:|
-| ckpt_012000.pt | 0.827227 | 0.829952 | 0 / 40 |
+| [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt) | 0.827227 | 0.829952 | 0 / 40 |
 
 ![Training and evaluation curves through iteration 12000](docs/assets/success_curve.png)
 
@@ -240,8 +240,8 @@ Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.
 
 | policy | eval set | norm_return | frame-weighted | failed clips |
 |---|---|---:|---:|---:|
-| BONES-SEED ckpt_012000.pt | all 129,487 kept clips | 0.9243 | 0.9267 | 350 / 129,487 (0.27%) |
-| LAFAN1 ckpt_012000.pt (baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
+| BONES-SEED [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ckpt_012000.pt) | all 129,487 kept clips | 0.9243 | 0.9267 | 350 / 129,487 (0.27%) |
+| LAFAN1 [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt) (baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
 
 ![BONES-SEED vs LAFAN1: full-library evaluation and training curves through iteration 12000](docs/assets/boneseed_curve.png)
 
@@ -256,7 +256,7 @@ Building on the fused 3×3 rotations and fused Adam already in this repository, 
 | ckpt_002000.pt | 2000 | 0.8092 | 0.8187 | 1901 / 129,487 (1.47%) |
 | ckpt_004000.pt | 4000 | 0.9125 | 0.9165 | 660 / 129,487 (0.51%) |
 | ckpt_006000.pt | 6000 | 0.9306 | 0.9342 | 206 / 129,487 (0.16%) |
-| ckpt_008000.pt | 8000 | 0.9395 | 0.9433 | 193 / 129,487 (0.15%) |
+| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ema_nosync_ckpt_008000.pt) | 8000 | 0.9395 | 0.9433 | 193 / 129,487 (0.15%) |
 
 ![EMA + no-sync + lr: full-library evaluation and training reward through iteration 8000](docs/assets/boneseed_optimized_curve.png)
 
