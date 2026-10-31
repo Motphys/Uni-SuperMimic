@@ -230,7 +230,7 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 | checkpoint | norm_return | frame-weighted | 失败段数 |
 |---|---:|---:|---:|
-| ckpt_012000.pt | 0.827227 | 0.829952 | 0 / 40 |
+| [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt) | 0.827227 | 0.829952 | 0 / 40 |
 
 ![截至 12000 轮的训练与评估曲线](docs/assets/success_curve.png)
 
@@ -240,8 +240,8 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 | 策略 | 评估集 | norm_return | frame-weighted | 失败段数 |
 |---|---|---:|---:|---:|
-| BONES-SEED ckpt_012000.pt | 全部 129,487 段 | 0.9243 | 0.9267 | 350 / 129,487（0.27%） |
-| LAFAN1 ckpt_012000.pt（基线） | 全部 40 段 | 0.8336 | 0.8366 | 0 / 40 |
+| BONES-SEED [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ckpt_012000.pt) | 全部 129,487 段 | 0.9243 | 0.9267 | 350 / 129,487（0.27%） |
+| LAFAN1 [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt)（基线） | 全部 40 段 | 0.8336 | 0.8366 | 0 / 40 |
 
 ![截至 12000 轮的 BONES-SEED 与 LAFAN1 全库评估和训练曲线](docs/assets/boneseed_curve.png)
 
@@ -256,7 +256,7 @@ BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEE
 | ckpt_002000.pt | 2000 | 0.8092 | 0.8187 | 1901 / 129,487（1.47%） |
 | ckpt_004000.pt | 4000 | 0.9125 | 0.9165 | 660 / 129,487（0.51%） |
 | ckpt_006000.pt | 6000 | 0.9306 | 0.9342 | 206 / 129,487（0.16%） |
-| ckpt_008000.pt | 8000 | 0.9395 | 0.9433 | 193 / 129,487（0.15%） |
+| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ema_nosync_ckpt_008000.pt) | 8000 | 0.9395 | 0.9433 | 193 / 129,487（0.15%） |
 
 ![EMA + no-sync + lr：截至 8000 轮的全库评估与训练奖励](docs/assets/boneseed_optimized_curve.png)
 
