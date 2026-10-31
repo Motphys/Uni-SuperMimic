@@ -206,6 +206,35 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+### Viser 批量渲染
+
+直接评估 checkpoint 时添加 `--viser`，即可在浏览器中同时查看多个确定性回放。该功能复用 UniLab 的 Viser 渲染器，无需本地显示器或 `MUJOCO_GL`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --viser \
+  --viser_max_envs 16 \
+  --viser_port 8080
+```
+
+评估器会读取 checkpoint 所在目录的 `run_config.json`，复用其中记录的动作库，无需额外传入动作文件覆盖。上面的示例使用该 run 的 LAFAN1 动作库。若要渲染 BONES-SEED，改为选择 BONES-SEED checkpoint 即可；其 run 配置会自动选择 `data/library/bones_seed_compact.pt`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_001/ckpt_012000.pt \
+  --viser \
+  --viser_max_envs 16
+```
+
+如果 `run_config.json` 不存在，评估器回退到默认 LAFAN1 动作库。
+
+打开 <http://localhost:8080>。**Controls** 面板可切换批量网格和单环境视图，并提供暂停、单步及变速控制。Viser 模式默认最多创建 16 个仿真环境；使用 `--num_envs N` 调整实际并行 batch 大小，使用 `--viser_max_envs N` 限制网格中显示的环境数。已结束的环境会装载待播放 clip，动作库全部播放完后循环回放各自分配的 clip。其他选项包括 `--render_spacing`、`--viser_display single`、`--viser_env_idx`、`--start_paused` 和 `--speed`。在终端按 Ctrl+C 停止服务。
+
+对于远程 GPU 服务器，先执行 `ssh -L 8080:localhost:8080 <server>` 转发端口，再打开浏览器。Viser 用于交互式查看，不会写出 MP4；如需视频文件，请使用下面的视频导出入口。
+
 ## 视频导出
 
 以下命令从 checkpoint 连续采样 `jumps1_subject1`，截取第 6–14 秒的跳跃片段，生成 25 fps 的参考动作对比 MP4：
