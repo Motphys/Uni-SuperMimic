@@ -517,6 +517,138 @@ def test_make_eval_env_composes_backend_owner(monkeypatch, tmp_path, backend: st
     assert cfg.env.commands.motion.motion_files == ["data/library/recorded.pt"]
 
 
+def test_viser_session_recycles_pending_clips_and_restarts_completed_library(
+    monkeypatch,
+) -> None:
+    FakePolicy.instances = []
+    monkeypatch.setattr(networks, "Policy", FakePolicy)
+    monkeypatch.setattr(networks, "AMP_DTYPE", None)
+
+    class PlaybackEnv(FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.num_envs = 2
+            self.transitions = tuple(
+                {key: value[:2].clone() for key, value in transition.items()}
+                for transition in self.transitions
+            )
+            self.reset_calls = []
+
+        def reset_to_frames(self, frames, env_ids=None):
+            self.reset_calls.append((frames.clone(), env_ids))
+            if env_ids is None:
+                self.reset_frames = frames
+                current = self._current_info(frames)
+            else:
+                current_frames = self.state.info[SUPERMIMIC_STATE_KEY]["f"].clone()
+                current_frames[env_ids] = frames
+                self.reset_frames = current_frames
+                current = self._current_info(current_frames)
+            self.state = FakeState({SUPERMIMIC_STATE_KEY: current})
+            return {}, self.state.info
+
+    env = PlaybackEnv()
+    checkpoint = {
+        "pi": {},
+        "args": {
+            "goal_frames": 1,
+            "hist": 3,
+            "amp": "none",
+            "z_dim": 4,
+            "policy_hidden": [8],
+        },
+    }
+    session = supermimic_evaluate.SuperMimicPlaybackSession(env, checkpoint, policy_device="cpu")
+
+    session.reset()
+    torch.testing.assert_close(env.reset_calls[0][0], torch.tensor([30, 20]))
+    session.step_once()
+    session.step_once()
+    session.step_once()
+
+    torch.testing.assert_close(session.assigned, torch.tensor([2, 0]))
+    torch.testing.assert_close(session.current["f"], torch.tensor([33, 10]))
+    torch.testing.assert_close(session.history[1, :, 0], torch.tensor([10.0, 10.0, 10.0]))
+    assert env.reset_calls[1][1].tolist() == [1]
+
+    session.step_once()
+    torch.testing.assert_close(env.reset_calls[-1][0], torch.tensor([30, 10]))
+    assert session.next_clip == 3
+
+    controls = SimpleNamespace(consume_step_permission=lambda: False)
+    assert not session.advance(controls)
+    env.get_physics_state_snapshot = lambda: "snapshot"
+    assert session.physics_state() == "snapshot"
+
+
+def test_viser_evaluation_reuses_unilab_playback(monkeypatch) -> None:
+    import unilab.visualization.viser_playback as viser_playback
+
+    session = object()
+    monkeypatch.setattr(
+        supermimic_evaluate,
+        "SuperMimicPlaybackSession",
+        lambda *args, **kwargs: session,
+    )
+    calls = {}
+
+    def fake_run(received_session, **kwargs):
+        calls["session"] = received_session
+        calls.update(kwargs)
+
+    monkeypatch.setattr(viser_playback, "run_viser_playback", fake_run)
+    env = object()
+
+    supermimic_evaluate.run_viser_evaluation(
+        env,
+        {},
+        device="cpu",
+        policy_device="cpu",
+        port=8081,
+        max_visible_envs=8,
+        env_idx=2,
+        display_mode="single",
+        render_spacing=2.5,
+        start_paused=True,
+        speed=0.5,
+    )
+
+    assert calls == {
+        "session": session,
+        "port": 8081,
+        "max_visible_envs": 8,
+        "env_idx": 2,
+        "display_mode": "single",
+        "render_spacing": 2.5,
+        "start_paused": True,
+        "speed": 0.5,
+        "entrypoint": "unisupermimic-eval --viser",
+    }
+
+
+def test_eval_parser_accepts_viser_batch_options() -> None:
+    args = supermimic_evaluate._argument_parser().parse_args(
+        [
+            "--ckpt",
+            "run/ckpt.pt",
+            "--viser",
+            "--viser_port",
+            "8081",
+            "--viser_max_envs",
+            "8",
+            "--viser_display",
+            "single",
+            "--start_paused",
+        ]
+    )
+
+    assert args.viser
+    assert args.viser_port == 8081
+    assert args.viser_max_envs == 8
+    assert args.viser_display == "single"
+    assert args.start_paused
+
+
 @pytest.mark.parametrize("backend", supermimic_evaluate.SUPPORTED_BACKENDS)
 def test_eval_parser_accepts_backend(backend: str) -> None:
     args = supermimic_evaluate._argument_parser().parse_args(
