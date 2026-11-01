@@ -493,6 +493,8 @@ def test_hydra_materializes_supermimic_manager_configs() -> None:
             ),
             "motion_files": ["motion.csv"],
             "mjcf_path": "g1.xml",
+            "w_amp": 1.2,
+            "w_speed": 0.8,
         }
     )
     action_cfg = instantiate(
@@ -508,6 +510,8 @@ def test_hydra_materializes_supermimic_manager_configs() -> None:
     assert command_cfg.eval_mode is False
     assert command_cfg.gamma == 0.99
     assert command_cfg.max_episode_steps == 500
+    assert command_cfg.w_amp == 1.2
+    assert command_cfg.w_speed == 0.8
     assert isinstance(action_cfg, SuperMimicActionCfg)
     assert action_cfg.command_name == "motion"
 

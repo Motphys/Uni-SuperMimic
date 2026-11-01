@@ -60,6 +60,16 @@ class RewardCfg:
     body_angvel_std: float = 3.14
     root_pos_std: float = 0.3
     root_ori_std: float = 0.4
+    w_amp: float = 0.0
+    amp_tol: float = 0.02
+    amp_scale: float = 0.5
+    amp_min_height: float = 0.8
+    amp_ankles: tuple[int, int] = (3, 6)
+    w_speed: float = 0.0
+    speed_min: float = 2.0
+    speed_tol: float = 0.3
+    speed_scale: float = 1.5
+    speed_bodies: tuple[int, int, int, int] = (3, 6, 9, 11)
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
     soft_limit_factor: float = 0.9
@@ -203,6 +213,24 @@ class MDP:
             + 0.5 * torch.exp(-error_root_pos / cfg.root_pos_std**2)
             + 0.5 * torch.exp(-error_root_ori / cfg.root_ori_std**2)
         )
+        if cfg.w_amp > 0.0:
+            ankle_ids = list(cfg.amp_ankles)
+            z_pol = body_p[..., ankle_ids, 2].max(dim=-1).values
+            z_ref = reference_body_p[..., ankle_ids, 2].max(dim=-1).values
+            amp_error = (z_pol - z_ref).abs().sub(cfg.amp_tol).clamp(min=0.0)
+            amp = (1.0 - amp_error / cfg.amp_scale).clamp(0.0, 1.0)
+            active = (z_ref > cfg.amp_min_height).float()
+            tracking = tracking + cfg.w_amp * amp * active
+        if cfg.w_speed > 0.0:
+            speed_ids = list(cfg.speed_bodies)
+            v_pol = body_v[..., speed_ids, :].norm(dim=-1)
+            v_ref = reference_body_v[..., speed_ids, :].norm(dim=-1)
+            speed_error = (v_pol - v_ref).abs().sub(cfg.speed_tol).clamp(min=0.0)
+            speed = (1.0 - speed_error / cfg.speed_scale).clamp(0.0, 1.0)
+            active = (v_ref > cfg.speed_min).float()
+            tracking = tracking + cfg.w_speed * (speed * active).sum(-1) / active.sum(-1).clamp(
+                min=1.0
+            )
         action_rate = ((action - previous_action) ** 2).sum(-1)
         joint_limit = (
             torch.relu(joint_pos - self.soft_hi) + torch.relu(self.soft_lo - joint_pos)
