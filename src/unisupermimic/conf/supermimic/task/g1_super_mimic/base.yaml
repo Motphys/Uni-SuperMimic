@@ -92,6 +92,16 @@ env:
       max_episode_steps: 500
       goal_frames: 10
       context_dim: 33
+      w_amp: 0.0
+      amp_tol: 0.02
+      amp_scale: 0.5
+      amp_min_height: 0.8
+      amp_ankles: [3, 6]
+      w_speed: 0.0
+      speed_min: 2.0
+      speed_tol: 0.3
+      speed_scale: 1.5
+      speed_bodies: [3, 6, 9, 11]
       resampling_time_range: [1.0e9, 1.0e9]
       motion_files:
         - src/unisupermimic/assets/motions/g1/lafan1_supermimic/dance1_subject1.csv
