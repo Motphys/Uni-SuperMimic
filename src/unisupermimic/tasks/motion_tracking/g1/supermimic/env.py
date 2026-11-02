@@ -14,6 +14,7 @@ from unilab.base.reset_selectors import resolve_reset_env_ids
 from unilab.base.torch_env import TorchEnvState
 from unilab.envs.manager_based_rl_env import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from unisim.backend.base import SimBackend
+from unisim.backend.mujoco.backend import MuJoCoBackend
 
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
@@ -67,6 +68,13 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             "action": actions.detach().clone(),
         }
         return super().apply_action(actions, state)
+
+    def update_state(self, state: TorchEnvState) -> TorchEnvState:
+        # Native mj_step may leave tracked body sensors one substep behind qpos/qvel.
+        # Refresh before the Manager packs the first post-physics read packet.
+        if isinstance(self.backend, MuJoCoBackend):
+            self.backend._sync_tracked_body_state()
+        return super().update_state(state)
 
     def _update_state_in_read_phase(self, state: TorchEnvState) -> TorchEnvState:
         updated = super()._update_state_in_read_phase(state)
