@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from unisupermimic.rl.contracts.supermimic import State
 
-from .geometry import invariant_features, so3_exp, so3_log, yaw_mat
+from .geometry import invariant_features, matmul, matvec, so3_exp, so3_log, yaw_mat
 
 
 def mlp(
@@ -34,6 +34,10 @@ def mlp(
 class RunningNorm(nn.Module):
     """Running mean and variance, frozen once ``max_count`` is reached."""
 
+    # When True, the freeze test and the buffer update run on-device (``torch.where``)
+    # instead of a host-side ``if``, avoiding a CPU<->GPU sync in the training loop.
+    no_sync: bool = False
+
     def __init__(self, dim: int, max_count: float = 2e8, eps: float = 1e-2):
         super().__init__()
         self.mean: torch.Tensor
@@ -48,20 +52,28 @@ class RunningNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1, x.shape[-1]).float()
-        if self.count >= self.max_count:
+        if not self.no_sync and self.count >= self.max_count:
             return
         batch_count = x.shape[0]
         batch_mean = x.mean(0)
         batch_var = x.var(0, unbiased=False)
         total = self.count + batch_count
         delta = batch_mean - self.mean
-        self.mean += delta * batch_count / total
-        self.var = (
+        mean = self.mean + delta * batch_count / total
+        var = (
             self.var * self.count
             + batch_var * batch_count
             + delta**2 * self.count * batch_count / total
         ) / total
-        self.count = total
+        if self.no_sync:
+            live = self.count < self.max_count
+            self.mean.copy_(torch.where(live, mean, self.mean))
+            self.var.copy_(torch.where(live, var, self.var))
+            self.count.copy_(torch.where(live, total, self.count))
+        else:
+            self.mean.copy_(mean)
+            self.var.copy_(var)
+            self.count.copy_(total)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
@@ -122,10 +134,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (next_position - position).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ next_rotation),
-                (rotation_t @ (next_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (next_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), next_position - position),
+                so3_log(matmul(rotation_t, next_rotation)),
+                matvec(rotation_t, next_lin_vel - lin_vel),
+                matvec(rotation_t, next_ang_vel - ang_vel),
                 next_joint_pos - joint_pos,
                 next_joint_vel - joint_vel,
             ),
@@ -148,10 +160,10 @@ class WorldModel(nn.Module):
         d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
-        next_position = position + (heading @ d_position.unsqueeze(-1)).squeeze(-1)
-        next_rotation = rotation @ so3_exp(d_rotation)
-        next_lin_vel = lin_vel + (rotation @ d_lin_vel.unsqueeze(-1)).squeeze(-1)
-        next_ang_vel = ang_vel + (rotation @ d_ang_vel.unsqueeze(-1)).squeeze(-1)
+        next_position = position + matvec(heading, d_position)
+        next_rotation = matmul(rotation, so3_exp(d_rotation))
+        next_lin_vel = lin_vel + matvec(rotation, d_lin_vel)
+        next_ang_vel = ang_vel + matvec(rotation, d_ang_vel)
         return (
             next_position,
             next_rotation,
@@ -177,12 +189,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (predicted_position - position).unsqueeze(-1)).squeeze(
-                    -1
-                ),
-                so3_log(rotation_t @ predicted_rotation),
-                (rotation_t @ (predicted_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (predicted_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), predicted_position - position),
+                so3_log(matmul(rotation_t, predicted_rotation)),
+                matvec(rotation_t, predicted_lin_vel - lin_vel),
+                matvec(rotation_t, predicted_ang_vel - ang_vel),
                 predicted_joint_pos - joint_pos,
                 predicted_joint_vel - joint_vel,
             ),

@@ -7,6 +7,7 @@ import warnings
 import torch
 
 from unisupermimic.rl.algos.supermimic import networks
+from unisupermimic.rl.algos.supermimic.geometry import matmul, matvec
 from unisupermimic.rl.algos.supermimic.networks import (
     Critic,
     Policy,
@@ -16,6 +17,28 @@ from unisupermimic.rl.algos.supermimic.networks import (
     run_mlp,
 )
 from unisupermimic.rl.contracts.supermimic import State
+
+
+def test_fused_small_matrix_operations_match_torch() -> None:
+    first = torch.randn(2, 4, 3, 3, requires_grad=True)
+    second = torch.randn(2, 4, 3, 3, requires_grad=True)
+    vector = torch.randn(2, 4, 3, requires_grad=True)
+
+    actual_matrix = matmul(first, second)
+    actual_vector = matvec(first, vector)
+    expected_matrix = first @ second
+    expected_vector = (first @ vector.unsqueeze(-1)).squeeze(-1)
+
+    torch.testing.assert_close(actual_matrix, expected_matrix)
+    torch.testing.assert_close(actual_vector, expected_vector)
+    actual_gradients = torch.autograd.grad(
+        (actual_matrix.sum() + actual_vector.sum()), (first, second, vector)
+    )
+    expected_gradients = torch.autograd.grad(
+        (expected_matrix.sum() + expected_vector.sum()), (first, second, vector)
+    )
+    for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual, expected)
 
 
 def _state(batch_size: int, num_joints: int) -> State:
@@ -42,6 +65,25 @@ def test_running_norm_tracks_feature_statistics() -> None:
     assert norm.count.item() == 2
     assert normalized.shape == values.shape
     assert normalized.dtype == torch.float32
+
+
+def test_running_norm_no_sync_matches_host_path() -> None:
+    host = RunningNorm(2, max_count=5)
+    host.no_sync = False
+    syncless = RunningNorm(2, max_count=5)
+    syncless.no_sync = True
+    torch.manual_seed(0)
+    values = [torch.randn(3, 2) for _ in range(4)]
+
+    for value in values:
+        host.update(value)
+        syncless.update(value)
+
+    # Freeze kicks in once ``max_count`` is crossed (3 -> 6), so the fourth update is a no-op.
+    assert host.count.item() == 6
+    torch.testing.assert_close(syncless.mean, host.mean)
+    torch.testing.assert_close(syncless.var, host.var)
+    torch.testing.assert_close(syncless.count, host.count)
 
 
 def test_world_model_zero_init_step_is_identity() -> None:

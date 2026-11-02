@@ -15,8 +15,9 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import (
     INV_DIM,
     MAX_STEP_REWARD,
     MDP,
+    RewardCfg,
 )
-from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import MotionLib
+from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import CONTROL_DT, MotionLib
 from unisupermimic.tasks.motion_tracking.g1.supermimic.robot import (
     G1_JOINT_NAMES,
     TRACKED_BODIES,
@@ -331,3 +332,51 @@ def test_perfect_tracking_reward_and_termination(library) -> None:
         ]
     )
     assert mdp.termination(tilt_state, frames).tolist() == [False, True, False, False]
+
+
+def test_dynamic_tracking_rewards(library, monkeypatch: pytest.MonkeyPatch) -> None:
+    kin, motion, mdp = library
+    frames = torch.tensor([0, 1, 2, 3])
+    state = motion.ref_state(frames)
+    body_p, body_R, body_v, body_w = (value.clone() for value in kin.forward(*state))
+    reference_body = tuple(value.clone() for value in motion.body_state(frames))
+
+    policy_height = torch.tensor(0.5, requires_grad=True)
+    body_p[:, [3, 6], 2] = policy_height
+    reference_body[0][:, [3, 6], 2] = torch.tensor(
+        [[0.7, 1.0], [0.7, 0.79], [0.2, 0.4], [0.2, 0.85]]
+    )
+    speed_ids = [3, 6, 9, 11]
+    body_v.zero_()
+    reference_body[2].zero_()
+    body_v[:, speed_ids, 0] = torch.tensor([[2.5, 100.0, 2.0, 100.0]] * 2 + [[100.0] * 4] * 2)
+    reference_body[2][:, speed_ids, 0] = torch.tensor(
+        [[3.0, 1.0, 4.0, 0.0]] * 2 + [[1.9, 1.0, 1.0, 0.0], [2.1, 0.0, 0.0, 0.0]]
+    )
+    monkeypatch.setattr(kin, "forward", lambda *_: (body_p, body_R, body_v, body_w))
+    monkeypatch.setattr(
+        motion, "body_state", lambda indices: tuple(value[indices] for value in reference_body)
+    )
+
+    action = torch.zeros(4, 29)
+    baseline = mdp.reward(state, frames, action, action)
+    default_reward = MDP(kin, motion, mdp.default_q, RewardCfg()).reward(
+        state, frames, action, action
+    )
+    enabled = MDP(
+        kin,
+        motion,
+        mdp.default_q,
+        RewardCfg(w_amp=1.2, w_speed=0.8),
+    )
+    reward, terms = enabled.reward(state, frames, action, action, terms=True)
+
+    amp = torch.tensor([0.04, 0.0, 0.0, 0.34])
+    speed = torch.tensor([13.0 / 30.0, 13.0 / 30.0, 0.0, 0.0])
+    expected_delta = (1.2 * amp + 0.8 * speed) * CONTROL_DT
+    torch.testing.assert_close(default_reward, baseline)
+    torch.testing.assert_close(reward - baseline, expected_delta)
+    torch.testing.assert_close(terms["track"] - baseline, expected_delta)
+
+    (reward[0] - baseline[0]).backward()
+    torch.testing.assert_close(policy_height.grad, torch.tensor(1.2 / 0.5 * CONTROL_DT))

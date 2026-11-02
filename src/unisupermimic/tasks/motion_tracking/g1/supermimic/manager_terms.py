@@ -28,7 +28,7 @@ from unisupermimic.rl.algos.supermimic.geometry import (
 from unisupermimic.rl.contracts.supermimic import State
 
 from .kinematics import G1Kinematics
-from .mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_DIM
+from .mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_DIM, RewardCfg
 from .motion import BIN_FRAMES, MotionLib
 from .robot import G1_JOINT_NAMES, action_scale
 
@@ -180,6 +180,16 @@ class SuperMimicCommandCfg(CommandTermCfg):
     max_episode_steps: int = 500
     goal_frames: int = 1
     context_dim: int = XI_DIM
+    w_amp: float = 0.0
+    amp_tol: float = 0.02
+    amp_scale: float = 0.5
+    amp_min_height: float = 0.8
+    amp_ankles: tuple[int, int] = (3, 6)
+    w_speed: float = 0.0
+    speed_min: float = 2.0
+    speed_tol: float = 0.3
+    speed_scale: float = 1.5
+    speed_bodies: tuple[int, int, int, int] = (3, 6, 9, 11)
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
 
     def build(self, env: ManagerBasedRlEnv) -> SuperMimicCommand:
@@ -206,7 +216,23 @@ class SuperMimicCommand(CommandTerm):
                 f"SuperMimic default joint positions have shape {self.default_q.shape}; "
                 f"expected {(self.num_envs, NUM_J)}"
             )
-        self.mdp = MDP(self.kin, self.motion, self.default_q[0].clone())
+        self.mdp = MDP(
+            self.kin,
+            self.motion,
+            self.default_q[0].clone(),
+            RewardCfg(
+                w_amp=cfg.w_amp,
+                amp_tol=cfg.amp_tol,
+                amp_scale=cfg.amp_scale,
+                amp_min_height=cfg.amp_min_height,
+                amp_ankles=cfg.amp_ankles,
+                w_speed=cfg.w_speed,
+                speed_min=cfg.speed_min,
+                speed_tol=cfg.speed_tol,
+                speed_scale=cfg.speed_scale,
+                speed_bodies=cfg.speed_bodies,
+            ),
+        )
         self.gamma = float(cfg.gamma)
         self.eval_mode = cfg.eval_mode
         self.reset_noise = cfg.reset_noise and not cfg.eval_mode
@@ -225,6 +251,7 @@ class SuperMimicCommand(CommandTerm):
         )
         self.last_episode_stats: dict[str, torch.Tensor] = {}
         self._requested_frames: torch.Tensor | None = None
+        self._requested_env_ids: torch.Tensor | None = None
         self._read_phase_bound = False
 
     @staticmethod
@@ -293,18 +320,32 @@ class SuperMimicCommand(CommandTerm):
     def goal(self, num_frames: int) -> torch.Tensor:
         return self.mdp.goal(self.f, num_frames)
 
-    def request_frames(self, frames: torch.Tensor) -> None:
-        """Set per-environment frames for the next full reset."""
+    def request_frames(self, frames: torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
+        """Set frames for the next full or partial reset."""
         if not isinstance(frames, torch.Tensor):
             raise TypeError("SuperMimic reset frames must be a torch.Tensor")
-        if frames.shape != (self.num_envs,):
-            raise ValueError(f"SuperMimic reset frames must have shape {(self.num_envs,)}")
+        expected_frames = self.num_envs if env_ids is None else env_ids.numel()
+        if frames.shape != (expected_frames,):
+            raise ValueError(
+                f"SuperMimic reset frames must have shape ({expected_frames},), "
+                f"got {tuple(frames.shape)}"
+            )
         if frames.dtype not in (torch.int32, torch.int64):
             raise TypeError("SuperMimic reset frames must use an integer dtype")
-        frames = frames.to(device=self._device, dtype=torch.int64).clone()
-        if bool((frames < 0).any()) or bool((frames >= self.motion.num_frames).any()):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self._device)
+        else:
+            env_ids = resolve_reset_env_ids(
+                env_ids,
+                num_envs=self.num_envs,
+                device=self._device,
+                owner="SuperMimicCommand.request_frames",
+            )
+        requested = frames.to(device=self._device, dtype=torch.int64).clone()
+        if bool((requested < 0).any()) or bool((requested >= self.motion.num_frames).any()):
             raise ValueError("SuperMimic reset frames are outside the motion library")
-        self._requested_frames = frames
+        self._requested_frames = requested
+        self._requested_env_ids = env_ids
 
     def reset(
         self, env_ids: torch.Tensor | slice | None = None, *, publish_metrics: bool = True
@@ -329,10 +370,14 @@ class SuperMimicCommand(CommandTerm):
                 self._rng,
             )
         else:
-            if not bool(reset_mask.all()):
-                raise ValueError("SuperMimic requested-frame reset must include every environment")
+            assert self._requested_env_ids is not None
+            if not torch.equal(ids, self._requested_env_ids):
+                raise ValueError(
+                    "SuperMimic requested-frame reset environment IDs do not match the request"
+                )
             frames = self._requested_frames
             self._requested_frames = None
+            self._requested_env_ids = None
             bins = self.motion.frame_bin[frames]
 
         full_frames = self.f.clone()
