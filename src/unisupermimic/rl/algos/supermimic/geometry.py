@@ -131,8 +131,17 @@ def rot_angle_sq(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
 
 
 def yaw_mat(rotation: torch.Tensor) -> torch.Tensor:
+    """Project the heading continuously; a vertical forward axis has no unique yaw.
+
+    Outside the near-vertical radius, the exact normalized heading is preserved.
+    Inside it, the horizontal block contracts toward zero instead of switching
+    abruptly to an identity heading (which can point the opposite way). The
+    gradient stays bounded, although the horizontal block is not orthonormal
+    near vertical.
+    """
     forward_x, forward_y = rotation[..., 0, 0], rotation[..., 1, 0]
-    norm = torch.sqrt(forward_x * forward_x + forward_y * forward_y + 1e-9)
+    planar_sq = forward_x * forward_x + forward_y * forward_y
+    norm = torch.sqrt(torch.clamp(planar_sq, min=4e-4))
     cos, sin = forward_x / norm, forward_y / norm
     zero, one = torch.zeros_like(cos), torch.ones_like(cos)
     return torch.stack((cos, -sin, zero, sin, cos, zero, zero, zero, one), -1).reshape(

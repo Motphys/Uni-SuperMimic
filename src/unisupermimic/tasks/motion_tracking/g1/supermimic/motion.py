@@ -122,8 +122,8 @@ class MotionLib:
             )
 
         root_rotation_t = self.root_R.transpose(-1, -2)
-        self._root_v_local = (root_rotation_t @ self.root_v.unsqueeze(-1)).squeeze(-1)
-        self._root_w_local = (root_rotation_t @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        self._root_v_local = matvec(root_rotation_t, self.root_v)
+        self._root_w_local = matvec(root_rotation_t, self.root_w)
         self._root_gz = self.root_R[:, 2, 2]
         self._build_indices()
 
@@ -217,14 +217,14 @@ class MotionLib:
         if not self.compact:
             return self._root_v_local
         rotation_t = self.root_R.transpose(-1, -2)
-        return (rotation_t @ self.root_v.unsqueeze(-1)).squeeze(-1)
+        return matvec(rotation_t, self.root_v)
 
     @property
     def root_w_local(self) -> torch.Tensor:
         if not self.compact:
             return self._root_w_local
         rotation_t = self.root_R.transpose(-1, -2)
-        return (rotation_t @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        return matvec(rotation_t, self.root_w)
 
     @property
     def root_gz(self) -> torch.Tensor:

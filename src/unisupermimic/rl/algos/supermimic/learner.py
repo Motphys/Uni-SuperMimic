@@ -85,6 +85,11 @@ _LOG_FIELDS = (
     "lr",
 )
 
+# ROCm's flattened small-matrix bmm path is numerically unreliable above a batch
+# boundary (~32x4096 rollout); chunk the geometry-heavy reward/critic inputs
+# there. Other backends keep a single fused call so their hot path is unchanged.
+_SAFE_GEOMETRY_BATCH = 4096 if getattr(torch.version, "hip", None) is not None else 0
+
 
 def _empty_stats() -> dict[str, list[torch.Tensor]]:
     return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
@@ -326,6 +331,51 @@ class SuperMimicLearner:
     ) -> torch.Tensor:
         return torch.cat((self.mdp.critic_features(state, frames, normalized_context), goal), -1)
 
+    def _batched_reward_term(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        action: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
+            reward, done = self._reward_term_fn(state, frames, action, previous_action)
+            return reward, done
+        reward_parts, done_parts = [], []
+        for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
+            stop = start + _SAFE_GEOMETRY_BATCH
+            reward, done = self._reward_term_fn(
+                cast(State, tuple(item[start:stop] for item in state)),
+                frames[start:stop],
+                action[start:stop],
+                previous_action[start:stop],
+            )
+            reward_parts.append(reward)
+            done_parts.append(done)
+        return torch.cat(reward_parts), torch.cat(done_parts)
+
+    def _batched_critic_input(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        normalized_context: torch.Tensor,
+        goal: torch.Tensor,
+    ) -> torch.Tensor:
+        if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
+            return self._critic_input_fn(state, frames, normalized_context, goal)
+        parts = []
+        for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
+            stop = start + _SAFE_GEOMETRY_BATCH
+            parts.append(
+                self._critic_input_fn(
+                    cast(State, tuple(item[start:stop] for item in state)),
+                    frames[start:stop],
+                    normalized_context[start:stop],
+                    goal[start:stop],
+                )
+            )
+        return torch.cat(parts)
+
     @torch.no_grad()
     def collect(self, n_steps: int) -> None:
         for _ in range(n_steps):
@@ -458,7 +508,7 @@ class SuperMimicLearner:
                 State, tuple(flatten([item[index] for item in states]) for index in range(6))
             )
             flat_frames = flatten(all_frames)
-            rewards, dones = self._reward_term_fn(
+            rewards, dones = self._batched_reward_term(
                 all_states, flat_frames, flatten(actions), flatten(previous_actions)
             )
             rewards = rewards.view(self.cfg.horizon, batch_size)
@@ -527,7 +577,7 @@ class SuperMimicLearner:
                     .expand(self.cfg.horizon + 1, -1, -1)
                     .flatten(0, 1)
                 )
-                critic_input = self._critic_input_fn(
+                critic_input = self._batched_critic_input(
                     critic_states, critic_frames, critic_context, critic_goals
                 ).view(self.cfg.horizon + 1, batch_size, -1)
             self.critic.norm.update(critic_input)
@@ -708,6 +758,11 @@ class SuperMimicLearner:
                     wm_error = torch.zeros((), device=self.device)
                     for _ in range(self.cfg.wm_batches):
                         wm_loss, wm_error = self.wm_update()
+                        for name, metric in (("wm_loss", wm_loss), ("wm_err8", wm_error)):
+                            if not torch.isfinite(metric).all():
+                                raise FloatingPointError(
+                                    f"non-finite {name} at iteration {iteration + 1}"
+                                )
                     aggregate["wm"].append(wm_loss)
                     aggregate["wm8"].append(wm_error)
                     pi_loss: float | None = None
@@ -719,6 +774,19 @@ class SuperMimicLearner:
                         policy_loss, value_loss, imagined_reward, grad_norm, survival = (
                             self.policy_update()
                         )
+                        # Fail fast on divergence instead of checkpointing a diverged model.
+                        # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
+                        # handles a non-finite gradient by zeroing it and stepping, so a non-finite
+                        # gradient is not a divergence signal on its own.
+                        for name, metric in (
+                            ("pi_loss", policy_loss),
+                            ("v_loss", value_loss),
+                            ("imag_rew", imagined_reward),
+                        ):
+                            if not torch.isfinite(metric).all():
+                                raise FloatingPointError(
+                                    f"non-finite {name} at iteration {iteration + 1}"
+                                )
                         aggregate["pi"].append(policy_loss)
                         aggregate["v"].append(value_loss)
                         aggregate["ir"].append(imagined_reward)
