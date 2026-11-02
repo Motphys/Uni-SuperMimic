@@ -191,14 +191,7 @@ uv run unisupermimic-train \
 
 评估从每段动作的首帧开始，关闭观测/动作噪声，并跑完整个 clip。已结束的环境会被回收给待评估动作；调度器优先启动较长 clip，避免固定 batch 出现长空闲尾巴。独立评估器默认最多使用 16,384 个并行环境，可用 `unisupermimic-eval --num_envs N` 适配较小 GPU。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
 
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  training.play_only=true \
-  algo.load_run=runs/supermimic_mjwarp_001 \
-  algo.checkpoint=12000
-```
-
-结果写入同目录的 `ckpt_012000_eval.json`。也可直接评估指定 checkpoint。独立评估和视频导出入口支持 `--backend mjwarp`、`--backend mujoco`、`--backend motrix`，默认为 mjwarp：
+独立评估和视频导出入口支持 `--backend mjwarp`、`--backend mujoco`、`--backend motrix`，默认为 mjwarp：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
