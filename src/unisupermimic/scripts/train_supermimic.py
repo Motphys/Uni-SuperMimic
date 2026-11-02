@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import hydra
-import torch
 from omegaconf import DictConfig, OmegaConf
 from unilab.base.config_adapter import EnvConfigAdapter, create_env
 from unilab.base.process_device import (
@@ -26,11 +25,7 @@ from unilab.utils.checkpoint import get_latest_run, normalize_checkpoint_value
 from unilab.utils.device import get_default_device
 
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
-from unisupermimic.sim2sim import (
-    extract_contract_snapshot,
-    policy_load_dim_guard,
-    resolve_sim2sim_config,
-)
+from unisupermimic.sim2sim import extract_contract_snapshot
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import compact_motion_clip_count
 
 
@@ -126,19 +121,9 @@ def main(cfg: DictConfig) -> None:
     bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)
     if bound_device is not None:
         device = bound_device
-    play_only = bool(cfg.training.play_only)
-    checkpoint = resolve_supermimic_checkpoint(cfg) if play_only or cfg.algo.resume else None
-    env_override = build_env_override(cfg, eval_mode=play_only, learner_device=str(device))
-    if play_only:
-        assert checkpoint is not None
-        resolve_sim2sim_config(
-            checkpoint.parent,
-            cfg,
-            algo_name="supermimic",
-            strict=bool(cfg.training.sim2sim_strict),
-        )
-        log_dir = checkpoint.parent
-    elif checkpoint is not None:
+    checkpoint = resolve_supermimic_checkpoint(cfg) if cfg.algo.resume else None
+    env_override = build_env_override(cfg, eval_mode=False, learner_device=str(device))
+    if checkpoint is not None:
         log_dir = checkpoint.parent
     else:
         log_dir = Path(resolve_run_log_dir(cfg))
@@ -162,27 +147,9 @@ def main(cfg: DictConfig) -> None:
     try:
         env = create_env(
             cfg,
-            num_envs=_motion_count(cfg) if play_only else int(cfg.algo.num_envs),
+            num_envs=int(cfg.algo.num_envs),
             env_cfg_override=env_override,
         )
-        if play_only:
-            from unisupermimic.tasks.motion_tracking.g1.supermimic.evaluate import evaluate
-
-            assert checkpoint is not None
-            saved = torch.load(checkpoint, map_location=device, weights_only=True)
-            with policy_load_dim_guard(
-                env_obs_dim=env.supermimic_mdp.obs_dim,
-                env_action_dim=env.action_manager.total_action_dim,
-                algo_name="supermimic",
-            ):
-                result = evaluate(env, saved)
-            destination = checkpoint.with_name(checkpoint.stem + "_eval.json")
-            temporary = destination.with_name(destination.name + ".tmp")
-            temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-            temporary.replace(destination)
-            print(json.dumps(result, indent=2))
-            return
-
         learner = SuperMimicLearner(
             env,
             build_learner_config(cfg),
