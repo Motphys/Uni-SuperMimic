@@ -243,6 +243,8 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     ):
         assert metric.ndim == 0
         assert torch.isfinite(metric)
+    assert learner._v_init
+    assert learner._v_std >= 0.01
 
 
 def test_no_sync_and_host_sampling_return_full_batch(tmp_path) -> None:
