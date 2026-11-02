@@ -473,7 +473,7 @@ def make_eval_env(
     from unisupermimic.sim2sim import resolve_sim2sim_config
 
     config_dir = Path(unisupermimic.__file__).resolve().parent / "conf" / "supermimic"
-    overrides = ["training.play_only=true", f"task=g1_super_mimic/{backend}"]
+    overrides = [f"task=g1_super_mimic/{backend}"]
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         cfg = compose(config_name="config", overrides=overrides)
     ensure_registries()
