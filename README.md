@@ -191,14 +191,7 @@ Use the same `task=g1_super_mimic/<backend>` override when resuming or evaluatin
 
 Evaluation starts every motion from its first frame, disables observation and action noise, and runs the complete clip. Finished environments are recycled for pending clips, with longer clips scheduled first to avoid a long idle batch tail. The standalone evaluator uses at most 16,384 parallel environments by default; use `unisupermimic-eval --num_envs N` to fit a smaller GPU. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
 
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  training.play_only=true \
-  algo.load_run=runs/supermimic_mjwarp_001 \
-  algo.checkpoint=12000
-```
-
-Results are written to `ckpt_012000_eval.json` in the same directory. You can also evaluate a checkpoint directly. The standalone evaluator and video exporter accept `--backend mjwarp`, `--backend mujoco`, or `--backend motrix` and default to mjwarp:
+The standalone evaluator and video exporter accept `--backend mjwarp`, `--backend mujoco`, or `--backend motrix` and default to mjwarp:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
