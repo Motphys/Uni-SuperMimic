@@ -493,6 +493,8 @@ def test_hydra_materializes_supermimic_manager_configs() -> None:
             ),
             "motion_files": ["motion.csv"],
             "mjcf_path": "g1.xml",
+            "w_amp": 1.2,
+            "w_speed": 0.8,
         }
     )
     action_cfg = instantiate(
@@ -508,6 +510,8 @@ def test_hydra_materializes_supermimic_manager_configs() -> None:
     assert command_cfg.eval_mode is False
     assert command_cfg.gamma == 0.99
     assert command_cfg.max_episode_steps == 500
+    assert command_cfg.w_amp == 1.2
+    assert command_cfg.w_speed == 0.8
     assert isinstance(action_cfg, SuperMimicActionCfg)
     assert action_cfg.command_name == "motion"
 
@@ -782,6 +786,13 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         state = env.step(torch.zeros((2, 29), dtype=torch.float32, device=env.device))
         assert not bool(state.info[SUPERMIMIC_TRANSITION_KEY]["done"].any())
         assert state.info[SUPERMIMIC_STATE_KEY]["f"].tolist() == [1, 52]
+        obs, info = env.reset_to_frames(
+            torch.tensor([51], dtype=torch.int64, device=env.device),
+            env_ids=torch.tensor([1], dtype=torch.int64, device=env.device),
+        )
+        assert command.f.tolist() == [1, 51]
+        assert info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [1, 0]
+        assert obs["obs"].shape == (2, 99)
     finally:
         env.close()
         env.backend.close()

@@ -11,6 +11,8 @@ import torch
 from unisupermimic.rl.algos.supermimic.geometry import (
     invariant_features,
     mat_to_6d,
+    matmul,
+    matvec,
     rot_angle_sq,
     yaw_mat,
 )
@@ -58,6 +60,16 @@ class RewardCfg:
     body_angvel_std: float = 3.14
     root_pos_std: float = 0.3
     root_ori_std: float = 0.4
+    w_amp: float = 0.0
+    amp_tol: float = 0.02
+    amp_scale: float = 0.5
+    amp_min_height: float = 0.8
+    amp_ankles: tuple[int, int] = (3, 6)
+    w_speed: float = 0.0
+    speed_min: float = 2.0
+    speed_tol: float = 0.3
+    speed_scale: float = 1.5
+    speed_bodies: tuple[int, int, int, int] = (3, 6, 9, 11)
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
     soft_limit_factor: float = 0.9
@@ -119,12 +131,12 @@ class MDP:
         rotation_t = rotation.transpose(-1, -2)
         default_offset = context[..., 1:30]
         gravity = -rotation[..., 2, :]
-        relative_rotation = mat_to_6d(rotation_t @ self.motion.ref_state(frames)[1])
+        relative_rotation = mat_to_6d(matmul(rotation_t, self.motion.ref_state(frames)[1]))
         return torch.cat(
             (
                 joint_pos - self.default_q - default_offset,
                 joint_vel,
-                (rotation_t @ angular_velocity.unsqueeze(-1)).squeeze(-1),
+                matvec(rotation_t, angular_velocity),
                 gravity,
                 previous_action,
                 relative_rotation,
@@ -181,12 +193,12 @@ class MDP:
         reference_body_p, reference_body_R, reference_body_v, reference_body_w = motion.body_state(
             frames
         )
-        delta_rotation = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
-        ref_body_p = anchor.unsqueeze(-2) + (
-            delta_rotation.unsqueeze(-3) @ (reference_body_p - ref_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        ref_body_R = delta_rotation.unsqueeze(-3) @ reference_body_R
+        ref_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), reference_body_p - ref_p.unsqueeze(-2)
+        )
+        ref_body_R = matmul(delta_rotation.unsqueeze(-3), reference_body_R)
         error_pos = ((ref_body_p - body_p) ** 2).sum(-1).mean(-1)
         error_ori = rot_angle_sq(ref_body_R, body_R).mean(-1)
         error_linvel = ((reference_body_v - body_v) ** 2).sum(-1).mean(-1)
@@ -201,6 +213,24 @@ class MDP:
             + 0.5 * torch.exp(-error_root_pos / cfg.root_pos_std**2)
             + 0.5 * torch.exp(-error_root_ori / cfg.root_ori_std**2)
         )
+        if cfg.w_amp > 0.0:
+            ankle_ids = list(cfg.amp_ankles)
+            z_pol = body_p[..., ankle_ids, 2].max(dim=-1).values
+            z_ref = reference_body_p[..., ankle_ids, 2].max(dim=-1).values
+            amp_error = (z_pol - z_ref).abs().sub(cfg.amp_tol).clamp(min=0.0)
+            amp = (1.0 - amp_error / cfg.amp_scale).clamp(0.0, 1.0)
+            active = (z_ref > cfg.amp_min_height).float()
+            tracking = tracking + cfg.w_amp * amp * active
+        if cfg.w_speed > 0.0:
+            speed_ids = list(cfg.speed_bodies)
+            v_pol = body_v[..., speed_ids, :].norm(dim=-1)
+            v_ref = reference_body_v[..., speed_ids, :].norm(dim=-1)
+            speed_error = (v_pol - v_ref).abs().sub(cfg.speed_tol).clamp(min=0.0)
+            speed = (1.0 - speed_error / cfg.speed_scale).clamp(0.0, 1.0)
+            active = (v_ref > cfg.speed_min).float()
+            tracking = tracking + cfg.w_speed * (speed * active).sum(-1) / active.sum(-1).clamp(
+                min=1.0
+            )
         action_rate = ((action - previous_action) ** 2).sum(-1)
         joint_limit = (
             torch.relu(joint_pos - self.soft_hi) + torch.relu(self.soft_lo - joint_pos)
@@ -263,17 +293,14 @@ class MDP:
             joint_pos,
             joint_vel,
         )[0]
-        delta_rotation = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
-        ref_body_p = anchor.unsqueeze(-2) + (
-            delta_rotation.unsqueeze(-3)
-            @ (motion.body_state(frames)[0] - ref_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        body_error = (
-            (heading_t.unsqueeze(-3) @ (ref_body_p - body_p).unsqueeze(-1)).squeeze(-1).flatten(-2)
+        ref_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), motion.body_state(frames)[0] - ref_p.unsqueeze(-2)
         )
-        root_error = (heading_t @ (ref_p - position).unsqueeze(-1)).squeeze(-1)
-        relative_rotation = mat_to_6d(rotation.transpose(-1, -2) @ ref_R)
+        body_error = matvec(heading_t.unsqueeze(-3), ref_body_p - body_p).flatten(-2)
+        root_error = matvec(heading_t, ref_p - position)
+        relative_rotation = mat_to_6d(matmul(rotation.transpose(-1, -2), ref_R))
         return torch.cat(
             (
                 invariant_features(state),
