@@ -26,6 +26,7 @@ from unisupermimic.rl.logging import SuperMimicLogger
 from . import networks
 from .geometry import unflatten_state
 from .networks import Critic, Policy, WorldModel, mlp
+from .optim import MuonAdam
 from .replay import ReplayBuffer
 
 
@@ -46,6 +47,8 @@ class SuperMimicConfig:
     wm_batch: int = 2048
     pi_batch: int = 4096
     lr: float = 4e-4
+    pi_opt: str = "adam"
+    wm_opt: str = "adam"
     no_sync: bool = True
     pi_ema: float = 0.0
     gamma: float = 0.99
@@ -113,6 +116,10 @@ class SuperMimicLearner:
             raise ValueError(f"amp must be 'none' or 'bf16', got {cfg.amp!r}")
         if cfg.utd <= 0:
             raise ValueError("utd must be positive")
+        if cfg.pi_opt not in ("adam", "muon"):
+            raise ValueError(f"pi_opt must be 'adam' or 'muon', got {cfg.pi_opt!r}")
+        if cfg.wm_opt not in ("adam", "muon"):
+            raise ValueError(f"wm_opt must be 'adam' or 'muon', got {cfg.wm_opt!r}")
         if cfg.test_hidden_dims is not None and not cfg.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
 
@@ -158,10 +165,28 @@ class SuperMimicLearner:
                 use_buffers=True,
             )
         fused_adam = self.device.type == "cuda"
-        self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
-        self.opt_pi = torch.optim.Adam(
-            self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
-        )
+        if cfg.wm_opt == "muon":
+            self.opt_wm = MuonAdam(
+                self.wm,
+                [self.wm.net],
+                lr=cfg.lr,
+                betas=(0.9, 0.999),
+                fused=fused_adam,
+            )
+        else:
+            self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
+        if cfg.pi_opt == "muon":
+            self.opt_pi = MuonAdam(
+                self.pi,
+                [self.pi.enc, self.pi.dec],
+                lr=cfg.lr,
+                betas=(0.9, 0.95),
+                fused=fused_adam,
+            )
+        else:
+            self.opt_pi = torch.optim.Adam(
+                self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
+            )
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
         self._v_mean = torch.zeros((), device=self.device)
         self._v_std = torch.ones((), device=self.device)

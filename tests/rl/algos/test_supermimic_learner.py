@@ -10,6 +10,7 @@ import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
+from unisupermimic.rl.algos.supermimic.optim import MuonAdam
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
     SUPERMIMIC_TRANSITION_KEY,
@@ -247,6 +248,118 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
     assert learner._v_std >= 0.01
 
 
+def test_invalid_optimizer_name_is_rejected(tmp_path) -> None:
+    with pytest.raises(ValueError, match="pi_opt must be 'adam' or 'muon'"):
+        SuperMimicLearner(FakeEnv(), replace(_config(), pi_opt="sgd"), tmp_path)
+
+    with pytest.raises(ValueError, match="wm_opt must be 'adam' or 'muon'"):
+        SuperMimicLearner(FakeEnv(), replace(_config(), wm_opt="sgd"), tmp_path)
+
+
+def test_muon_updates_hidden_matrices_and_runs_on_cpu(tmp_path) -> None:
+    cfg = replace(
+        _config(),
+        pi_opt="muon",
+        wm_opt="muon",
+        test_hidden_dims=(8, 8),
+    )
+    learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path)
+
+    assert isinstance(learner.opt_wm, MuonAdam)
+    assert isinstance(learner.opt_pi, MuonAdam)
+    assert not isinstance(learner.opt_v, MuonAdam)
+
+    world_model_muon = {
+        id(parameter) for parameter in learner.opt_wm.muon.param_groups[0]["params"]
+    }
+    policy_muon = {
+        id(parameter) for group in learner.opt_pi.muon.param_groups for parameter in group["params"]
+    }
+    world_model_hidden = learner.wm.net[3]
+    policy_encoder_hidden = learner.pi.enc[2]
+    policy_decoder_hidden = learner.pi.dec[2]
+    assert isinstance(world_model_hidden, torch.nn.Linear)
+    assert isinstance(policy_encoder_hidden, torch.nn.Linear)
+    assert isinstance(policy_decoder_hidden, torch.nn.Linear)
+    assert id(world_model_hidden.weight) in world_model_muon
+    assert id(policy_encoder_hidden.weight) in policy_muon
+    assert id(policy_decoder_hidden.weight) in policy_muon
+    assert id(learner.wm.net[0].weight) not in world_model_muon
+    assert id(learner.wm.net[-1].weight) not in world_model_muon
+    assert id(learner.pi.enc[0].weight) not in policy_muon
+    assert id(learner.pi.dec[-1].weight) not in policy_muon
+
+    learner.collect(3)
+    wm_loss, wm_error = learner.wm_update()
+    policy_loss, value_loss, imagined_reward, grad_norm, survival = learner.policy_update()
+    for metric in (
+        wm_loss,
+        wm_error,
+        policy_loss,
+        value_loss,
+        imagined_reward,
+        grad_norm,
+        survival,
+    ):
+        assert metric.ndim == 0
+        assert torch.isfinite(metric)
+
+
+def test_muon_optimizer_checkpoint_roundtrip(tmp_path) -> None:
+    cfg = replace(
+        _config(),
+        pi_opt="muon",
+        wm_opt="muon",
+        test_hidden_dims=(8, 8),
+        iterations=1,
+    )
+    learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path)
+    learner.collect(3)
+    learner.wm_update()
+    learner.policy_update()
+    learner.save()
+
+    resumed = SuperMimicLearner(FakeEnv(), replace(cfg, iterations=2), tmp_path / "resumed")
+    resumed.load(tmp_path / "last.pt")
+
+    assert isinstance(resumed.opt_wm, MuonAdam)
+    assert isinstance(resumed.opt_pi, MuonAdam)
+    assert len(resumed.opt_wm.muon.state) == len(learner.opt_wm.muon.state)
+    assert len(resumed.opt_pi.muon.state) == len(learner.opt_pi.muon.state)
+    for name, value in learner.wm.named_parameters():
+        torch.testing.assert_close(resumed.wm.state_dict()[name], value)
+    for name, value in learner.pi.state_dict().items():
+        if name in dict(learner.pi.named_parameters()):
+            torch.testing.assert_close(resumed.pi.state_dict()[name], value)
+    for original, restored in zip(learner.wm.parameters(), resumed.wm.parameters(), strict=True):
+        if original in learner.opt_wm.muon.state:
+            torch.testing.assert_close(
+                resumed.opt_wm.muon.state[restored]["momentum_buffer"],
+                learner.opt_wm.muon.state[original]["momentum_buffer"],
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_muon_updates_run_with_fused_adam_on_cuda(tmp_path) -> None:
+    cfg = replace(
+        _config(),
+        pi_opt="muon",
+        wm_opt="muon",
+        test_hidden_dims=(8, 8),
+    )
+    learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path, device="cuda")
+
+    assert learner.opt_wm.adam.defaults["fused"] is True
+    assert learner.opt_pi.adam.defaults["fused"] is True
+    learner.collect(3)
+    wm_loss, _ = learner.wm_update()
+    policy_loss, value_loss, _, _, _ = learner.policy_update()
+
+    assert torch.isfinite(wm_loss)
+    assert torch.isfinite(policy_loss)
+    assert torch.isfinite(value_loss)
+
+
 def test_no_sync_and_host_sampling_return_full_batch(tmp_path) -> None:
     cfg = _config()
     for no_sync in (False, True):
@@ -266,12 +379,12 @@ def test_pi_ema_disabled_by_default(tmp_path) -> None:
 
 def test_ema_policy_averages_weights(tmp_path) -> None:
     decay = 0.995
-    learner = SuperMimicLearner(
-        FakeEnv(), replace(_config(), pi_ema=decay), tmp_path
-    )
+    learner = SuperMimicLearner(FakeEnv(), replace(_config(), pi_ema=decay), tmp_path)
     learner.collect(3)
     learner.policy_update()  # first call initializes the average to the live weights
-    previous = {name: parameter.detach().clone() for name, parameter in learner.pi.named_parameters()}
+    previous = {
+        name: parameter.detach().clone() for name, parameter in learner.pi.named_parameters()
+    }
 
     learner.policy_update()
 
