@@ -71,6 +71,25 @@ thermal behavior; keep both fixed for A/B tests.
 | Fused Adam | available | support is backend/version dependent | `--fused-adam auto` enables it on CUDA and disables it elsewhere. Check `benchmark.json`'s effective flag rather than relying on the request. |
 | CUDA graphs | available through PyTorch | not portable; ROCm graph support depends on PyTorch/ROCm/driver | `--cuda-graph update` attempts full-update capture. The current update contains reset counts and other host synchronization/control flow, so full capture may fail until that path is graph-safe. A failure is reported rather than replaced with an eager result. Do not compare a failed graph run to a successful run. |
 
+## Integrated A/B result on RTX 4090
+
+The following synthetic A/B compares the merged branch against commit `8d13ebd`
+using the same command, RNG seed, eager kernels, AMP `none`, TF32, fused Adam,
+and profiler settings. These are kernel/scheduling measurements, not accuracy
+results. The fake benchmark uses simplified reward geometry, so use it to rank
+implementations before spending time on a real-checkpoint run.
+
+| run | batch/horizon | baseline | merged | speed-up |
+|---|---:|---:|---:|---:|
+| small MLP | 128/8 | 36.208 ms | 22.030 ms | 1.64× |
+| large MLP | 1024/32 | 129.619 ms | 67.607 ms | 1.92× |
+
+Large-MLP configuration: 29 joints, policy `1024,512,256`, world model
+`2048,2048,2048`, critic `256,128`, 10 goal frames, and 10-frame history. At
+1024×32 it reached 484,533 imagined steps/s versus 253,310 steps/s before the
+optimizations. The profiler shows the remaining time dominated by MLP GEMMs,
+which is the intended shape for this training path.
+
 ## Current benchmark status on this branch
 
 Verified on 2026-11-04 with the repository's CUDA lockfile:
