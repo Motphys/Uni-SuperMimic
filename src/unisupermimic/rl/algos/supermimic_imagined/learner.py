@@ -11,10 +11,11 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from unisupermimic.rl.algos.supermimic import networks as networks_module
@@ -44,6 +45,13 @@ class ImaginedSuperMimicConfig:
     max_episode_steps: int = 500
     critic_epochs: int = 5
     critic_minibatches: int = 4
+    critic_norm_update: str = "full"
+    critic_norm_subsample: int = 131_072
+    critic_norm_interval: int = 1
+    critic_norm_max_count: float | None = None
+    optimizer_mode: str = "auto"
+    critic_amsgrad: bool = False
+    pi_amsgrad: bool = False
     no_critic: bool = False
     reset_noise: bool = True
     lr_decay_iters: int = 250_000
@@ -68,6 +76,24 @@ class ImaginedSuperMimicConfig:
             raise ValueError(f"amp must be 'none' or 'bf16', got {self.amp!r}")
         if self.critic_minibatches <= 0:
             raise ValueError("critic_minibatches must be positive")
+        if self.critic_norm_update not in ("full", "subsample", "interval", "off"):
+            raise ValueError(
+                "critic_norm_update must be 'full', 'subsample', 'interval', or 'off', got "
+                f"{self.critic_norm_update!r}"
+            )
+        if self.critic_norm_subsample <= 0:
+            raise ValueError("critic_norm_subsample must be positive")
+        if self.critic_norm_interval <= 0:
+            raise ValueError("critic_norm_interval must be positive")
+        if self.critic_norm_max_count is not None and self.critic_norm_max_count < 0:
+            raise ValueError("critic_norm_max_count cannot be negative")
+        if self.optimizer_mode not in ("auto", "fused", "foreach", "single"):
+            raise ValueError(
+                "optimizer_mode must be 'auto', 'fused', 'foreach', or 'single', got "
+                f"{self.optimizer_mode!r}"
+            )
+        if self.pi_amsgrad and self.pi_opt != "adam":
+            raise ValueError("pi_amsgrad is only valid with pi_opt='adam'")
         if self.test_hidden_dims is not None and not self.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
         if self.iterations <= 0:
@@ -135,6 +161,10 @@ class ImaginedSuperMimicLearner:
             self.critic.net = mlp(self.critic.norm.mean.numel(), cfg.test_hidden_dims, 1).to(
                 self.device
             )
+        if cfg.critic_norm_max_count is not None:
+            # The global RunningNorm default is intentionally huge; deployments can freeze
+            # earlier without changing the default behavior of existing configs.
+            self.critic.norm.max_count = float(cfg.critic_norm_max_count)
         self.pi_avg = None
         if cfg.pi_ema > 0:
             self.pi_avg = AveragedModel(
@@ -143,20 +173,34 @@ class ImaginedSuperMimicLearner:
                 use_buffers=True,
             )
 
-        fused_adam = self.device.type == "cuda"
+        optimizer_mode = self._resolve_optimizer_mode(cfg.optimizer_mode, self.device)
+        # Leaving foreach=None under auto preserves Adam's implementation choice;
+        # only explicit acceleration modes force foreach or single-tensor kernels.
+        foreach = cfg.optimizer_mode in ("foreach", "single") or None
         if cfg.pi_opt == "muon":
             self.opt_pi = MuonAdam(
                 self.pi,
                 [self.pi.enc, self.pi.dec],
                 lr=cfg.lr,
                 betas=(0.9, 0.95),
-                fused=fused_adam,
+                fused=optimizer_mode == "fused",
             )
         else:
             self.opt_pi = torch.optim.Adam(
-                self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
+                self.pi.parameters(),
+                lr=cfg.lr,
+                betas=(0.9, 0.95),
+                amsgrad=cfg.pi_amsgrad,
+                foreach=foreach,
+                fused=optimizer_mode == "fused",
             )
-        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
+        self.opt_v = torch.optim.Adam(
+            self.critic.parameters(),
+            lr=cfg.lr,
+            amsgrad=cfg.critic_amsgrad,
+            foreach=foreach,
+            fused=optimizer_mode == "fused",
+        )
 
         self._v_mean = torch.zeros((), device=self.device)
         self._v_std = torch.ones((), device=self.device)
@@ -213,10 +257,14 @@ class ImaginedSuperMimicLearner:
             self._imag_step_fn = self._imag_step
             self._reward_fn = self._reward_term
             self._critic_input_fn = self._critic_input
+            self._critic_targets_fn = self._critic_targets
+            self._critic_loss_fn = self._critic_loss
             return
         self._imag_step_fn = torch.compile(self._imag_step, dynamic=False)
         self._reward_fn = torch.compile(self._reward_term, dynamic=False)
         self._critic_input_fn = torch.compile(self._critic_input, dynamic=False)
+        self._critic_targets_fn = torch.compile(self._critic_targets, dynamic=False)
+        self._critic_loss_fn = torch.compile(self._critic_loss, dynamic=False)
 
     def _reset_batch(self, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Reset all or selected imagined environments to motion-library starts."""
@@ -344,6 +392,87 @@ class ImaginedSuperMimicLearner:
     ) -> torch.Tensor:
         return self._critic_input_fn(state, frames, normalized_context, goal)
 
+    @staticmethod
+    def _resolve_optimizer_mode(
+        mode: str, device: torch.device
+    ) -> Literal["fused", "foreach", "single"]:
+        """Resolve an optimizer implementation without silently changing device support."""
+        if mode == "auto":
+            # This matches the historical implementation: fused on CUDA, Adam's
+            # platform-selected implementation everywhere else.
+            return "fused" if device.type == "cuda" else "single"
+        if mode == "fused" and device.type != "cuda":
+            raise ValueError(
+                f"fused optimizers require CUDA; device {device} requested fused explicitly"
+            )
+        return cast(Literal["foreach", "single"], mode)
+
+    def _critic_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the critic while folding input normalization into its first linear.
+
+        ``(x - mean) / std @ W.T + b`` is algebraically identical to
+        ``x @ (W / std).T + (b - W @ (mean / std))``. The latter reads the already
+        contiguous concatenated critic input once and avoids two horizon-sized
+        normalization temporaries before the first GEMM.
+        """
+        norm = self.critic.norm
+        first = self.critic.net[0]
+        assert isinstance(first, nn.Linear)
+        inv_std = norm.std().reciprocal()
+        normalized_weight = first.weight * inv_std
+        shift = first.bias - torch.mv(first.weight, norm.mean * inv_std)
+
+        def run(x: torch.Tensor) -> torch.Tensor:
+            hidden = F.linear(x, normalized_weight, shift)
+            for layer in self.critic.net[1:]:
+                hidden = layer(hidden)
+            return hidden
+
+        amp_dtype = networks_module.AMP_DTYPE
+        if amp_dtype is not None and x.device.type in ("cuda", "mps"):
+            with torch.autocast(x.device.type, dtype=amp_dtype):
+                hidden = run(x)
+            return hidden.float().squeeze(-1)
+        return run(x).squeeze(-1)
+
+    def _critic_targets(
+        self,
+        values: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> torch.Tensor:
+        target = values[-1]
+        targets: list[torch.Tensor] = []
+        gamma, lam = self.cfg.gamma, self.cfg.lam
+        for index in range(self.cfg.horizon - 1, -1, -1):
+            target = rewards[index] + gamma * (1 - dones[index]) * (
+                (1 - lam) * values[index + 1] + lam * target
+            )
+            targets.append(target)
+        return torch.stack(targets[::-1])
+
+    def _critic_loss(self, critic_input: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(self._critic_forward(critic_input), targets)
+
+    def _update_critic_norm(self, critic_input: torch.Tensor) -> None:
+        """Apply the configured RunningNorm update cadence and sample budget."""
+        if self.cfg.critic_norm_update == "off":
+            return
+        if self.iteration % self.cfg.critic_norm_interval != 0:
+            return
+
+        rows = critic_input.shape[0] * critic_input.shape[1]
+        sample = self.cfg.critic_norm_subsample
+        if self.cfg.critic_norm_update == "subsample" and rows > sample:
+            # Sampling with replacement keeps the index generation entirely on-device and
+            # avoids a host sync or a full randperm. For sample >= rows this is exactly a
+            # full update, which makes acceleration switches easy to test.
+            indices = torch.randint(rows, (sample,), device=critic_input.device)
+            update_input = critic_input.reshape(-1, critic_input.shape[-1]).index_select(0, indices)
+        else:
+            update_input = critic_input
+        self.critic.norm.update(update_input)
+
     def update(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
@@ -416,7 +545,7 @@ class ImaginedSuperMimicLearner:
         detached_rewards, detached_dones = rewards.detach(), dones.detach()
         if not self.cfg.no_critic:
             bootstrap_input = self._critic_input_fn(state, frames, normalized_context, goal)
-            bootstrap = self.critic(bootstrap_input).detach()
+            bootstrap = self._critic_forward(bootstrap_input).detach()
             objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
                 bootstrap * self._v_std + self._v_mean
             )
@@ -441,44 +570,28 @@ class ImaginedSuperMimicLearner:
         value_loss = torch.zeros((), device=self.device)
         if not self.cfg.no_critic:
             with torch.no_grad():
+                # stack(initial, rollout) produces the same T-major layout as the old
+                # cat/flatten path, while variadic stack avoids an intermediate rollout
+                # tensor per state component.
                 critic_states = cast(
                     State,
                     tuple(
-                        torch.cat(
-                            (
-                                initial_state[index].unsqueeze(0),
-                                torch.stack([item[index].detach() for item in states]),
-                            ),
-                            0,
-                        ).flatten(0, 1)
+                        torch.stack((initial_state[index], *(item[index] for item in states)))
                         for index in range(6)
                     ),
                 )
-                critic_frames = torch.cat(
-                    (frames0.unsqueeze(0), torch.stack(all_frames)), 0
-                ).flatten()
-                critic_goals = torch.cat(
-                    (initial_goal.unsqueeze(0), torch.stack(goals)), 0
-                ).flatten(0, 1)
-                critic_context = (
-                    normalized_context.unsqueeze(0)
-                    .expand(self.cfg.horizon + 1, -1, -1)
-                    .flatten(0, 1)
+                critic_frames = torch.stack((frames0, *all_frames))
+                critic_goals = torch.stack((initial_goal, *goals))
+                critic_context = normalized_context.unsqueeze(0).expand(
+                    self.cfg.horizon + 1, -1, -1
                 )
                 critic_input = self._batched_critic_input(
                     critic_states, critic_frames, critic_context, critic_goals
-                ).view(self.cfg.horizon + 1, self.cfg.batch, -1)
-            self.critic.norm.update(critic_input)
+                )
+            self._update_critic_norm(critic_input)
             with torch.no_grad():
-                values = self.critic(critic_input) * self._v_std + self._v_mean
-                target = values[-1]
-                targets = []
-                for index in range(self.cfg.horizon - 1, -1, -1):
-                    target = detached_rewards[index] + self.cfg.gamma * (
-                        1 - detached_dones[index]
-                    ) * ((1 - self.cfg.lam) * values[index + 1] + self.cfg.lam * target)
-                    targets.append(target)
-                targets = torch.stack(targets[::-1])
+                values = self._critic_forward(critic_input) * self._v_std + self._v_mean
+                targets = self._critic_targets_fn(values, detached_rewards, detached_dones)
                 target_mean = targets.mean()
                 target_std = targets.std().clamp(min=1e-2)
                 if not self._v_init:
@@ -502,9 +615,14 @@ class ImaginedSuperMimicLearner:
             for _ in range(self.cfg.critic_epochs):
                 permutation = torch.randperm(num_samples, device=self.device)
                 for index in range(self.cfg.critic_minibatches):
-                    indices = permutation[index * minibatch_size : (index + 1) * minibatch_size]
-                    value_loss = (self.critic(flat_input[indices]) - flat_targets[indices]) ** 2
-                    value_loss = value_loss.mean()
+                    # narrow is a scalar-offset view and index_select creates only the
+                    # contiguous minibatch needed by the MLP (rather than reindexing the
+                    # complete horizon tensor once per epoch).
+                    start = index * minibatch_size
+                    indices = permutation.narrow(0, start, minibatch_size)
+                    minibatch_input = flat_input.index_select(0, indices)
+                    minibatch_targets = flat_targets.index_select(0, indices)
+                    value_loss = self._critic_loss_fn(minibatch_input, minibatch_targets)
                     self.opt_v.zero_grad(set_to_none=True)
                     value_loss.backward()
                     nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)

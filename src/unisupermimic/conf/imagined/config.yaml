@@ -23,6 +23,15 @@ algo:
   max_episode_steps: 500
   critic_epochs: 5
   critic_minibatches: 4
+  # full preserves the historical RunningNorm update on every iteration.
+  # subsample/interval/off are opt-in accelerators; see ImaginedSuperMimicConfig.
+  critic_norm_update: full
+  critic_norm_subsample: 131072
+  critic_norm_interval: 1
+  critic_norm_max_count: null
+  optimizer_mode: auto
+  critic_amsgrad: false
+  pi_amsgrad: false
   no_critic: false
   reset_noise: true
   lr_decay_iters: 250000
