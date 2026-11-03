@@ -546,6 +546,7 @@ class ImaginedSuperMimicLearner:
         assert previous_action is not None
         obs_hist = self._obs_hist
         assert obs_hist is not None
+
         initial_state = state
         frames0 = frames
 

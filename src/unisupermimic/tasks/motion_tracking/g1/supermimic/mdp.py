@@ -19,17 +19,12 @@ from unisupermimic.rl.algos.supermimic.geometry import (
 from unisupermimic.rl.contracts.supermimic import State
 
 from .kinematics import G1Kinematics
-from .motion import (
-    CONTROL_DT,
-    GOAL_FRAME_DIM,
-    MotionLib,
-    ReferenceStatePack,
-    ReferenceTimeline,
-)
+from .motion import CONTROL_DT, MotionLib
 
 STATE_DIM = 71
 NUM_J = 29
 OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
+GOAL_FRAME_DIM = 73
 XI_DIM = 33
 INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
@@ -130,20 +125,13 @@ class MDP:
         previous_action: torch.Tensor,
         context: torch.Tensor,
         frames: torch.Tensor,
-        reference_rotation: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the 99D noise-free proprioceptive observation.
-
-        ``reference_rotation`` is an optional prefetched ``root_R`` batch. It
-        keeps rollout observation construction from revisiting the motion cache.
-        """
+        """Return the 99D noise-free proprioceptive observation."""
         _, rotation, _, angular_velocity, joint_pos, joint_vel = state
         rotation_t = rotation.transpose(-1, -2)
         default_offset = context[..., 1:30]
         gravity = -rotation[..., 2, :]
-        if reference_rotation is None:
-            reference_rotation = self.motion.ref_state_pack(frames).root_R
-        relative_rotation = mat_to_6d(matmul(rotation_t, reference_rotation))
+        relative_rotation = mat_to_6d(matmul(rotation_t, self.motion.ref_state(frames)[1]))
         return torch.cat(
             (
                 joint_pos - self.default_q - default_offset,
@@ -189,9 +177,6 @@ class MDP:
         action: torch.Tensor,
         previous_action: torch.Tensor,
         terms: bool = False,
-        reference: ReferenceStatePack | None = None,
-        reference_body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compare a state with its reference and return the dt-weighted reward."""
         cfg, motion = self.cfg, self.motion
@@ -204,12 +189,9 @@ class MDP:
             joint_pos,
             joint_vel,
         )
-        reference = reference if reference is not None else motion.ref_state_pack(frames)
-        ref_p, ref_R = reference.root_p, reference.root_R
-        if reference_body_state is None:
-            reference_body_state = motion.body_state(frames)
-        reference_body_p, reference_body_R, reference_body_v, reference_body_w = (
-            reference_body_state
+        ref_p, ref_R = motion.ref_state(frames)[:2]
+        reference_body_p, reference_body_R, reference_body_v, reference_body_w = motion.body_state(
+            frames
         )
         delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
@@ -267,26 +249,12 @@ class MDP:
             }
         return reward
 
-    def _termination_errors(
-        self,
-        state: State,
-        reference: ReferenceStatePack | None = None,
-        frames: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        position, rotation = state[0], state[1]
-        if reference is None:
-            if frames is None:
-                raise ValueError("termination queries need either reference or frames")
-            reference = self.motion.ref_state_pack(frames)
-        error_height = (reference.root_p[..., 2] - position[..., 2]).abs()
-        error_tilt = (reference.root_R[..., 2, 2] - rotation[..., 2, 2]).abs()
-        return error_height, error_tilt
-
-    def termination(
-        self, state: State, frames: torch.Tensor, reference: ReferenceStatePack | None = None
-    ) -> torch.Tensor:
+    def termination(self, state: State, frames: torch.Tensor) -> torch.Tensor:
         """Return hard termination from root height and tilt deviations."""
-        error_height, error_tilt = self._termination_errors(state, reference, frames)
+        position, rotation = state[0], state[1]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
+        error_height = (ref_p[..., 2] - position[..., 2]).abs()
+        error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         return (error_height > self.cfg.term_height) | (error_tilt > self.cfg.term_tilt)
 
     def soft_termination(
@@ -295,10 +263,12 @@ class MDP:
         frames: torch.Tensor,
         height_temperature: float = 0.02,
         tilt_temperature: float = 0.04,
-        reference: ReferenceStatePack | None = None,
     ) -> torch.Tensor:
         """Return the differentiable imagined-rollout termination probability."""
-        error_height, error_tilt = self._termination_errors(state, reference, frames)
+        position, rotation = state[0], state[1]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
+        error_height = (ref_p[..., 2] - position[..., 2]).abs()
+        error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         alive = (1 - torch.sigmoid((error_height - self.cfg.term_height) / height_temperature)) * (
             1 - torch.sigmoid((error_tilt - self.cfg.term_tilt) / tilt_temperature)
         )
@@ -309,17 +279,12 @@ class MDP:
         state: State,
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
-        reference: ReferenceStatePack | None = None,
-        reference_body_p: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return invariant state, goal errors, and normalized simulation context."""
         motion = self.motion
         position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
         heading_t = yaw_mat(rotation).transpose(-1, -2)
-        reference = reference if reference is not None else motion.ref_state_pack(frames)
-        ref_p, ref_R, ref_q = reference.root_p, reference.root_R, reference.q
-        if reference_body_p is None:
-            reference_body_p = motion.body_state(frames)[0]
+        ref_p, ref_R, _, _, ref_q, _ = motion.ref_state(frames)
         body_p = self.kin.forward(
             position,
             rotation,
@@ -331,7 +296,7 @@ class MDP:
         delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
         ref_body_p = anchor.unsqueeze(-2) + matvec(
-            delta_rotation.unsqueeze(-3), reference_body_p - ref_p.unsqueeze(-2)
+            delta_rotation.unsqueeze(-3), motion.body_state(frames)[0] - ref_p.unsqueeze(-2)
         )
         body_error = matvec(heading_t.unsqueeze(-3), ref_body_p - body_p).flatten(-2)
         root_error = matvec(heading_t, ref_p - position)
@@ -364,51 +329,6 @@ class MDP:
 
     def ref_state(self, frames: torch.Tensor) -> State:
         return self.motion.ref_state(frames)
-
-    def ref_state_pack(self, frames: torch.Tensor) -> ReferenceStatePack:
-        """Return all reference state fields from one contiguous-cache gather."""
-        return self.motion.ref_state_pack(frames)
-
-    def timeline_frames(self, frames: torch.Tensor, horizon: int) -> torch.Tensor:
-        """Return a contiguous unified rollout frame axis owned by the task."""
-        return self.motion.timeline_frames(frames, horizon)
-
-    def reference_timeline(
-        self, frames: torch.Tensor, horizon: int, goal_frames: int
-    ) -> ReferenceTimeline:
-        """Prefetch reference states, body states, and future goals once."""
-        if horizon < 0:
-            raise ValueError("horizon cannot be negative")
-        if goal_frames <= 0:
-            raise ValueError("goal_frames must be positive")
-        return self.motion.reference_timeline(frames, horizon, goal_frames)
-
-    @staticmethod
-    def timeline_reference(
-        reference: ReferenceStatePack, time_index: int, batch_size: int
-    ) -> ReferenceStatePack:
-        """Slice a prefetched flat reference pack to one rollout time step."""
-        start = time_index * batch_size
-        stop = start + batch_size
-        return ReferenceStatePack(
-            reference.root_p[start:stop],
-            reference.root_R[start:stop],
-            reference.root_v[start:stop],
-            reference.root_w[start:stop],
-            reference.q[start:stop],
-            reference.qd[start:stop],
-        )
-
-    @staticmethod
-    def timeline_body_state(
-        body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        time_index: int,
-        batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Slice prefetched body states to one rollout time step."""
-        start = time_index * batch_size
-        stop = start + batch_size
-        return tuple(value[start:stop] for value in body_state)  # type: ignore[return-value]
 
     def clip_info(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return owning clip, its inclusive bounds, and the frame's one-second bin."""

@@ -7,7 +7,6 @@ import csv
 import math
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import torch
 
@@ -26,73 +25,6 @@ from .kinematics import G1Kinematics
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50
-GOAL_FRAME_DIM = 73
-
-
-@dataclass(frozen=True)
-class ReferenceStatePack:
-    """Reference state gathered from one contiguous cache into batch-shaped views.
-
-    ``root_p`` is the underlying packed tensor while the other members are views
-    into it. This keeps one gather per field-group while retaining the historical
-    tuple layout used throughout learners and task code.
-    """
-
-    root_p: torch.Tensor
-    root_R: torch.Tensor  # noqa: N815
-    root_v: torch.Tensor
-    root_w: torch.Tensor
-    q: torch.Tensor
-    qd: torch.Tensor
-
-    def state(self) -> State:
-        return (
-            self.root_p,
-            self.root_R,
-            self.root_v,
-            self.root_w,
-            self.q,
-            self.qd,
-        )
-
-    def __iter__(self):
-        return iter(self.state())
-
-
-@dataclass(frozen=True)
-class ReferenceTimeline:
-    """Prefetched reference data on one contiguous rollout time axis."""
-
-    frames: torch.Tensor
-    reference: ReferenceStatePack
-    body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    goals: torch.Tensor
-
-    def step(self, time_index: int, batch_size: int) -> ReferenceStatePack:
-        """Return one step's reference views for a standard ``(T, N)`` rollout."""
-        start = time_index * batch_size
-        stop = start + batch_size
-        return ReferenceStatePack(
-            self.reference.root_p[start:stop],
-            self.reference.root_R[start:stop],
-            self.reference.root_v[start:stop],
-            self.reference.root_w[start:stop],
-            self.reference.q[start:stop],
-            self.reference.qd[start:stop],
-        )
-
-    def body_at(
-        self, time_index: int, batch_size: int
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """Return one step's reference body-state views."""
-        start = time_index * batch_size
-        stop = start + batch_size
-        return tuple(value[start:stop] for value in self.body_state)
 
 
 class MotionLib:
@@ -174,12 +106,12 @@ class MotionLib:
             for start in range(0, self.num_frames, 65536):
                 end = min(start + 65536, self.num_frames)
                 output = kin.forward(
-                    self._root_p[start:end],
-                    self._root_R[start:end],
-                    self._root_v[start:end],
-                    self._root_w[start:end],
-                    self._q[start:end],
-                    self._qd[start:end],
+                    self.root_p[start:end],
+                    self.root_R[start:end],
+                    self.root_v[start:end],
+                    self.root_w[start:end],
+                    self.q[start:end],
+                    self.qd[start:end],
                 )
                 body_p.append(output[0])
                 body_R.append(output[1])
@@ -189,12 +121,11 @@ class MotionLib:
                 torch.cat(values) for values in (body_p, body_R, body_v, body_w)
             )
 
-        root_rotation_t = self._root_R.transpose(-1, -2)
-        self._root_v_local = matvec(root_rotation_t, self._root_v)
-        self._root_w_local = matvec(root_rotation_t, self._root_w)
-        self._root_gz = self._root_R[:, 2, 2]
+        root_rotation_t = self.root_R.transpose(-1, -2)
+        self._root_v_local = matvec(root_rotation_t, self.root_v)
+        self._root_w_local = matvec(root_rotation_t, self.root_w)
+        self._root_gz = self.root_R[:, 2, 2]
         self._build_indices()
-        self._build_reference_cache()
 
     def _load_compact(self, path: str) -> None:
         pack = _load_compact_payload(path)
@@ -238,55 +169,6 @@ class MotionLib:
         self.clip_len = torch.tensor(lengths, dtype=torch.long, device=self.device)
         self.clip_end = self.clip_start + self.clip_len - 1
         self.num_frames = expected_start
-        self._build_reference_cache()
-        self._ref = self._ref[:0]
-
-    def _build_reference_cache(self) -> None:
-        """Materialize query fields once as contiguous device-resident tensors.
-
-        Compact libraries store scalar reference fields as fp16 on disk. They are
-        expanded to a contiguous fp32 cache so rollout gathers do not repeatedly
-        widen non-contiguous slices. Rotations and local velocities are derived
-        once here rather than at every goal query.
-        """
-        with torch.no_grad():
-            if self.compact:
-                reference = self._ref.float()
-                self._root_R = quat_to_mat(reference[:, 3:7])
-                self._root_v_local = matvec(self._root_R.transpose(-1, -2), reference[:, 36:39])
-                self._root_w_local = matvec(self._root_R.transpose(-1, -2), reference[:, 39:42])
-                self._root_gz = self._root_R[:, 2, 2]
-                self._reference_cache = torch.cat(
-                    (
-                        reference[:, :3],
-                        self._root_R.reshape(self.num_frames, -1),
-                        reference[:, 36:39],
-                        reference[:, 39:42],
-                        reference[:, 7:36],
-                        reference[:, 42:71],
-                    ),
-                    dim=1,
-                ).contiguous()
-                return
-            self._reference_cache = torch.cat(
-                (
-                    self._root_p.reshape(self.num_frames, -1),
-                    self._root_R.reshape(self.num_frames, -1),
-                    self._root_v,
-                    self._root_w,
-                    self._q,
-                    self._qd,
-                ),
-                dim=1,
-            ).contiguous()
-            # The cache is now the source of truth for scalar fields. Releasing
-            # these construction arrays avoids duplicating roughly 268 fp32 bytes
-            # per frame on the training device.
-            self._root_p = self._root_p[:0]
-            self._root_v = self._root_v[:0]
-            self._root_w = self._root_w[:0]
-            self._q = self._q[:0]
-            self._qd = self._qd[:0]
 
     def _build_indices(self) -> None:
         clips = torch.arange(len(self.names), dtype=torch.long, device=self.device)
@@ -308,44 +190,45 @@ class MotionLib:
 
     @property
     def root_p(self) -> torch.Tensor:
-        return self._reference_cache[:, :3]
+        return self._ref[:, :3].float() if self.compact else self._root_p
 
     @property
     def root_R(self) -> torch.Tensor:
-        return self._root_R
+        return quat_to_mat(self._ref[:, 3:7].float()) if self.compact else self._root_R
 
     @property
     def root_v(self) -> torch.Tensor:
-        return self._reference_cache[:, 12:15]
+        return self._ref[:, 36:39].float() if self.compact else self._root_v
 
     @property
     def root_w(self) -> torch.Tensor:
-        return self._reference_cache[:, 15:18]
+        return self._ref[:, 39:42].float() if self.compact else self._root_w
 
     @property
     def q(self) -> torch.Tensor:
-        return self._reference_cache[:, 18:47]
+        return self._ref[:, 7:36].float() if self.compact else self._q
 
     @property
     def qd(self) -> torch.Tensor:
-        return self._reference_cache[:, 47:76]
+        return self._ref[:, 42:71].float() if self.compact else self._qd
 
     @property
     def root_v_local(self) -> torch.Tensor:
-        return self._root_v_local
+        if not self.compact:
+            return self._root_v_local
+        rotation_t = self.root_R.transpose(-1, -2)
+        return matvec(rotation_t, self.root_v)
 
     @property
     def root_w_local(self) -> torch.Tensor:
-        return self._root_w_local
+        if not self.compact:
+            return self._root_w_local
+        rotation_t = self.root_R.transpose(-1, -2)
+        return matvec(rotation_t, self.root_w)
 
     @property
     def root_gz(self) -> torch.Tensor:
-        return self._root_gz
-
-    @property
-    def reference_cache(self) -> torch.Tensor:
-        """Contiguous tensor ordered as p, R, v, w, q, qd columns."""
-        return self._reference_cache
+        return self.root_R[:, 2, 2]
 
     @property
     def body_p(self) -> torch.Tensor:
@@ -371,19 +254,6 @@ class MotionLib:
             raise RuntimeError("Compact body states are batch-only; use body_state(frames)")
         return self._body_w
 
-    def ref_state_pack(self, frames: torch.Tensor) -> ReferenceStatePack:
-        """Gather all scalar reference fields with one contiguous index lookup."""
-        reference = self._reference_cache[frames]
-        fields = (
-            reference[..., 0:3],
-            reference[..., 3:12].reshape(*reference.shape[:-1], 3, 3),
-            reference[..., 12:15],
-            reference[..., 15:18],
-            reference[..., 18:47],
-            reference[..., 47:76],
-        )
-        return ReferenceStatePack(*fields)
-
     def body_state(
         self, frames: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -394,14 +264,14 @@ class MotionLib:
                 self._body_v[frames],
                 self._body_w[frames],
             )
-        reference = self._reference_cache[frames]
+        reference = self._ref[frames].float()
         return self.kin.forward(
-            reference[..., 0:3],
-            self._root_R[frames],
-            reference[..., 12:15],
-            reference[..., 15:18],
-            reference[..., 18:47],
-            reference[..., 47:76],
+            reference[..., :3],
+            quat_to_mat(reference[..., 3:7]),
+            reference[..., 36:39],
+            reference[..., 39:42],
+            reference[..., 7:36],
+            reference[..., 42:71],
         )
 
     def to(self, device: str | torch.device) -> MotionLib:
@@ -423,45 +293,28 @@ class MotionLib:
         future = frames.unsqueeze(-1) + torch.arange(1, num_frames + 1, device=frames.device)
         return torch.minimum(future, end.unsqueeze(-1))
 
-    def timeline_frames(self, frames: torch.Tensor, horizon: int) -> torch.Tensor:
-        """Return frames through frames+horizon on a unified ``(T, ...)`` axis."""
-        if horizon < 0:
-            raise ValueError("horizon cannot be negative")
-        offsets = torch.arange(horizon + 1, device=frames.device)
-        return frames + offsets.reshape(horizon + 1, *([1] * frames.ndim))
-
-    def reference_timeline(
-        self, frames: torch.Tensor, horizon: int, goal_frames: int
-    ) -> ReferenceTimeline:
-        """Prefetch every rollout reference query with three contiguous gathers.
-
-        The resulting state and body tensors use a flat ``(T*N,)`` axis. Goals
-        retain a leading time axis so callers can slice step inputs directly.
-        Future-goal clamping remains per owning clip and is unchanged.
-        """
-        timeline = self.timeline_frames(frames, horizon)
-        flat_frames = timeline.reshape(-1)
-        reference = self.ref_state_pack(flat_frames)
-        body_state = self.body_state(flat_frames)
-        goals = self.goal(flat_frames, goal_frames)
-        goals = goals.reshape(horizon + 1, *frames.shape, goal_frames * GOAL_FRAME_DIM)
-        return ReferenceTimeline(timeline, reference, body_state, goals)
-
-    def goal_frame_dim(self) -> int:
-        """Return one future-reference feature width."""
-        return GOAL_FRAME_DIM
-
     def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Build future reference features in the current reference heading frame."""
         future = self.future_frames(frames, num_frames)
-        reference = self._reference_cache[future]
-        current_rotation = self._root_R[frames]
-        root_p = reference[..., 0:3]
-        root_R = reference[..., 3:12].reshape(*reference.shape[:-1], 3, 3)
-        root_v_local = self._root_v_local[future]
-        root_w_local = self._root_w_local[future]
-        q, qd = reference[..., 18:47], reference[..., 47:76]
-        current_p = self._reference_cache[frames, :3]
+        if self.compact:
+            reference = self._ref[future].float()
+            current_rotation = quat_to_mat(self._ref[frames, 3:7].float())
+            root_p = reference[..., :3]
+            root_R = quat_to_mat(reference[..., 3:7])
+            root_v = reference[..., 36:39]
+            root_w = reference[..., 39:42]
+            root_v_local = matvec(root_R.transpose(-1, -2), root_v)
+            root_w_local = matvec(root_R.transpose(-1, -2), root_w)
+            q, qd = reference[..., 7:36], reference[..., 42:71]
+            current_p = self._ref[frames, :3].float()
+        else:
+            current_rotation = self.root_R[frames]
+            root_p = self.root_p[future]
+            root_R = self.root_R[future]
+            root_v_local = self.root_v_local[future]
+            root_w_local = self.root_w_local[future]
+            q, qd = self.q[future], self.qd[future]
+            current_p = self.root_p[frames]
         heading_t = yaw_mat(current_rotation).transpose(-1, -2).unsqueeze(1)
         position_delta = matvec(heading_t, root_p - current_p.unsqueeze(1))
         rotation = mat_to_6d(matmul(heading_t, root_R))
@@ -471,7 +324,24 @@ class MotionLib:
         return features.reshape(frames.shape[0], -1)
 
     def ref_state(self, frames: torch.Tensor) -> State:
-        return self.ref_state_pack(frames).state()
+        if self.compact:
+            reference = self._ref[frames].float()
+            return (
+                reference[..., :3],
+                quat_to_mat(reference[..., 3:7]),
+                reference[..., 36:39],
+                reference[..., 39:42],
+                reference[..., 7:36],
+                reference[..., 42:71],
+            )
+        return (
+            self.root_p[frames],
+            self.root_R[frames],
+            self.root_v[frames],
+            self.root_w[frames],
+            self.q[frames],
+            self.qd[frames],
+        )
 
 
 def _load_compact_payload(path: str) -> dict:
