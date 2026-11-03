@@ -278,6 +278,14 @@ class ImaginedSuperMimicLearner:
         self._critic_targets_fn = torch.compile(self._critic_targets, dynamic=False)
         self._critic_loss_fn = torch.compile(self._critic_loss, dynamic=False)
 
+    def _sample_valid_frames(self, batch: int) -> torch.Tensor:
+        """Draw frame indices that retain at least ``horizon`` frames in their clip."""
+        for _ in range(8):
+            candidate = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
+            if bool(self.mdp.valid_imagination_start(candidate, self.cfg.horizon).all()):
+                return candidate
+        raise RuntimeError("could not sample horizon-valid imagination starts")
+
     def _reset_batch(self, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Reset all or selected imagined environments to motion-library starts."""
         if indices is None:
@@ -293,7 +301,20 @@ class ImaginedSuperMimicLearner:
         if batch == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.device)
 
-        frames = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
+        if hasattr(self.mdp, "valid_imagination_start"):
+            # Resample rather than clamp: a rollout must never query beyond its
+            # owning clip, and rejection preserves the original start distribution
+            # conditioned on being horizon-valid.
+            maximum = max(self.motion.num_frames - self.cfg.horizon - 1, 0)
+            frames = torch.randint(0, maximum + 1, (batch,), device=self.device)
+            valid = self.mdp.valid_imagination_start(frames, self.cfg.horizon)
+            if bool((~valid).any()):
+                overflow = (~valid).nonzero(as_tuple=False).squeeze(-1)
+                replacement = self._sample_valid_frames(overflow.numel())
+                frames = frames.clone()
+                frames[overflow] = replacement
+        else:
+            frames = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
         state = self.motion.ref_state(frames)
         context = torch.zeros((batch, self.mdp.context_dim), device=self.device)
         if self.cfg.reset_noise:
@@ -583,9 +604,12 @@ class ImaginedSuperMimicLearner:
             ),
         )
         flat_actions = flatten(actions)
-        flat_previous_actions = torch.cat(
-            (previous_actions[0].unsqueeze(0), torch.stack(actions[:-1])), 0
-        ).flatten(0, 1)
+        if self.cfg.horizon == 1:
+            flat_previous_actions = previous_actions[0]
+        else:
+            flat_previous_actions = torch.cat(
+                (previous_actions[0].unsqueeze(0), torch.stack(actions[:-1])), 0
+            ).flatten(0, 1)
 
         if self._fused_scoring:
             scored_frames = frame_sequence[1:].flatten()
@@ -685,9 +709,11 @@ class ImaginedSuperMimicLearner:
                         .clamp(min=1e-2)
                     )
                 targets = ((targets - self._v_mean) / self._v_std).clamp(-20.0, 20.0)
+            # Critic regression covers the T rollout transitions; the bootstrap row
+            # only contributes through the GAE recursion above.
             flat_input = critic_input[:-1].reshape(-1, critic_input.shape[-1])
             flat_targets = targets.reshape(-1)
-            num_samples = flat_input.shape[0]
+            num_samples = min(flat_input.shape[0], flat_targets.shape[0])
             minibatch_size = num_samples // self.cfg.critic_minibatches
             if minibatch_size == 0:
                 raise ValueError("critic_minibatches exceeds imagined transitions")
@@ -700,7 +726,7 @@ class ImaginedSuperMimicLearner:
                     start = index * minibatch_size
                     indices = permutation.narrow(0, start, minibatch_size)
                     minibatch_input = flat_input.index_select(0, indices)
-                    minibatch_targets = flat_targets.index_select(0, indices)
+                    minibatch_targets = flat_targets[:num_samples].index_select(0, indices)
                     value_loss = self._critic_loss_fn(minibatch_input, minibatch_targets)
                     self.opt_v.zero_grad(set_to_none=True)
                     value_loss.backward()
