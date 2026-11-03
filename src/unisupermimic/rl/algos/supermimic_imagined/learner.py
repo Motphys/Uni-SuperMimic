@@ -280,11 +280,26 @@ class ImaginedSuperMimicLearner:
 
     def _sample_valid_frames(self, batch: int) -> torch.Tensor:
         """Draw frame indices that retain at least ``horizon`` frames in their clip."""
-        for _ in range(8):
-            candidate = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
-            if bool(self.mdp.valid_imagination_start(candidate, self.cfg.horizon).all()):
-                return candidate
-        raise RuntimeError("could not sample horizon-valid imagination starts")
+        clip_start = self.motion.clip_start.detach().to(self.device)
+        clip_end = self.motion.clip_end.detach().to(self.device)
+        # valid Imagination starts satisfy frame + horizon <= clip_end.
+        lengths = clip_end - clip_start - self.cfg.horizon + 1
+        valid = lengths > 0
+        if not bool(valid.any()):
+            raise ValueError(
+                f"no motion clip is long enough for imagination horizon {self.cfg.horizon}"
+            )
+        starts = clip_start[valid]
+        lengths = lengths[valid]
+        cumulative = lengths.cumsum(0)
+        draws = torch.rand(batch, device=self.device) * cumulative[-1]
+        clip_ids = torch.searchsorted(cumulative, draws, right=True).clamp(
+            max=clip_start.numel() - 1
+        )
+        offsets = torch.floor(
+            torch.rand(batch, device=self.device) * lengths.gather(0, clip_ids)
+        ).long()
+        return starts.gather(0, clip_ids) + offsets
 
     def _reset_batch(self, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Reset all or selected imagined environments to motion-library starts."""
@@ -355,24 +370,29 @@ class ImaginedSuperMimicLearner:
             assert self._state is not None
             self._state = cast(
                 State,
-                tuple(
-                    torch.where(reset_mask[:, None, None], new, old)
-                    for new, old in zip(state, self._state)
-                ),
+                tuple(old.index_copy(0, selected, new) for new, old in zip(state, self._state)),
             )
-            self._context[selected] = context
-            self._frames[selected] = frames
-            self._ep_step[selected] = 0
-            self._previous_action[selected] = 0.0
+            self._context.index_copy_(0, selected, context)
+            self._frames.index_copy_(0, selected, frames)
+            self._ep_step.index_fill_(0, selected, 0)
+            self._previous_action.index_fill_(0, selected, 0.0)
 
         assert self._state is not None
         self._normalized_context = self.mdp.normalize_context(self._context)
-        obs = self.mdp.obs(self._state, self._previous_action, self._context, self._frames)
         if selected is None:
+            obs = self.mdp.obs(self._state, self._previous_action, self._context, self._frames)
             self._obs_hist = obs[:, None, :].expand(-1, self.cfg.hist, -1).clone()
         else:
+            selected_state = cast(State, tuple(item[selected] for item in self._state))
+            obs = self.mdp.obs(
+                selected_state,
+                self._previous_action[selected],
+                self._context[selected],
+                self._frames[selected],
+            )
             assert self._obs_hist is not None
-            self._obs_hist[selected] = obs[:, None, :]
+            selected_obs = obs[:, None, :].expand(-1, self.cfg.hist, -1)
+            self._obs_hist.index_copy_(0, selected, selected_obs)
         return torch.ones(batch, dtype=torch.bool, device=self.device)
 
     def reset_all(self) -> None:

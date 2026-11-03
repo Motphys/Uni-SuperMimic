@@ -18,9 +18,11 @@ from unisupermimic.rl.algos.supermimic_imagined.learner import (
 class FakeMotion:
     def __init__(self) -> None:
         self.num_frames = 101
-        self.clip_start = torch.tensor([0])
-        self.clip_end = torch.tensor([100])
-        self.clip_id = torch.zeros(101, dtype=torch.long)
+        self.clip_start = torch.tensor([0, 80])
+        self.clip_end = torch.tensor([79, 100])
+        self.clip_id = torch.cat(
+            (torch.zeros(80, dtype=torch.long), torch.ones(21, dtype=torch.long))
+        )
 
     def ref_state(self, frames: torch.Tensor):
         batch = frames.shape[0]
@@ -109,7 +111,7 @@ class FakeMdp:
         return torch.tanh(context)
 
     def valid_imagination_start(self, frames, horizon):
-        return torch.ones_like(frames, dtype=torch.bool)
+        return frames + horizon <= self._clip_end[self._clip_id[frames]]
 
     def to(self, device):
         return self
@@ -125,7 +127,11 @@ class FakeTask:
 
 
 def _task() -> FakeTask:
-    return FakeTask(FakeMdp(), FakeMotion(), WorldModel((8,), 29, 33), (8,), False)
+    motion = FakeMotion()
+    mdp = FakeMdp()
+    mdp._clip_end = motion.clip_end
+    mdp._clip_id = motion.clip_id
+    return FakeTask(mdp, motion, WorldModel((8,), 29, 33), (8,), False)
 
 
 def _config(**overrides) -> ImaginedSuperMimicConfig:
@@ -177,12 +183,34 @@ def test_update_backprops_through_frozen_wm_without_wm_gradients(tmp_path) -> No
 def test_update_reuses_persistent_imagined_state(tmp_path) -> None:
     learner = ImaginedSuperMimicLearner(_task(), _config(), tmp_path)
     initial_frames = learner._frames.clone()
+    clip_end = learner.motion.clip_end[learner.motion.clip_id[initial_frames]]
+    surviving = (initial_frames + learner.cfg.horizon < clip_end).nonzero().squeeze(-1)
     learner.update()
 
-    assert learner._frames is not None and torch.equal(learner._frames, initial_frames + 2)
-    assert learner._ep_step is not None and torch.equal(
-        learner._ep_step, torch.full_like(initial_frames, 2)
+    assert learner._frames is not None
+    assert torch.equal(
+        learner._frames[: surviving.numel()], initial_frames[surviving] + learner.cfg.horizon
     )
+    assert learner._ep_step is not None
+    assert torch.equal(learner._ep_step[: surviving.numel()], torch.full_like(surviving, 2))
+    assert learner._frames.numel() == learner.cfg.batch
+
+
+def test_reset_samples_valid_clip_starts_and_preserves_unselected_rows(tmp_path) -> None:
+    learner = ImaginedSuperMimicLearner(_task(), _config(), tmp_path)
+    learner._reset_batch(None)
+    original_frames = learner._frames.clone()
+    original_history = learner._obs_hist.clone()
+    selected = torch.tensor([1], dtype=torch.long)
+    learner._reset_batch(selected)
+
+    assert learner._frames is not None
+    assert learner.mdp.valid_imagination_start(learner._frames[selected], learner.cfg.horizon).all()
+    assert torch.equal(learner._frames[0], original_frames[0])
+    assert torch.equal(learner._frames[2], original_frames[2])
+    assert learner._obs_hist is not None
+    assert torch.equal(learner._obs_hist[0], original_history[0])
+    assert torch.equal(learner._obs_hist[2], original_history[2])
 
 
 def test_reset_samples_motion_starts_and_fills_history(tmp_path) -> None:
