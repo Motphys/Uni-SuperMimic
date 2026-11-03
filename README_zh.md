@@ -302,9 +302,9 @@ Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 
 
 Muon 在 4000 轮达到 Adam 8000 轮的宏平均 return（0.939500 vs 0.939490），但其 423 段失败不能视为与 Adam 8000 轮的 193 段严格等价。到 8000 轮时，Muon 将宏平均 return 提高 0.0108，失败段从 193 降至 166。
 
-结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。由于这是 seed-0 工程对照，`wm_structured` 仍保持可选。
+结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。其补充的 3000 轮 checkpoint 达到宏平均 return 0.929833、帧加权 return 0.932974、297 段失败。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。由于这是 seed-0 工程对照，`wm_structured` 仍保持可选。
 
-![Adam、Muon 与 Muon + 结构化 WM：2000/4000/6000/8000 轮全库评估与训练墙钟](docs/assets/muon_vs_adam_evaluation.png)
+![Adam、Muon 与 Muon + 结构化 WM：2000/3000/4000/6000/8000 轮全库评估与训练墙钟](docs/assets/muon_vs_adam_evaluation.png)
 
 构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现 Muon run：
 
