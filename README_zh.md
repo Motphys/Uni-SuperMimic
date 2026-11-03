@@ -298,16 +298,20 @@ BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEE
 
 | checkpoint | 迭代轮数 | norm_return | 帧加权 | 失败段 | 同迭代 Adam 基线 |
 |---|---:|---:|---:|---:|---|
+| ckpt_002000.pt | 2000 | 0.895346 | 0.899637 | 1126 / 129,487（0.87%） | 0.8092，1901 段失败 |
 | [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487（0.33%） | 0.912482，660 段失败 |
+| ckpt_006000.pt | 6000 | 0.947208 | 0.950058 | 186 / 129,487（0.14%） | 0.9306，206 段失败 |
 | [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487（0.13%） | 0.939490，193 段失败 |
 
 Muon 在 4000 轮达到 Adam 8000 轮的宏平均 `norm_return`：0.939500 vs 0.939490；4000 轮 learner 墙钟为 27.1 分钟，而 Adam 8000 轮为 48.1 分钟。这是迭代效率结论，不是严格成功率等价：Muon 4000 轮仍有 423 段失败，多于 Adam 8000 轮的 193 段，帧加权回报也低 0.0010。到完整 8000 轮时，Muon 将宏平均回报提高 0.0108，失败段从 193 降至 166，并将世界模型 8 步误差从 0.08759 降至 0.06252（-28.6%）。实测吞吐为 2.46 it/s，低于 Adam 的 2.70 it/s。
+
+完整 checkpoint 扫描进一步支持“一半迭代达到相近 return”的观察：Muon 6000 轮在宏平均 return（0.947208 vs 0.939490）和失败段数（186 vs 193）上都超过 Adam 8000 轮，learner 墙钟为 40.6 分钟 vs 48.1 分钟。
 
 以上为 seed 0 且对照既有 Adam run 的工程实验结果；在完成同一代码版本的多 seed 验证前，默认优化器仍保持 Adam。
 
 ![Muon 与 Adam：按迭代和墙钟对比训练奖励与世界模型误差](docs/assets/muon_vs_adam_training_curves.png)
 
-![Muon 与 Adam：4000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
+![Muon 与 Adam：2000/4000/6000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
 
 构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现：
 

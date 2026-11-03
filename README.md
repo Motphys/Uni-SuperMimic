@@ -298,16 +298,20 @@ The optional Muon optimizers update only the hidden `Linear` weight matrices of 
 
 | checkpoint | iterations | norm_return | frame-weighted | failed clips | Adam baseline at the same iteration |
 |---|---:|---:|---:|---:|---|
+| ckpt_002000.pt | 2000 | 0.895346 | 0.899637 | 1126 / 129,487 (0.87%) | 0.8092, 1901 failed |
 | [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487 (0.33%) | 0.912482, 660 failed |
+| ckpt_006000.pt | 6000 | 0.947208 | 0.950058 | 186 / 129,487 (0.14%) | 0.9306, 206 failed |
 | [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487 (0.13%) | 0.939490, 193 failed |
 
 Muon reaches the Adam 8000-iteration macro `norm_return` in 4000 iterations: 0.939500 versus 0.939490. The 4000-iteration learner wall time is 27.1 minutes versus 48.1 minutes for Adam at 8000 iterations. This is an iteration-efficiency result rather than a strict success-rate match: Muon at 4000 iterations has 423 failed clips versus 193 for Adam at 8000, and its frame-weighted return is lower by 0.0010. At the full 8000 iterations, Muon improves macro return by 0.0108, reduces failed clips from 193 to 166, and lowers the world-model 8-step error from 0.08759 to 0.06252 (-28.6%). Its measured throughput is 2.46 versus 2.70 iterations/second for Adam.
+
+The complete checkpoint sweep strengthens the halfway-return observation: Muon at 6000 iterations exceeds Adam at 8000 iterations on both macro return (0.947208 vs 0.939490) and failed clips (186 vs 193), while using 40.6 versus 48.1 minutes of learner wall time.
 
 These are seed-0 engineering-comparison numbers against the existing Adam run; the optimizer default remains Adam until a same-checkout, multi-seed study is completed.
 
 ![Muon versus Adam: training reward and world-model error by iteration and wall-clock time](docs/assets/muon_vs_adam_training_curves.png)
 
-![Muon versus Adam: full-library evaluation at 4000 and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
+![Muon versus Adam: full-library evaluation at 2000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
 
 Reproduce the run after building `data/library/bones_seed_compact.pt`:
 
