@@ -40,6 +40,7 @@ class SuperMimicConfig:
     hist: int = 10
     z_dim: int = 32
     wm_hidden: tuple[int, ...] = (2048, 2048, 2048)
+    wm_structured: bool = False
     policy_hidden: tuple[int, ...] = (2048, 1024, 512, 256)
     critic_hidden: tuple[int, ...] = (256, 128)
     wm_window: int = 8
@@ -47,8 +48,8 @@ class SuperMimicConfig:
     wm_batch: int = 2048
     pi_batch: int = 4096
     lr: float = 4e-4
-    pi_opt: str = "adam"
-    wm_opt: str = "adam"
+    pi_opt: str = "muon"
+    wm_opt: str = "muon"
     no_sync: bool = True
     pi_ema: float = 0.0
     gamma: float = 0.99
@@ -235,13 +236,19 @@ class SuperMimicLearner:
         return torch.compile(function)
 
     def _make_world_model(self) -> WorldModel:
-        kwargs = {
-            "num_joints": self.mdp.num_joints,
-            "context_dim": self.mdp.context_dim,
-        }
         if self.cfg.test_hidden_dims is not None:
-            return WorldModel(hidden=self.cfg.test_hidden_dims, **kwargs)
-        return WorldModel(hidden=self.cfg.wm_hidden, **kwargs)
+            return WorldModel(
+                hidden=self.cfg.test_hidden_dims,
+                num_joints=self.mdp.num_joints,
+                context_dim=self.mdp.context_dim,
+                structured=self.cfg.wm_structured,
+            )
+        return WorldModel(
+            hidden=self.cfg.wm_hidden,
+            num_joints=self.mdp.num_joints,
+            context_dim=self.mdp.context_dim,
+            structured=self.cfg.wm_structured,
+        )
 
     def _make_policy(self) -> Policy:
         goal_dim = self.mdp.goal_frame_dim * self.cfg.goal_frames
@@ -313,7 +320,7 @@ class SuperMimicLearner:
     def _wm_err(
         self, predicted: State, next_states: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        std = torch.maximum(self.wm.out_norm.std(), self.err_floor)
+        std = torch.maximum(self.wm.inc_norm.std(), self.err_floor)
         error = (self.wm.state_error(predicted, unflatten_state(next_states)) / std) ** 2
         error = error.mean(-1)
         return (error * mask).sum() / next_states.shape[0], error[:, -1]
@@ -434,7 +441,12 @@ class SuperMimicLearner:
                     self.mdp.normalize_context(transition["xi"]),
                 )
             )
-            self.wm.out_norm.update(self.wm.targets(initial, next_state))
+            target = self.wm.targets(initial, next_state)
+            self.wm.out_norm.update(target)
+            if self.cfg.wm_structured:
+                self.wm.inc_norm.update(self.wm.increments(initial, next_state))
+            else:
+                self.wm.inc_norm.update(target)
             self.sim_steps += self.env.num_envs
             self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
             if "ep_len" in transition:
@@ -705,6 +717,13 @@ class SuperMimicLearner:
         if missing:
             raise ValueError(
                 f"SuperMimic resume requires a full last.pt checkpoint; missing {missing} in {path}"
+            )
+        checkpoint_args = checkpoint.get("args", {})
+        checkpoint_structured = bool(checkpoint_args.get("wm_structured", False))
+        if checkpoint_structured != self.cfg.wm_structured:
+            raise ValueError(
+                "Cannot resume with a different algo.wm_structured setting "
+                f"(checkpoint={checkpoint_structured}, requested={self.cfg.wm_structured})"
             )
         self.wm.load_state_dict(checkpoint["wm"])
         if "pi_live" in checkpoint:

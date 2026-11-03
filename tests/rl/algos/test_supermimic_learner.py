@@ -205,7 +205,7 @@ def _config() -> SuperMimicConfig:
         log_backend="no_print",
         amp="none",
         compile=False,
-        test_hidden_dims=(8,),
+        test_hidden_dims=(8, 8),
     )
 
 
@@ -246,6 +246,19 @@ def test_collect_and_updates_run_on_cpu(tmp_path) -> None:
         assert torch.isfinite(metric)
     assert learner._v_init
     assert learner._v_std >= 0.01
+
+
+def test_structured_world_model_mode_is_wired_into_updates(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), replace(_config(), wm_structured=True), tmp_path)
+
+    assert learner.wm.structured is True
+    assert learner.cfg.wm_structured is True
+
+    learner.collect(3)
+    _, _ = learner.wm_update()
+
+    assert learner.wm.out_norm.count > 0
+    assert learner.wm.inc_norm.count == learner.wm.out_norm.count
 
 
 def test_invalid_optimizer_name_is_rejected(tmp_path) -> None:

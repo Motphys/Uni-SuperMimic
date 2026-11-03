@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,9 @@ import torch.nn as nn
 from unisupermimic.rl.contracts.supermimic import State
 
 from .geometry import invariant_features, matmul, matvec, so3_exp, so3_log, yaw_mat
+
+if TYPE_CHECKING:
+    from torch.nn.modules.module import _IncompatibleKeys
 
 
 def mlp(
@@ -97,17 +101,32 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 class WorldModel(nn.Module):
-    """Predict frame-local state increments and integrate them in fp32."""
+    """Predict frame-local state increments and integrate them in fp32.
+
+    ``structured`` switches the model from direct increments to semi-implicit
+    integration: velocities are predicted as increments, while positions are
+    integrated from a trapezoidal velocity drift and a learned residual correction.
+    """
+
+    # Four semi-implicit substeps with a linearly changing velocity imply that the
+    # new velocity contributes (n + 1) / (2n) = 0.625 of the position drift.
+    DRIFT_NEW_VELOCITY_WEIGHT = 0.625
 
     def __init__(
         self,
         hidden: Sequence[int] = (2048, 2048, 2048),
         num_joints: int = 29,
         context_dim: int = 33,
+        structured: bool = False,
+        dt: float = 0.02,
     ):
         super().__init__()
+        if dt <= 0:
+            raise ValueError(f"WorldModel dt must be positive, got {dt}")
         self.num_joints = num_joints
         self.context_dim = context_dim
+        self.structured = structured
+        self.dt = dt
         self.in_dim = 13 + 3 * num_joints + context_dim
         self.out_dim = 12 + 2 * num_joints
         self.net = mlp(self.in_dim, hidden, self.out_dim, act=nn.SiLU, layer_norm=True)
@@ -117,14 +136,41 @@ class WorldModel(nn.Module):
         nn.init.zeros_(output.bias)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(self.out_dim, eps=1e-4)
+        # Plain state-increment statistics remain the error scale even when the
+        # network output changes to velocity increments plus position residuals.
+        self.inc_norm = RunningNorm(self.out_dim, eps=1e-4)
 
     def inputs(
         self, state: State, action: torch.Tensor, normalized_context: torch.Tensor
     ) -> torch.Tensor:
         return torch.cat((invariant_features(state), action, normalized_context), -1)
 
+    def _drift(
+        self,
+        state: State,
+        next_lin_vel: torch.Tensor,
+        next_ang_vel: torch.Tensor,
+        next_joint_vel: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the semi-implicit position drift in each increment's local frame."""
+        _, rotation, lin_vel, ang_vel, _, joint_vel = state
+        heading = yaw_mat(rotation)
+        old_weight = self.dt * (1 - self.DRIFT_NEW_VELOCITY_WEIGHT)
+        new_weight = self.dt * self.DRIFT_NEW_VELOCITY_WEIGHT
+        return (
+            matvec(
+                heading.transpose(-1, -2),
+                old_weight * lin_vel + new_weight * next_lin_vel,
+            ),
+            matvec(
+                rotation.transpose(-1, -2),
+                old_weight * ang_vel + new_weight * next_ang_vel,
+            ),
+            old_weight * joint_vel + new_weight * next_joint_vel,
+        )
+
     @staticmethod
-    def targets(state: State, next_state: State) -> torch.Tensor:
+    def increments(state: State, next_state: State) -> torch.Tensor:
         """Return frame-local increments from ``state`` to ``next_state``."""
         position, rotation, lin_vel, ang_vel, joint_pos, joint_vel = state
         next_position, next_rotation, next_lin_vel, next_ang_vel, next_joint_pos, next_joint_vel = (
@@ -144,34 +190,93 @@ class WorldModel(nn.Module):
             -1,
         )
 
+    def targets(self, state: State, next_state: State) -> torch.Tensor:
+        """Return the regression layout used by the final network layer."""
+        increment = self.increments(state, next_state)
+        if not self.structured:
+            return increment
+
+        d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
+            (3, 3, 3, 3, self.num_joints, self.num_joints), -1
+        )
+        position_drift, rotation_drift, joint_pos_drift = self._drift(
+            state,
+            next_state[2],
+            next_state[3],
+            next_state[5],
+        )
+        return torch.cat(
+            (
+                d_position - position_drift,
+                d_rotation - rotation_drift,
+                d_lin_vel,
+                d_ang_vel,
+                d_joint_pos - joint_pos_drift,
+                d_joint_vel,
+            ),
+            -1,
+        )
+
     def step(
         self,
         state: State,
         action: torch.Tensor,
         normalized_context: torch.Tensor,
     ) -> State:
-        position, rotation, lin_vel, ang_vel, joint_pos, joint_vel = state
         prediction = run_mlp(
             self.net,
             self.in_norm(self.inputs(state, action, normalized_context)),
         )
         increment = prediction * self.out_norm.std() + self.out_norm.mean
+        return self.integrate(state, increment)
+
+    def integrate(self, state: State, increment: torch.Tensor) -> State:
+        """Integrate a denormalized output in the layout of :meth:`targets`."""
+        position, rotation, lin_vel, ang_vel, joint_pos, joint_vel = state
         heading = yaw_mat(rotation)
         d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
-        next_position = position + matvec(heading, d_position)
-        next_rotation = matmul(rotation, so3_exp(d_rotation))
         next_lin_vel = lin_vel + matvec(rotation, d_lin_vel)
         next_ang_vel = ang_vel + matvec(rotation, d_ang_vel)
+        next_joint_vel = joint_vel + d_joint_vel
+        if self.structured:
+            position_drift, rotation_drift, joint_pos_drift = self._drift(
+                state, next_lin_vel, next_ang_vel, next_joint_vel
+            )
+            d_position = d_position + position_drift
+            d_rotation = d_rotation + rotation_drift
+            d_joint_pos = d_joint_pos + joint_pos_drift
+
+        next_position = position + matvec(heading, d_position)
+        next_rotation = matmul(rotation, so3_exp(d_rotation))
         return (
             next_position,
             next_rotation,
             next_lin_vel,
             next_ang_vel,
             joint_pos + d_joint_pos,
-            joint_vel + d_joint_vel,
+            next_joint_vel,
         )
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> "_IncompatibleKeys":
+        """Load checkpoints from before the separate increment normalizer.
+
+        For an unstructured model, ``out_norm`` and ``inc_norm`` describe the
+        identical targets, so old checkpoints can safely copy the former. A
+        structured checkpoint must already contain the new normalizer.
+        """
+        values = dict(state_dict)
+        missing_increment_norm = not any(key.startswith("inc_norm.") for key in values)
+        if missing_increment_norm and not self.structured:
+            for suffix in ("mean", "var", "count"):
+                values[f"inc_norm.{suffix}"] = values[f"out_norm.{suffix}"]
+        return super().load_state_dict(values, strict=strict, assign=assign)
 
     @staticmethod
     def state_error(predicted_state: State, state: State) -> torch.Tensor:
