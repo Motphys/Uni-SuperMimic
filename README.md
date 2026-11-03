@@ -80,6 +80,10 @@ host-bridge backend (`task=g1_super_mimic/mujoco`). `make sync-rocm` swaps
 switch back. Maintainers regenerate the ROCm lockfile after dependency changes
 with `make lock-rocm`.
 
+The frozen-world-model training path has a reproducible learner-update benchmark.
+See [Imagined frozen-WM performance](docs/imagined-performance.md) for CLI usage,
+profiler artifacts, and the CUDA/ROCm optimization matrix.
+
 ### Prepare Assets and Choose a Dataset
 
 Both training modes use the same G1 robot model, but **you only need to download the dataset you plan to train on**. LAFAN1 and BONES-SEED are independent choices; downloading one does not require downloading the other.
