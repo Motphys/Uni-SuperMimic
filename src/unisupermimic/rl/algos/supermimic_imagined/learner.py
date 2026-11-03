@@ -11,10 +11,11 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from unisupermimic.rl.algos.supermimic import networks as networks_module
@@ -44,6 +45,13 @@ class ImaginedSuperMimicConfig:
     max_episode_steps: int = 500
     critic_epochs: int = 5
     critic_minibatches: int = 4
+    critic_norm_update: str = "full"
+    critic_norm_subsample: int = 131_072
+    critic_norm_interval: int = 1
+    critic_norm_max_count: float | None = None
+    optimizer_mode: str = "auto"
+    critic_amsgrad: bool = False
+    pi_amsgrad: bool = False
     no_critic: bool = False
     reset_noise: bool = True
     lr_decay_iters: int = 250_000
@@ -68,6 +76,24 @@ class ImaginedSuperMimicConfig:
             raise ValueError(f"amp must be 'none' or 'bf16', got {self.amp!r}")
         if self.critic_minibatches <= 0:
             raise ValueError("critic_minibatches must be positive")
+        if self.critic_norm_update not in ("full", "subsample", "interval", "off"):
+            raise ValueError(
+                "critic_norm_update must be 'full', 'subsample', 'interval', or 'off', got "
+                f"{self.critic_norm_update!r}"
+            )
+        if self.critic_norm_subsample <= 0:
+            raise ValueError("critic_norm_subsample must be positive")
+        if self.critic_norm_interval <= 0:
+            raise ValueError("critic_norm_interval must be positive")
+        if self.critic_norm_max_count is not None and self.critic_norm_max_count < 0:
+            raise ValueError("critic_norm_max_count cannot be negative")
+        if self.optimizer_mode not in ("auto", "fused", "foreach", "single"):
+            raise ValueError(
+                "optimizer_mode must be 'auto', 'fused', 'foreach', or 'single', got "
+                f"{self.optimizer_mode!r}"
+            )
+        if self.pi_amsgrad and self.pi_opt != "adam":
+            raise ValueError("pi_amsgrad is only valid with pi_opt='adam'")
         if self.test_hidden_dims is not None and not self.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
         if self.iterations <= 0:
@@ -135,6 +161,10 @@ class ImaginedSuperMimicLearner:
             self.critic.net = mlp(self.critic.norm.mean.numel(), cfg.test_hidden_dims, 1).to(
                 self.device
             )
+        if cfg.critic_norm_max_count is not None:
+            # The global RunningNorm default is intentionally huge; deployments can freeze
+            # earlier without changing the default behavior of existing configs.
+            self.critic.norm.max_count = float(cfg.critic_norm_max_count)
         self.pi_avg = None
         if cfg.pi_ema > 0:
             self.pi_avg = AveragedModel(
@@ -143,20 +173,34 @@ class ImaginedSuperMimicLearner:
                 use_buffers=True,
             )
 
-        fused_adam = self.device.type == "cuda"
+        optimizer_mode = self._resolve_optimizer_mode(cfg.optimizer_mode, self.device)
+        # Leaving foreach=None under auto preserves Adam's implementation choice;
+        # only explicit acceleration modes force foreach or single-tensor kernels.
+        foreach = cfg.optimizer_mode in ("foreach", "single") or None
         if cfg.pi_opt == "muon":
             self.opt_pi = MuonAdam(
                 self.pi,
                 [self.pi.enc, self.pi.dec],
                 lr=cfg.lr,
                 betas=(0.9, 0.95),
-                fused=fused_adam,
+                fused=optimizer_mode == "fused",
             )
         else:
             self.opt_pi = torch.optim.Adam(
-                self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
+                self.pi.parameters(),
+                lr=cfg.lr,
+                betas=(0.9, 0.95),
+                amsgrad=cfg.pi_amsgrad,
+                foreach=foreach,
+                fused=optimizer_mode == "fused",
             )
-        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
+        self.opt_v = torch.optim.Adam(
+            self.critic.parameters(),
+            lr=cfg.lr,
+            amsgrad=cfg.critic_amsgrad,
+            foreach=foreach,
+            fused=optimizer_mode == "fused",
+        )
 
         self._v_mean = torch.zeros((), device=self.device)
         self._v_std = torch.ones((), device=self.device)
@@ -187,6 +231,8 @@ class ImaginedSuperMimicLearner:
             [-0.52, -0.52, -0.78, 0.52, 0.52, 0.78], device=self.device
         ).view(2, 3)
 
+        self._fused_scoring = hasattr(self.mdp, "reward_term_critic_features_with_reference")
+        self._detach_frozen_wm = True
         self._compile_fns()
         self.reset_all()
 
@@ -210,13 +256,50 @@ class ImaginedSuperMimicLearner:
 
     def _compile_fns(self) -> None:
         if not self.cfg.compile:
-            self._imag_step_fn = self._imag_step
+            self._imag_policy_fn = self.pi
+            self._imag_state_fn = self.wm.step
             self._reward_fn = self._reward_term
+            self._fused_score_fn = self._reward_term_critic_features
             self._critic_input_fn = self._critic_input
+            self._critic_targets_fn = self._critic_targets
+            self._critic_loss_fn = self._critic_loss
             return
-        self._imag_step_fn = torch.compile(self._imag_step, dynamic=False)
+
+        # Keep each compiled region narrowly scoped. The policy function is the
+        # only rollout component that needs autograd; compiling it separately from
+        # the frozen state transition avoids specializing the whole imagination
+        # graph (including the horizon loop) and prevents an inference-mode WM
+        # compilation from being reused for a training-mode call.
+        self._imag_policy_fn = torch.compile(self.pi, dynamic=False)
+        self._imag_state_fn = torch.compile(self.wm.step, dynamic=False)
         self._reward_fn = torch.compile(self._reward_term, dynamic=False)
+        self._fused_score_fn = torch.compile(self._reward_term_critic_features, dynamic=False)
         self._critic_input_fn = torch.compile(self._critic_input, dynamic=False)
+        self._critic_targets_fn = torch.compile(self._critic_targets, dynamic=False)
+        self._critic_loss_fn = torch.compile(self._critic_loss, dynamic=False)
+
+    def _sample_valid_frames(self, batch: int) -> torch.Tensor:
+        """Draw frame indices that retain at least ``horizon`` frames in their clip."""
+        clip_start = self.motion.clip_start.detach().to(self.device)
+        clip_end = self.motion.clip_end.detach().to(self.device)
+        # valid Imagination starts satisfy frame + horizon <= clip_end.
+        lengths = clip_end - clip_start - self.cfg.horizon + 1
+        valid = lengths > 0
+        if not bool(valid.any()):
+            raise ValueError(
+                f"no motion clip is long enough for imagination horizon {self.cfg.horizon}"
+            )
+        starts = clip_start[valid]
+        lengths = lengths[valid]
+        cumulative = lengths.cumsum(0)
+        draws = torch.rand(batch, device=self.device) * cumulative[-1]
+        clip_ids = torch.searchsorted(cumulative, draws, right=True).clamp(
+            max=clip_start.numel() - 1
+        )
+        offsets = torch.floor(
+            torch.rand(batch, device=self.device) * lengths.gather(0, clip_ids)
+        ).long()
+        return starts.gather(0, clip_ids) + offsets
 
     def _reset_batch(self, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Reset all or selected imagined environments to motion-library starts."""
@@ -233,7 +316,20 @@ class ImaginedSuperMimicLearner:
         if batch == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.device)
 
-        frames = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
+        if hasattr(self.mdp, "valid_imagination_start"):
+            # Resample rather than clamp: a rollout must never query beyond its
+            # owning clip, and rejection preserves the original start distribution
+            # conditioned on being horizon-valid.
+            maximum = max(self.motion.num_frames - self.cfg.horizon - 1, 0)
+            frames = torch.randint(0, maximum + 1, (batch,), device=self.device)
+            valid = self.mdp.valid_imagination_start(frames, self.cfg.horizon)
+            if bool((~valid).any()):
+                overflow = (~valid).nonzero(as_tuple=False).squeeze(-1)
+                replacement = self._sample_valid_frames(overflow.numel())
+                frames = frames.clone()
+                frames[overflow] = replacement
+        else:
+            frames = torch.randint(0, self.motion.num_frames, (batch,), device=self.device)
         state = self.motion.ref_state(frames)
         context = torch.zeros((batch, self.mdp.context_dim), device=self.device)
         if self.cfg.reset_noise:
@@ -274,46 +370,33 @@ class ImaginedSuperMimicLearner:
             assert self._state is not None
             self._state = cast(
                 State,
-                tuple(
-                    torch.where(reset_mask[:, None, None], new, old)
-                    for new, old in zip(state, self._state)
-                ),
+                tuple(old.index_copy(0, selected, new) for new, old in zip(state, self._state)),
             )
-            self._context[selected] = context
-            self._frames[selected] = frames
-            self._ep_step[selected] = 0
-            self._previous_action[selected] = 0.0
+            self._context.index_copy_(0, selected, context)
+            self._frames.index_copy_(0, selected, frames)
+            self._ep_step.index_fill_(0, selected, 0)
+            self._previous_action.index_fill_(0, selected, 0.0)
 
         assert self._state is not None
         self._normalized_context = self.mdp.normalize_context(self._context)
-        obs = self.mdp.obs(self._state, self._previous_action, self._context, self._frames)
         if selected is None:
+            obs = self.mdp.obs(self._state, self._previous_action, self._context, self._frames)
             self._obs_hist = obs[:, None, :].expand(-1, self.cfg.hist, -1).clone()
         else:
+            selected_state = cast(State, tuple(item[selected] for item in self._state))
+            obs = self.mdp.obs(
+                selected_state,
+                self._previous_action[selected],
+                self._context[selected],
+                self._frames[selected],
+            )
             assert self._obs_hist is not None
-            self._obs_hist[selected] = obs[:, None, :]
+            selected_obs = obs[:, None, :].expand(-1, self.cfg.hist, -1)
+            self._obs_hist.index_copy_(0, selected, selected_obs)
         return torch.ones(batch, dtype=torch.bool, device=self.device)
 
     def reset_all(self) -> None:
         self._reset_batch(None)
-
-    def _imag_step(
-        self,
-        state: State,
-        obs_hist: torch.Tensor,
-        previous_action: torch.Tensor,
-        frames: torch.Tensor,
-        context: torch.Tensor,
-        normalized_context: torch.Tensor,
-        goal: torch.Tensor,
-    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action = self.pi(obs_hist, goal)
-        next_state = self.wm.step(state, action, normalized_context)
-        next_frames = frames + 1
-        obs = self.mdp.obs(next_state, action, context, next_frames)
-        next_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
-        next_goal = self.mdp.goal(next_frames, self.cfg.goal_frames)
-        return next_state, action, next_hist, next_frames, next_goal
 
     def _reward_term(
         self,
@@ -325,6 +408,27 @@ class ImaginedSuperMimicLearner:
         return self.mdp.reward(state, frames, action, previous_action), self.mdp.soft_termination(
             state, frames
         )
+
+    def _reward_term_critic_features(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        normalized_context: torch.Tensor,
+        reference_state: State,
+        reference_body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        action: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        reward, dones, features = self.mdp.reward_term_critic_features_with_reference(
+            state,
+            frames,
+            normalized_context,
+            reference_state,
+            reference_body_state,
+            action,
+            previous_action,
+        )
+        return reward, dones, features
 
     def _critic_input(
         self,
@@ -344,6 +448,87 @@ class ImaginedSuperMimicLearner:
     ) -> torch.Tensor:
         return self._critic_input_fn(state, frames, normalized_context, goal)
 
+    @staticmethod
+    def _resolve_optimizer_mode(
+        mode: str, device: torch.device
+    ) -> Literal["fused", "foreach", "single"]:
+        """Resolve an optimizer implementation without silently changing device support."""
+        if mode == "auto":
+            # This matches the historical implementation: fused on CUDA, Adam's
+            # platform-selected implementation everywhere else.
+            return "fused" if device.type == "cuda" else "single"
+        if mode == "fused" and device.type != "cuda":
+            raise ValueError(
+                f"fused optimizers require CUDA; device {device} requested fused explicitly"
+            )
+        return cast(Literal["foreach", "single"], mode)
+
+    def _critic_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the critic while folding input normalization into its first linear.
+
+        ``(x - mean) / std @ W.T + b`` is algebraically identical to
+        ``x @ (W / std).T + (b - W @ (mean / std))``. The latter reads the already
+        contiguous concatenated critic input once and avoids two horizon-sized
+        normalization temporaries before the first GEMM.
+        """
+        norm = self.critic.norm
+        first = self.critic.net[0]
+        assert isinstance(first, nn.Linear)
+        inv_std = norm.std().reciprocal()
+        normalized_weight = first.weight * inv_std
+        shift = first.bias - torch.mv(first.weight, norm.mean * inv_std)
+
+        def run(x: torch.Tensor) -> torch.Tensor:
+            hidden = F.linear(x, normalized_weight, shift)
+            for layer in self.critic.net[1:]:
+                hidden = layer(hidden)
+            return hidden
+
+        amp_dtype = networks_module.AMP_DTYPE
+        if amp_dtype is not None and x.device.type in ("cuda", "mps"):
+            with torch.autocast(x.device.type, dtype=amp_dtype):
+                hidden = run(x)
+            return hidden.float().squeeze(-1)
+        return run(x).squeeze(-1)
+
+    def _critic_targets(
+        self,
+        values: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> torch.Tensor:
+        target = values[-1]
+        targets: list[torch.Tensor] = []
+        gamma, lam = self.cfg.gamma, self.cfg.lam
+        for index in range(self.cfg.horizon - 1, -1, -1):
+            target = rewards[index] + gamma * (1 - dones[index]) * (
+                (1 - lam) * values[index + 1] + lam * target
+            )
+            targets.append(target)
+        return torch.stack(targets[::-1])
+
+    def _critic_loss(self, critic_input: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(self._critic_forward(critic_input), targets)
+
+    def _update_critic_norm(self, critic_input: torch.Tensor) -> None:
+        """Apply the configured RunningNorm update cadence and sample budget."""
+        if self.cfg.critic_norm_update == "off":
+            return
+        if self.iteration % self.cfg.critic_norm_interval != 0:
+            return
+
+        rows = critic_input.shape[0] * critic_input.shape[1]
+        sample = self.cfg.critic_norm_subsample
+        if self.cfg.critic_norm_update == "subsample" and rows > sample:
+            # Sampling with replacement keeps the index generation entirely on-device and
+            # avoids a host sync or a full randperm. For sample >= rows this is exactly a
+            # full update, which makes acceleration switches easy to test.
+            indices = torch.randint(rows, (sample,), device=critic_input.device)
+            update_input = critic_input.reshape(-1, critic_input.shape[-1]).index_select(0, indices)
+        else:
+            update_input = critic_input
+        self.critic.norm.update(update_input)
+
     def update(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
@@ -361,49 +546,137 @@ class ImaginedSuperMimicLearner:
         assert previous_action is not None
         obs_hist = self._obs_hist
         assert obs_hist is not None
-        goal = self.mdp.goal(frames, self.cfg.goal_frames)
+
         initial_state = state
-        initial_goal = goal
         frames0 = frames
+
+        # Materialize every reference frame once. Goals, observations, reward,
+        # termination, and critic inputs then share these deterministic gathers.
+        frame_offsets = torch.arange(
+            self.cfg.horizon + 1, device=self.device, dtype=frames.dtype
+        ).unsqueeze(-1)
+        frame_sequence = frames0.unsqueeze(0) + frame_offsets
+        critic_goals = self.mdp.goal(frame_sequence.flatten(), self.cfg.goal_frames).view(
+            self.cfg.horizon + 1, self.cfg.batch, -1
+        )
+        goal = critic_goals[0]
+        reference_state = cast(
+            State,
+            tuple(
+                part.reshape(self.cfg.horizon + 1, self.cfg.batch, *part.shape[1:])
+                for part in self.motion.ref_state(frame_sequence.flatten())
+            ),
+        )
+        self._fused_scoring = self._fused_scoring and hasattr(self.motion, "body_state")
+        reference_body_state = (
+            tuple(
+                part.reshape(self.cfg.horizon + 1, self.cfg.batch, *part.shape[1:])
+                for part in self.motion.body_state(frame_sequence.flatten())
+            )
+            if self._fused_scoring
+            else None
+        )
 
         states: list[State] = []
         actions: list[torch.Tensor] = []
         previous_actions: list[torch.Tensor] = []
-        all_frames: list[torch.Tensor] = []
-        goals: list[torch.Tensor] = []
 
         self.critic.requires_grad_(False)
-        for _ in range(self.cfg.horizon):
+        for index in range(self.cfg.horizon):
             previous_actions.append(previous_action)
-            state, action, obs_hist, frames, goal = self._imag_step_fn(
-                state,
-                obs_hist,
-                previous_action,
-                frames,
-                context,
-                normalized_context,
-                goal,
-            )
+            action = self._imag_policy_fn(obs_hist, goal)
+            if self._detach_frozen_wm:
+                with torch.no_grad():
+                    state = self._imag_state_fn(state, action, normalized_context)
+            else:
+                state = self._imag_state_fn(state, action, normalized_context)
+            next_frames = frames0 + index + 1
+            if hasattr(self.mdp, "obs_with_reference"):
+                obs = self.mdp.obs_with_reference(
+                    state,
+                    action,
+                    context,
+                    next_frames,
+                    reference_state[1][index + 1],
+                )
+            else:
+                obs = self.mdp.obs(state, action, context, next_frames)
+            obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
+            goal = critic_goals[index + 1]
             previous_action = action
             states.append(state)
             actions.append(action)
-            all_frames.append(frames)
-            goals.append(goal)
 
         def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
             return torch.stack(parts).flatten(0, 1)
 
+        # Include the initial state so a single FK pass serves all scored rewards,
+        # the soft-done curve, and all T + 1 critic feature rows.
         all_states = cast(
-            State, tuple(flatten([item[index] for item in states]) for index in range(6))
+            State,
+            tuple(
+                torch.cat(
+                    (
+                        initial_state[index].unsqueeze(0),
+                        torch.stack([item[index] for item in states]),
+                    )
+                ).flatten(0, 1)
+                for index in range(6)
+            ),
         )
-        rewards, dones = self._reward_fn(
-            all_states,
-            flatten(all_frames),
-            flatten(actions),
-            flatten(previous_actions),
-        )
-        rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
-        dones = dones.view(self.cfg.horizon, self.cfg.batch)
+        flat_actions = flatten(actions)
+        if self.cfg.horizon == 1:
+            flat_previous_actions = previous_actions[0]
+        else:
+            flat_previous_actions = torch.cat(
+                (previous_actions[0].unsqueeze(0), torch.stack(actions[:-1])), 0
+            ).flatten(0, 1)
+
+        if self._fused_scoring:
+            scored_frames = frame_sequence[1:].flatten()
+            expanded_context = (
+                normalized_context.unsqueeze(0).expand(self.cfg.horizon + 1, -1, -1).flatten(0, 1)
+            )
+            rewards, dones, critic_features = self._fused_score_fn(
+                all_states,
+                scored_frames,
+                expanded_context,
+                tuple(part.flatten(0, 1) for part in reference_state),
+                tuple(part.flatten(0, 1) for part in reference_body_state)
+                if reference_body_state is not None
+                else None,
+                flat_actions,
+                flat_previous_actions,
+            )
+            rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
+            dones = dones.view(self.cfg.horizon, self.cfg.batch)
+            critic_input = torch.cat((critic_features, critic_goals.flatten(0, 1)), -1).view(
+                self.cfg.horizon + 1, self.cfg.batch, -1
+            )
+        else:
+            rewards, dones = self._reward_fn(
+                cast(
+                    State,
+                    tuple(
+                        item[self.cfg.batch :].reshape(-1, *item.shape[1:]) for item in all_states
+                    ),
+                ),
+                frame_sequence[1:].flatten(),
+                flat_actions,
+                flat_previous_actions,
+            )
+            rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
+            dones = dones.view(self.cfg.horizon, self.cfg.batch)
+            critic_input = self._batched_critic_input(
+                all_states,
+                frame_sequence.flatten(),
+                expanded_context := (
+                    normalized_context.unsqueeze(0)
+                    .expand(self.cfg.horizon + 1, -1, -1)
+                    .flatten(0, 1)
+                ),
+                critic_goals.flatten(0, 1),
+            )
 
         alive = torch.cumprod(1 - dones, 0)
         continuation = torch.cat((torch.ones(1, self.cfg.batch, device=self.device), alive[:-1]), 0)
@@ -415,8 +688,7 @@ class ImaginedSuperMimicLearner:
         reward_sum = (continuation * rewards.detach()).sum(0)
         detached_rewards, detached_dones = rewards.detach(), dones.detach()
         if not self.cfg.no_critic:
-            bootstrap_input = self._critic_input_fn(state, frames, normalized_context, goal)
-            bootstrap = self.critic(bootstrap_input).detach()
+            bootstrap = self._critic_forward(critic_input[-1]).detach()
             objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
                 bootstrap * self._v_std + self._v_mean
             )
@@ -440,45 +712,10 @@ class ImaginedSuperMimicLearner:
 
         value_loss = torch.zeros((), device=self.device)
         if not self.cfg.no_critic:
+            self._update_critic_norm(critic_input)
             with torch.no_grad():
-                critic_states = cast(
-                    State,
-                    tuple(
-                        torch.cat(
-                            (
-                                initial_state[index].unsqueeze(0),
-                                torch.stack([item[index].detach() for item in states]),
-                            ),
-                            0,
-                        ).flatten(0, 1)
-                        for index in range(6)
-                    ),
-                )
-                critic_frames = torch.cat(
-                    (frames0.unsqueeze(0), torch.stack(all_frames)), 0
-                ).flatten()
-                critic_goals = torch.cat(
-                    (initial_goal.unsqueeze(0), torch.stack(goals)), 0
-                ).flatten(0, 1)
-                critic_context = (
-                    normalized_context.unsqueeze(0)
-                    .expand(self.cfg.horizon + 1, -1, -1)
-                    .flatten(0, 1)
-                )
-                critic_input = self._batched_critic_input(
-                    critic_states, critic_frames, critic_context, critic_goals
-                ).view(self.cfg.horizon + 1, self.cfg.batch, -1)
-            self.critic.norm.update(critic_input)
-            with torch.no_grad():
-                values = self.critic(critic_input) * self._v_std + self._v_mean
-                target = values[-1]
-                targets = []
-                for index in range(self.cfg.horizon - 1, -1, -1):
-                    target = detached_rewards[index] + self.cfg.gamma * (
-                        1 - detached_dones[index]
-                    ) * ((1 - self.cfg.lam) * values[index + 1] + self.cfg.lam * target)
-                    targets.append(target)
-                targets = torch.stack(targets[::-1])
+                values = self._critic_forward(critic_input) * self._v_std + self._v_mean
+                targets = self._critic_targets_fn(values, detached_rewards, detached_dones)
                 target_mean = targets.mean()
                 target_std = targets.std().clamp(min=1e-2)
                 if not self._v_init:
@@ -493,18 +730,25 @@ class ImaginedSuperMimicLearner:
                         .clamp(min=1e-2)
                     )
                 targets = ((targets - self._v_mean) / self._v_std).clamp(-20.0, 20.0)
+            # Critic regression covers the T rollout transitions; the bootstrap row
+            # only contributes through the GAE recursion above.
             flat_input = critic_input[:-1].reshape(-1, critic_input.shape[-1])
             flat_targets = targets.reshape(-1)
-            num_samples = flat_input.shape[0]
+            num_samples = min(flat_input.shape[0], flat_targets.shape[0])
             minibatch_size = num_samples // self.cfg.critic_minibatches
             if minibatch_size == 0:
                 raise ValueError("critic_minibatches exceeds imagined transitions")
             for _ in range(self.cfg.critic_epochs):
                 permutation = torch.randperm(num_samples, device=self.device)
                 for index in range(self.cfg.critic_minibatches):
-                    indices = permutation[index * minibatch_size : (index + 1) * minibatch_size]
-                    value_loss = (self.critic(flat_input[indices]) - flat_targets[indices]) ** 2
-                    value_loss = value_loss.mean()
+                    # narrow is a scalar-offset view and index_select creates only the
+                    # contiguous minibatch needed by the MLP (rather than reindexing the
+                    # complete horizon tensor once per epoch).
+                    start = index * minibatch_size
+                    indices = permutation.narrow(0, start, minibatch_size)
+                    minibatch_input = flat_input.index_select(0, indices)
+                    minibatch_targets = flat_targets[:num_samples].index_select(0, indices)
+                    value_loss = self._critic_loss_fn(minibatch_input, minibatch_targets)
                     self.opt_v.zero_grad(set_to_none=True)
                     value_loss.backward()
                     nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
