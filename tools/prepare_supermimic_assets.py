@@ -34,7 +34,7 @@ MESH_DIR = G1_DIR / "assets"
 URDF_PATH = MESH_DIR / "supermimic" / "g1_29dof_rev_1_0.urdf"
 ROBOT_XML = G1_DIR / "supermimic.xml"
 SCENE_XML = G1_DIR / "scene_supermimic.xml"
-MOTION_DIR = REPO_ROOT / "src" / "unisupermimic" / "assets" / "motions" / "g1" / "lafan1_supermimic"
+MOTION_DIR = REPO_ROOT / "data" / "raw" / "lafan1"
 
 REPO_ID = "lvhaidong/LAFAN1_Retargeting_Dataset"
 URDF_REMOTE_PATH = "robot_description/g1/g1_29dof_rev_1_0.urdf"

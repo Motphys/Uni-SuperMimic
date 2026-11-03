@@ -47,7 +47,6 @@ unisupermimic/
 │   ├── conf/supermimic/            # Hydra configuration
 │   ├── data/boneseed.py            # BONES-SEED download/convert/filter/pack CLI
 │   ├── assets/robots/g1/           # G1 MJCF; meshes/URDF are downloaded and untracked
-│   ├── assets/motions/             # LAFAN1 CSV files, downloaded and untracked
 │   └── sim2sim.py                  # Policy I/O, network shape, and asset identity checks
 ├── docs/assets/                    # Result curves, MP4, and GIF
 ├── tools/prepare_supermimic_assets.py
@@ -82,7 +81,7 @@ with `make lock-rocm`.
 
 ### Prepare Assets and Choose a Dataset
 
-Both training modes use the same G1 robot model, but **you only need to download the dataset you plan to train on**. LAFAN1 and BONES-SEED are independent choices; downloading one does not require downloading the other.
+Both training modes use the same G1 robot model and the same `data/raw/` root for downloaded datasets, but **you only need to download the dataset you plan to train on**. LAFAN1 and BONES-SEED are independent choices; downloading one does not require downloading the other.
 
 ### Shared G1 Robot Assets
 
@@ -106,7 +105,7 @@ uv run tools/prepare_supermimic_assets.py
 uv run tools/prepare_supermimic_assets.py --validate-only
 ```
 
-The source is `lvhaidong/LAFAN1_Retargeting_Dataset`. A complete motion set contains 40 CSV files with 264,705 source frames and 36 columns per frame.
+The source is `lvhaidong/LAFAN1_Retargeting_Dataset`; the CSVs are downloaded to `data/raw/lafan1`. A complete motion set contains 40 CSV files with 264,705 source frames and 36 columns per frame.
 
 ### Option B: BONES-SEED
 
@@ -124,7 +123,7 @@ uv run unisupermimic-boneseed pack
 
 Following `SuperMimic-Reproduced`, the pipeline resamples 120 fps CSV to 50 Hz NPZ with MuJoCo forward kinematics, applies name and feasibility filters, and packs retained clips into a 71-dimensional fp16 library. The source is Hugging Face `bones-studio/seed`, file `g1.tar.gz`.
 
-Paths default to `data/raw/bones_seed` for raw CSV, `data/npz/bones_seed` for NPZ and manifests, and `data/library/bones_seed_compact.pt` for the training library. Conversion skips existing NPZ files unless `--overwrite` is set; `--limit` supports a small trial. The reference full-set result has about 129.5k clips and a roughly 6.7 GB fp16 library, which is resident on the training device. Raw CSV and intermediate NPZ require additional disk space.
+Paths default to `data/raw/boneseed` for raw CSV, `data/npz/boneseed` for NPZ and manifests, and `data/library/boneseed_compact.pt` for the training library. Conversion skips existing NPZ files unless `--overwrite` is set; `--limit` supports a small trial. The reference full-set result has about 129.5k clips and a roughly 6.7 GB fp16 library, which is resident on the training device. Raw CSV and intermediate NPZ require additional disk space.
 
 Meshes, URDF, motion files, logs, checkpoints, and generated dataset directories are excluded by `.gitignore`. Dataset licenses remain with their respective owners.
 
@@ -155,12 +154,12 @@ After building the compact library, select it explicitly with `env.commands.moti
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   training.log_dir=runs/supermimic_boneseed_001
 
 # Resume the BONES-SEED run with the same dataset selection.
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   algo.resume=true \
   algo.load_run=runs/supermimic_boneseed_001 \
   algo.checkpoint=last.pt \
@@ -220,7 +219,7 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --viser_port 8080
 ```
 
-The evaluator reads `run_config.json` beside the checkpoint and reuses its recorded motion library, so no separate motion-file override is needed. The example above selects the run's LAFAN1 library. To render BONES-SEED instead, select a BONES-SEED checkpoint; its run configuration automatically selects `data/library/bones_seed_compact.pt`:
+The evaluator reads `run_config.json` beside the checkpoint and reuses its recorded motion library, so no separate motion-file override is needed. The example above selects the run's LAFAN1 library. To render BONES-SEED instead, select a BONES-SEED checkpoint; its run configuration automatically selects `data/library/boneseed_compact.pt`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
@@ -306,11 +305,11 @@ Adding the structured world model improves macro and frame-weighted return at ev
 
 ![Adam, Muon, and Muon + structured WM: full-library evaluation and learner wall time at 2000, 3000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
 
-Reproduce the Muon run after building `data/library/bones_seed_compact.pt`:
+Reproduce the Muon run after building `data/library/boneseed_compact.pt`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   algo.iterations=8000 \
   algo.pi_opt=muon \
   algo.wm_opt=muon \

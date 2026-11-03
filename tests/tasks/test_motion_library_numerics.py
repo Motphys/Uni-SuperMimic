@@ -9,7 +9,7 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.kinematics import G1Kinem
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import MotionLib
 
 ROOT = Path(__file__).resolve().parents[2]
-MOTIONS = ROOT / "src/unisupermimic/assets/motions/g1/lafan1_supermimic"
+MOTIONS = ROOT / "data/raw/lafan1"
 MJCF = ROOT / "src/unisupermimic/assets/robots/g1/supermimic.xml"
 pytestmark = pytest.mark.slow
 

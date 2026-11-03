@@ -47,7 +47,6 @@ unisupermimic/
 │   ├── conf/supermimic/            # Hydra 配置
 │   ├── data/boneseed.py            # BONES-SEED 下载/转换/过滤/打包命令行入口
 │   ├── assets/robots/g1/           # G1 MJCF；mesh/URDF 下载后不纳入 git
-│   ├── assets/motions/             # LAFAN1 CSV，下载后不纳入 git
 │   └── sim2sim.py                  # 策略 I/O、网络形状和资产身份校验
 ├── docs/assets/                    # 结果曲线、MP4 和 GIF
 ├── tools/prepare_supermimic_assets.py
@@ -82,7 +81,7 @@ ROCm lockfile。
 
 ### 准备资产并选择数据集
 
-两种训练方式使用同一个 G1 机器人模型，但**只需下载你准备用于训练的数据集**。LAFAN1 和 BONES-SEED 是两个独立选项，选择其中一个并不需要下载另一个。
+两种训练方式使用同一个 G1 机器人模型，下载数据也统一放在 `data/raw/` 下；但**只需下载你准备用于训练的数据集**。LAFAN1 和 BONES-SEED 是两个独立选项，选择其中一个并不需要下载另一个。
 
 ### 共享 G1 机器人资产
 
@@ -106,7 +105,7 @@ uv run tools/prepare_supermimic_assets.py
 uv run tools/prepare_supermimic_assets.py --validate-only
 ```
 
-数据源为 `lvhaidong/LAFAN1_Retargeting_Dataset`。完整动作集包含 40 段 CSV、264705 个源帧，每帧 36 列。
+数据源为 `lvhaidong/LAFAN1_Retargeting_Dataset`，CSV 会下载到 `data/raw/lafan1`。完整动作集包含 40 段 CSV、264705 个源帧，每帧 36 列。
 
 ### 选项 B：BONES-SEED
 
@@ -124,7 +123,7 @@ uv run unisupermimic-boneseed pack
 
 该流程与 `SuperMimic-Reproduced` 一致：把 120 fps CSV 重采样为带 MuJoCo 正运动学结果的 50 Hz NPZ，执行名称与可行性过滤，再将保留的 clip 打包为 71 维 fp16 运动库。数据源是 Hugging Face `bones-studio/seed` 的 `g1.tar.gz`。
 
-默认原始 CSV 目录为 `data/raw/bones_seed`，NPZ 与 manifest 目录为 `data/npz/bones_seed`，训练库输出为 `data/library/bones_seed_compact.pt`。转换会跳过已有 NPZ，`--overwrite` 可强制重建，`--limit` 可先做小规模试跑。参考全量结果约有 12.95 万段运动，fp16 库约 6.7 GB 并常驻训练设备，原始 CSV 和中间 NPZ 还需要额外磁盘空间。
+默认原始 CSV 目录为 `data/raw/boneseed`，NPZ 与 manifest 目录为 `data/npz/boneseed`，训练库输出为 `data/library/boneseed_compact.pt`。转换会跳过已有 NPZ，`--overwrite` 可强制重建，`--limit` 可先做小规模试跑。参考全量结果约有 12.95 万段运动，fp16 库约 6.7 GB 并常驻训练设备，原始 CSV 和中间 NPZ 还需要额外磁盘空间。
 
 mesh、URDF、动作文件、日志、checkpoint 和生成的数据集目录均被 `.gitignore` 排除；数据集许可证仍归各自所有者。
 
@@ -155,12 +154,12 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   training.log_dir=runs/supermimic_boneseed_001
 
 # 使用相同的数据集配置续训 BONES-SEED run
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   algo.resume=true \
   algo.load_run=runs/supermimic_boneseed_001 \
   algo.checkpoint=last.pt \
@@ -220,7 +219,7 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --viser_port 8080
 ```
 
-评估器会读取 checkpoint 所在目录的 `run_config.json`，复用其中记录的动作库，无需额外传入动作文件覆盖。上面的示例使用该 run 的 LAFAN1 动作库。若要渲染 BONES-SEED，改为选择 BONES-SEED checkpoint 即可；其 run 配置会自动选择 `data/library/bones_seed_compact.pt`：
+评估器会读取 checkpoint 所在目录的 `run_config.json`，复用其中记录的动作库，无需额外传入动作文件覆盖。上面的示例使用该 run 的 LAFAN1 动作库。若要渲染 BONES-SEED，改为选择 BONES-SEED checkpoint 即可；其 run 配置会自动选择 `data/library/boneseed_compact.pt`：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
@@ -306,11 +305,11 @@ Muon 在 4000 轮达到 Adam 8000 轮的宏平均 return（0.939500 vs 0.939490�
 
 ![Adam、Muon 与 Muon + 结构化 WM：2000/3000/4000/6000/8000 轮全库评估与训练墙钟](docs/assets/muon_vs_adam_evaluation.png)
 
-构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现 Muon run：
+构建 `data/library/boneseed_compact.pt` 后，可按以下命令复现 Muon run：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  'env.commands.motion.motion_files=[data/library/boneseed_compact.pt]' \
   algo.iterations=8000 \
   algo.pi_opt=muon \
   algo.wm_opt=muon \

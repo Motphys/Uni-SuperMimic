@@ -37,9 +37,7 @@ def _cfg() -> DictConfig:
                     "motion": {
                         "goal_frames": 10,
                         "context_dim": 33,
-                        "motion_files": [
-                            "src/unisupermimic/assets/motions/g1/lafan1_supermimic/walk1_subject1.csv"
-                        ],
+                        "motion_files": ["data/raw/lafan1/walk1_subject1.csv"],
                         "mjcf_path": "src/unisupermimic/assets/robots/g1/supermimic.xml",
                     }
                 },
@@ -60,9 +58,6 @@ def test_snapshot_contains_supermimic_policy_and_motion_fields() -> None:
 def test_unilab_to_downstream_relocation_is_strictly_compatible(tmp_path: Path) -> None:
     cfg = _cfg()
     snapshot = extract_contract_snapshot(cfg)
-    snapshot["env.commands.motion.motion_files"] = [
-        "src/unilab/assets/motions/g1/lafan1_supermimic/walk1_subject1.csv"
-    ]
     snapshot["env.commands.motion.mjcf_path"] = "src/unilab/assets/robots/g1/supermimic.xml"
     snapshot = json.loads(
         json.dumps(snapshot).replace(

@@ -177,7 +177,7 @@ def test_preparation_script_uses_expected_remote_and_ignored_locations():
     assert prepare.URDF_PATH.is_relative_to(prepare.MESH_DIR)
     assert prepare.ROBOT_XML.name == "supermimic.xml"
     assert prepare.SCENE_XML.name == "scene_supermimic.xml"
-    assert prepare.MOTION_DIR.name == "lafan1_supermimic"
+    assert prepare.MOTION_DIR == prepare.REPO_ROOT / "data" / "raw" / "lafan1"
 
 
 def test_robot_only_preparation_skips_motion_download_and_validation(monkeypatch):

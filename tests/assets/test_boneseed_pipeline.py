@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import shutil
 from pathlib import Path
@@ -123,3 +124,16 @@ def test_name_filter_and_longest_run() -> None:
     mask = np.array([False, True, True, True, False, True])
     assert longest_run(mask) == 3
     assert longest_run(np.zeros(4, dtype=bool)) == 0
+
+
+def test_cli_defaults_use_boneseed_raw_and_npz_roots() -> None:
+    from unisupermimic.data import boneseed
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    boneseed._add_convert_arguments(subparsers.add_parser("all"))
+
+    args = parser.parse_args(["all"])
+
+    assert args.input_dir == Path("data/raw/boneseed")
+    assert args.output_dir == Path("data/npz/boneseed")
