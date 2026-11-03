@@ -502,7 +502,8 @@ def test_make_eval_env_composes_backend_owner(monkeypatch, tmp_path, backend: st
         json.dumps(
             {
                 "contract_snapshot": {
-                    "env.commands.motion.motion_files": ["data/library/recorded.pt"]
+                    "env.commands.motion.motion_files": ["data/library/recorded.pt"],
+                    "algo.wm_structured": True,
                 }
             }
         ),
@@ -512,6 +513,7 @@ def test_make_eval_env_composes_backend_owner(monkeypatch, tmp_path, backend: st
     assert supermimic_evaluate.make_eval_env(tmp_path, backend=backend) is sentinel
     assert calls["overrides"] == [f"task=g1_super_mimic/{backend}"]
     assert cfg.env.commands.motion.motion_files == ["data/library/recorded.pt"]
+    assert cfg.algo.wm_structured is True
 
 
 def test_viser_session_recycles_pending_clips_and_restarts_completed_library(
