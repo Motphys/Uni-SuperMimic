@@ -298,28 +298,13 @@ Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 
 
 可选结构化世界模型（`algo.wm_structured=true`）默认关闭，默认行为仍是直接预测状态增量。打开后，模型参考 InstantTrack 的 semi-implicit 形式，预测速度增量和位置残差修正；该选项不改变 policy 输入/输出契约。
 
-以下三个 seed-0 run 均使用 mjwarp、4096 个环境、完整 129,487 段 BONES-SEED 库和相同调度：
-
-| 方法 | 迭代轮数 | norm_return | 帧加权 | 失败段 |
-|---|---:|---:|---:|---:|
-| Adam 基线 | 2000 | 0.809200 | 0.818700 | 1901 / 129,487（1.47%） |
-| Adam 基线 | 4000 | 0.912482 | 0.916519 | 660 / 129,487（0.51%） |
-| Adam 基线 | 6000 | 0.930600 | 0.934200 | 206 / 129,487（0.16%） |
-| Adam 基线 | 8000 | 0.939490 | 0.943325 | 193 / 129,487（0.15%） |
-| Muon | 2000 | 0.895346 | 0.899637 | 1126 / 129,487（0.87%） |
-| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487（0.33%） |
-| Muon | 6000 | 0.947208 | 0.950058 | 186 / 129,487（0.14%） |
-| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487（0.13%） |
-| Muon + 结构化 WM | 2000 | 0.898732 | 0.902762 | 722 / 129,487（0.56%） |
-| Muon + 结构化 WM | 4000 | 0.940363 | 0.943453 | 242 / 129,487（0.19%） |
-| Muon + 结构化 WM | 6000 | 0.948336 | 0.951015 | 195 / 129,487（0.15%） |
-| Muon + 结构化 WM | 8000 | 0.951722 | 0.954158 | 176 / 129,487（0.14%） |
+以下三个 seed-0 run 均使用 mjwarp、4096 个环境、完整 129,487 段 BONES-SEED 库和相同调度。
 
 Muon 在 4000 轮达到 Adam 8000 轮的宏平均 return（0.939500 vs 0.939490），但其 423 段失败不能视为与 Adam 8000 轮的 193 段严格等价。到 8000 轮时，Muon 将宏平均 return 提高 0.0108，失败段从 193 降至 166。
 
 结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。由于这是 seed-0 工程对照，`wm_structured` 仍保持可选。
 
-![Adam、Muon 与 Muon + 结构化 WM：2000/4000/6000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
+![Adam、Muon 与 Muon + 结构化 WM：2000/4000/6000/8000 轮全库评估与训练墙钟](docs/assets/muon_vs_adam_evaluation.png)
 
 构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现 Muon run：
 
