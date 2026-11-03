@@ -17,7 +17,11 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import (
     MDP,
     RewardCfg,
 )
-from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import CONTROL_DT, MotionLib
+from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import (
+    CONTROL_DT,
+    MotionLib,
+    ReferenceStatePack,
+)
 from unisupermimic.tasks.motion_tracking.g1.supermimic.robot import (
     G1_JOINT_NAMES,
     TRACKED_BODIES,
@@ -197,6 +201,149 @@ def test_compact_library_matches_full_motion(library, tmp_path) -> None:
         torch.testing.assert_close(actual, expected)
     for actual, expected in zip(compact.ref_state(frames_2d), motion.ref_state(frames_2d)):
         torch.testing.assert_close(actual, expected)
+
+
+def test_compact_cache_is_contiguous_and_releases_raw_reference(library, tmp_path) -> None:
+    from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import (
+        compact_motion_clip_count,
+    )
+
+    kin, motion, _ = library
+    reference = torch.cat(
+        (
+            motion.root_p,
+            mat_to_quat(motion.root_R),
+            motion.q,
+            motion.root_v,
+            motion.root_w,
+            motion.qd,
+        ),
+        dim=-1,
+    )
+    path = tmp_path / "compact-cache.pt"
+    torch.save(
+        {
+            "ref": reference,
+            "names": motion.names,
+            "starts": motion.clip_start.tolist(),
+            "lengths": motion.clip_len.tolist(),
+        },
+        path,
+    )
+    compact = MotionLib([str(path)], kin, "cpu")
+    assert compact_motion_clip_count(str(path)) == 2
+    assert compact._ref.numel() == 0
+    assert compact.reference_cache.is_contiguous()
+    assert compact.root_R.is_contiguous()
+    assert compact.root_v_local.is_contiguous()
+
+
+def test_contiguous_reference_cache_matches_legacy_field_queries(library) -> None:
+    _, motion, mdp = library
+    generator = torch.Generator().manual_seed(20261104)
+    frames = torch.randint(0, motion.num_frames, (129,), generator=generator)
+    frames[:6] = torch.tensor([0, 101, 100, 102, 108, motion.num_frames - 1])
+    frames_2d = frames.reshape(3, 43)
+    # Timeline prefetch itself stays in range; reset logic prevents this condition
+    # during an imagined rollout.
+    timeline_frames = frames.clamp(max=motion.num_frames - 4)
+
+    assert motion.reference_cache.shape == (motion.num_frames, 76)
+    assert motion.reference_cache.is_contiguous()
+
+    legacy = (
+        motion.root_p,
+        motion.root_R,
+        motion.root_v,
+        motion.root_w,
+        motion.q,
+        motion.qd,
+    )
+    for query in (frames, frames_2d):
+        packed = motion.ref_state_pack(query).state()
+        for actual, source in zip(packed, legacy, strict=True):
+            torch.testing.assert_close(actual, source[query], rtol=0, atol=0)
+    timeline = mdp.reference_timeline(timeline_frames, 3, 4)
+    assert timeline.frames.tolist() == (timeline_frames + torch.arange(4).unsqueeze(-1)).tolist()
+    for index in range(4):
+        expected = motion.ref_state(timeline_frames + index)
+        actual = timeline.reference
+        fields = (
+            actual.root_p[index * 129 : (index + 1) * 129],
+            actual.root_R[index * 129 : (index + 1) * 129],
+            actual.root_v[index * 129 : (index + 1) * 129],
+            actual.root_w[index * 129 : (index + 1) * 129],
+            actual.q[index * 129 : (index + 1) * 129],
+            actual.qd[index * 129 : (index + 1) * 129],
+        )
+        for value, expected_value in zip(fields, expected, strict=True):
+            torch.testing.assert_close(value, expected_value, rtol=0, atol=0)
+        torch.testing.assert_close(
+            timeline.goals[index], motion.goal(timeline_frames + index, 4), rtol=0, atol=0
+        )
+
+
+def test_prefetched_mdp_outputs_match_frame_queries(library) -> None:
+    _, motion, mdp = library
+    frames = torch.tensor([0, 50, 100, 101, 102, 103, 104, 105])
+    timeline = mdp.reference_timeline(frames, 3, 4)
+    actions = torch.randn(3, len(frames), 29)
+    previous_actions = torch.randn_like(actions)
+    context = torch.randn(4, len(frames), 33)
+    prefetched_reference = ReferenceStatePack(
+        timeline.reference.root_p[8:],
+        timeline.reference.root_R[8:],
+        timeline.reference.root_v[8:],
+        timeline.reference.root_w[8:],
+        timeline.reference.q[8:],
+        timeline.reference.qd[8:],
+    )
+    prefetched_body = tuple(value[8:] for value in timeline.body_state)
+    prefetched_reward, prefetched_done = (
+        mdp.reward(
+            motion.ref_state(timeline.frames[1:].reshape(-1)),
+            timeline.frames[1:].reshape(-1),
+            actions.reshape(-1, 29),
+            previous_actions.reshape(-1, 29),
+            reference=prefetched_reference,
+            reference_body_state=prefetched_body,
+        ),
+        mdp.termination(
+            motion.ref_state(timeline.frames[1:].reshape(-1)),
+            timeline.frames[1:].reshape(-1),
+            reference=prefetched_reference,
+        ),
+    )
+    expected_reward = mdp.reward(
+        motion.ref_state(timeline.frames[1:].reshape(-1)),
+        timeline.frames[1:].reshape(-1),
+        actions.reshape(-1, 29),
+        previous_actions.reshape(-1, 29),
+    )
+    expected_done = mdp.termination(
+        motion.ref_state(timeline.frames[1:].reshape(-1)),
+        timeline.frames[1:].reshape(-1),
+    )
+    torch.testing.assert_close(prefetched_reward, expected_reward, rtol=0, atol=0)
+    torch.testing.assert_close(prefetched_done, expected_done, rtol=0, atol=0)
+
+    reference = timeline.step(3, len(frames))
+    body_p = timeline.body_at(3, len(frames))[0]
+    state = motion.ref_state(timeline.frames[3])
+    normalized_context = context[3]
+    critic = mdp.critic_features(
+        state,
+        timeline.frames[3],
+        normalized_context,
+        reference=reference,
+        reference_body_p=body_p,
+    )
+    torch.testing.assert_close(
+        critic,
+        mdp.critic_features(state, timeline.frames[3], normalized_context),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_future_goal_clamps_at_clip_boundaries(library) -> None:
