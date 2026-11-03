@@ -36,6 +36,11 @@ class FakeMotion:
     def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         return frames.float()[:, None].expand(-1, num_frames * 3)
 
+    def body_state(self, frames: torch.Tensor):
+        batch = frames.shape[0]
+        zeros = torch.zeros(batch, 2, 3)
+        return zeros, torch.eye(3).expand(batch, 2, 3, 3), zeros, zeros
+
 
 class FakeMdp:
     num_joints = 29
@@ -69,6 +74,36 @@ class FakeMdp:
 
     def critic_features(self, state, frames, normalized_context):
         return torch.cat((state[0], state[4][..., :1], normalized_context), -1)
+
+    def obs_with_reference(self, state, previous_action, context, frames, reference_rotation):
+        del frames
+        return torch.cat(
+            (
+                state[0],
+                state[4][..., :1],
+                previous_action[..., :2],
+                torch.zeros_like(context),
+            ),
+            -1,
+        )
+
+    def reward_term_critic_features_with_reference(
+        self,
+        state,
+        frames,
+        normalized_context,
+        reference_state,
+        reference_body_state,
+        action,
+        previous_action,
+    ):
+        scored_state = tuple(item[1:].reshape(-1, *item.shape[2:]) for item in state)
+        reward = self.reward(scored_state, frames, action, previous_action)
+        dones = self.soft_termination(scored_state, frames)
+        features = self.critic_features(
+            state, torch.zeros(frames.shape[0] + 1, dtype=torch.long), normalized_context
+        )
+        return reward, dones, features
 
     def normalize_context(self, context):
         return torch.tanh(context)

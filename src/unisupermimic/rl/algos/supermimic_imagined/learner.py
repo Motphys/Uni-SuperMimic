@@ -187,6 +187,8 @@ class ImaginedSuperMimicLearner:
             [-0.52, -0.52, -0.78, 0.52, 0.52, 0.78], device=self.device
         ).view(2, 3)
 
+        self._fused_scoring = hasattr(self.mdp, "reward_term_critic_features_with_reference")
+        self._detach_frozen_wm = True
         self._compile_fns()
         self.reset_all()
 
@@ -210,12 +212,22 @@ class ImaginedSuperMimicLearner:
 
     def _compile_fns(self) -> None:
         if not self.cfg.compile:
-            self._imag_step_fn = self._imag_step
+            self._imag_policy_fn = self.pi
+            self._imag_state_fn = self.wm.step
             self._reward_fn = self._reward_term
+            self._fused_score_fn = self._reward_term_critic_features
             self._critic_input_fn = self._critic_input
             return
-        self._imag_step_fn = torch.compile(self._imag_step, dynamic=False)
+
+        # Keep each compiled region narrowly scoped. The policy function is the
+        # only rollout component that needs autograd; compiling it separately from
+        # the frozen state transition avoids specializing the whole imagination
+        # graph (including the horizon loop) and prevents an inference-mode WM
+        # compilation from being reused for a training-mode call.
+        self._imag_policy_fn = torch.compile(self.pi, dynamic=False)
+        self._imag_state_fn = torch.compile(self.wm.step, dynamic=False)
         self._reward_fn = torch.compile(self._reward_term, dynamic=False)
+        self._fused_score_fn = torch.compile(self._reward_term_critic_features, dynamic=False)
         self._critic_input_fn = torch.compile(self._critic_input, dynamic=False)
 
     def _reset_batch(self, indices: torch.Tensor | None = None) -> torch.Tensor:
@@ -297,24 +309,6 @@ class ImaginedSuperMimicLearner:
     def reset_all(self) -> None:
         self._reset_batch(None)
 
-    def _imag_step(
-        self,
-        state: State,
-        obs_hist: torch.Tensor,
-        previous_action: torch.Tensor,
-        frames: torch.Tensor,
-        context: torch.Tensor,
-        normalized_context: torch.Tensor,
-        goal: torch.Tensor,
-    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action = self.pi(obs_hist, goal)
-        next_state = self.wm.step(state, action, normalized_context)
-        next_frames = frames + 1
-        obs = self.mdp.obs(next_state, action, context, next_frames)
-        next_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
-        next_goal = self.mdp.goal(next_frames, self.cfg.goal_frames)
-        return next_state, action, next_hist, next_frames, next_goal
-
     def _reward_term(
         self,
         state: State,
@@ -325,6 +319,27 @@ class ImaginedSuperMimicLearner:
         return self.mdp.reward(state, frames, action, previous_action), self.mdp.soft_termination(
             state, frames
         )
+
+    def _reward_term_critic_features(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        normalized_context: torch.Tensor,
+        reference_state: State,
+        reference_body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        action: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        reward, dones, features = self.mdp.reward_term_critic_features_with_reference(
+            state,
+            frames,
+            normalized_context,
+            reference_state,
+            reference_body_state,
+            action,
+            previous_action,
+        )
+        return reward, dones, features
 
     def _critic_input(
         self,
@@ -361,49 +376,133 @@ class ImaginedSuperMimicLearner:
         assert previous_action is not None
         obs_hist = self._obs_hist
         assert obs_hist is not None
-        goal = self.mdp.goal(frames, self.cfg.goal_frames)
         initial_state = state
-        initial_goal = goal
         frames0 = frames
+
+        # Materialize every reference frame once. Goals, observations, reward,
+        # termination, and critic inputs then share these deterministic gathers.
+        frame_offsets = torch.arange(
+            self.cfg.horizon + 1, device=self.device, dtype=frames.dtype
+        ).unsqueeze(-1)
+        frame_sequence = frames0.unsqueeze(0) + frame_offsets
+        critic_goals = self.mdp.goal(frame_sequence.flatten(), self.cfg.goal_frames).view(
+            self.cfg.horizon + 1, self.cfg.batch, -1
+        )
+        goal = critic_goals[0]
+        reference_state = cast(
+            State,
+            tuple(
+                part.reshape(self.cfg.horizon + 1, self.cfg.batch, *part.shape[1:])
+                for part in self.motion.ref_state(frame_sequence.flatten())
+            ),
+        )
+        self._fused_scoring = self._fused_scoring and hasattr(self.motion, "body_state")
+        reference_body_state = (
+            tuple(
+                part.reshape(self.cfg.horizon + 1, self.cfg.batch, *part.shape[1:])
+                for part in self.motion.body_state(frame_sequence.flatten())
+            )
+            if self._fused_scoring
+            else None
+        )
 
         states: list[State] = []
         actions: list[torch.Tensor] = []
         previous_actions: list[torch.Tensor] = []
-        all_frames: list[torch.Tensor] = []
-        goals: list[torch.Tensor] = []
 
         self.critic.requires_grad_(False)
-        for _ in range(self.cfg.horizon):
+        for index in range(self.cfg.horizon):
             previous_actions.append(previous_action)
-            state, action, obs_hist, frames, goal = self._imag_step_fn(
-                state,
-                obs_hist,
-                previous_action,
-                frames,
-                context,
-                normalized_context,
-                goal,
-            )
+            action = self._imag_policy_fn(obs_hist, goal)
+            if self._detach_frozen_wm:
+                with torch.no_grad():
+                    state = self._imag_state_fn(state, action, normalized_context)
+            else:
+                state = self._imag_state_fn(state, action, normalized_context)
+            next_frames = frames0 + index + 1
+            if hasattr(self.mdp, "obs_with_reference"):
+                obs = self.mdp.obs_with_reference(
+                    state,
+                    action,
+                    context,
+                    next_frames,
+                    reference_state[1][index + 1],
+                )
+            else:
+                obs = self.mdp.obs(state, action, context, next_frames)
+            obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
+            goal = critic_goals[index + 1]
             previous_action = action
             states.append(state)
             actions.append(action)
-            all_frames.append(frames)
-            goals.append(goal)
 
         def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
             return torch.stack(parts).flatten(0, 1)
 
+        # Include the initial state so a single FK pass serves all scored rewards,
+        # the soft-done curve, and all T + 1 critic feature rows.
         all_states = cast(
-            State, tuple(flatten([item[index] for item in states]) for index in range(6))
+            State,
+            tuple(
+                torch.cat(
+                    (
+                        initial_state[index].unsqueeze(0),
+                        torch.stack([item[index] for item in states]),
+                    )
+                ).flatten(0, 1)
+                for index in range(6)
+            ),
         )
-        rewards, dones = self._reward_fn(
-            all_states,
-            flatten(all_frames),
-            flatten(actions),
-            flatten(previous_actions),
-        )
-        rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
-        dones = dones.view(self.cfg.horizon, self.cfg.batch)
+        flat_actions = flatten(actions)
+        flat_previous_actions = torch.cat(
+            (previous_actions[0].unsqueeze(0), torch.stack(actions[:-1])), 0
+        ).flatten(0, 1)
+
+        if self._fused_scoring:
+            scored_frames = frame_sequence[1:].flatten()
+            expanded_context = (
+                normalized_context.unsqueeze(0).expand(self.cfg.horizon + 1, -1, -1).flatten(0, 1)
+            )
+            rewards, dones, critic_features = self._fused_score_fn(
+                all_states,
+                scored_frames,
+                expanded_context,
+                tuple(part.flatten(0, 1) for part in reference_state),
+                tuple(part.flatten(0, 1) for part in reference_body_state)
+                if reference_body_state is not None
+                else None,
+                flat_actions,
+                flat_previous_actions,
+            )
+            rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
+            dones = dones.view(self.cfg.horizon, self.cfg.batch)
+            critic_input = torch.cat((critic_features, critic_goals.flatten(0, 1)), -1).view(
+                self.cfg.horizon + 1, self.cfg.batch, -1
+            )
+        else:
+            rewards, dones = self._reward_fn(
+                cast(
+                    State,
+                    tuple(
+                        item[self.cfg.batch :].reshape(-1, *item.shape[1:]) for item in all_states
+                    ),
+                ),
+                frame_sequence[1:].flatten(),
+                flat_actions,
+                flat_previous_actions,
+            )
+            rewards = rewards.view(self.cfg.horizon, self.cfg.batch)
+            dones = dones.view(self.cfg.horizon, self.cfg.batch)
+            critic_input = self._batched_critic_input(
+                all_states,
+                frame_sequence.flatten(),
+                expanded_context := (
+                    normalized_context.unsqueeze(0)
+                    .expand(self.cfg.horizon + 1, -1, -1)
+                    .flatten(0, 1)
+                ),
+                critic_goals.flatten(0, 1),
+            )
 
         alive = torch.cumprod(1 - dones, 0)
         continuation = torch.cat((torch.ones(1, self.cfg.batch, device=self.device), alive[:-1]), 0)
@@ -415,7 +514,7 @@ class ImaginedSuperMimicLearner:
         reward_sum = (continuation * rewards.detach()).sum(0)
         detached_rewards, detached_dones = rewards.detach(), dones.detach()
         if not self.cfg.no_critic:
-            bootstrap_input = self._critic_input_fn(state, frames, normalized_context, goal)
+            bootstrap_input = critic_input[-1]
             bootstrap = self.critic(bootstrap_input).detach()
             objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
                 bootstrap * self._v_std + self._v_mean
@@ -440,34 +539,6 @@ class ImaginedSuperMimicLearner:
 
         value_loss = torch.zeros((), device=self.device)
         if not self.cfg.no_critic:
-            with torch.no_grad():
-                critic_states = cast(
-                    State,
-                    tuple(
-                        torch.cat(
-                            (
-                                initial_state[index].unsqueeze(0),
-                                torch.stack([item[index].detach() for item in states]),
-                            ),
-                            0,
-                        ).flatten(0, 1)
-                        for index in range(6)
-                    ),
-                )
-                critic_frames = torch.cat(
-                    (frames0.unsqueeze(0), torch.stack(all_frames)), 0
-                ).flatten()
-                critic_goals = torch.cat(
-                    (initial_goal.unsqueeze(0), torch.stack(goals)), 0
-                ).flatten(0, 1)
-                critic_context = (
-                    normalized_context.unsqueeze(0)
-                    .expand(self.cfg.horizon + 1, -1, -1)
-                    .flatten(0, 1)
-                )
-                critic_input = self._batched_critic_input(
-                    critic_states, critic_frames, critic_context, critic_goals
-                ).view(self.cfg.horizon + 1, self.cfg.batch, -1)
             self.critic.norm.update(critic_input)
             with torch.no_grad():
                 values = self.critic(critic_input) * self._v_std + self._v_mean

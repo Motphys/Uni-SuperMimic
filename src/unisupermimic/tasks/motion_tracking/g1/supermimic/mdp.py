@@ -144,6 +144,32 @@ class MDP:
             -1,
         )
 
+    def obs_with_reference(
+        self,
+        state: State,
+        previous_action: torch.Tensor,
+        context: torch.Tensor,
+        frames: torch.Tensor,
+        reference_rotation: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return :meth:`obs` using an already-gathered reference rotation."""
+        _, rotation, _, angular_velocity, joint_pos, joint_vel = state
+        rotation_t = rotation.transpose(-1, -2)
+        default_offset = context[..., 1:30]
+        gravity = -rotation[..., 2, :]
+        relative_rotation = mat_to_6d(matmul(rotation_t, reference_rotation))
+        return torch.cat(
+            (
+                joint_pos - self.default_q - default_offset,
+                joint_vel,
+                matvec(rotation_t, angular_velocity),
+                gravity,
+                previous_action,
+                relative_rotation,
+            ),
+            -1,
+        )
+
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
         return obs + (2 * torch.rand_like(obs) - 1) * self.obs_noise
 
@@ -248,6 +274,130 @@ class MDP:
                 "joint_limit": joint_limit,
             }
         return reward
+
+    def reward_term_critic_features_with_reference(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        normalized_context: torch.Tensor,
+        reference_state: State,
+        reference_body_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        action: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute reward, termination, and critic features from shared geometry.
+
+        ``state``/``frames`` contain the initial and imagined states (``T + 1``
+        rows), while ``action``/``previous_action`` contain only the ``T``
+        scored transitions. Supplying the gathered references and running forward
+        kinematics once avoids three per-transition reference gathers and a second
+        forward-kinematics pass for the critic.
+        """
+        cfg = self.cfg
+        position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
+        body_p, body_R, body_v, body_w = self.kin.forward(
+            position,
+            rotation,
+            linear_velocity,
+            angular_velocity,
+            joint_pos,
+            joint_vel,
+        )
+
+        # Reward and soft termination are defined only for transitions, excluding
+        # the bootstrap state at index zero.
+        scored = slice(1, frames.shape[0])
+        scored_position = position[scored]
+        scored_rotation = rotation[scored]
+        scored_joint_pos = joint_pos[scored]
+        ref_p, ref_R = reference_state[0][scored], reference_state[1][scored]
+        (
+            reference_body_p,
+            reference_body_R,
+            reference_body_v,
+            reference_body_w,
+        ) = tuple(item[scored] for item in reference_body_state)
+        delta_rotation = yaw_mat(matmul(scored_rotation, ref_R.transpose(-1, -2)))
+        anchor = torch.cat((scored_position[..., :2], ref_p[..., 2:3]), -1)
+        aligned_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), reference_body_p - ref_p.unsqueeze(-2)
+        )
+        aligned_body_R = matmul(delta_rotation.unsqueeze(-3), reference_body_R)
+        error_pos = ((aligned_body_p - body_p[scored]) ** 2).sum(-1).mean(-1)
+        error_ori = rot_angle_sq(aligned_body_R, body_R[scored]).mean(-1)
+        error_linvel = ((reference_body_v - body_v[scored]) ** 2).sum(-1).mean(-1)
+        error_angvel = ((reference_body_w - body_w[scored]) ** 2).sum(-1).mean(-1)
+        error_root_pos = ((ref_p - scored_position) ** 2).sum(-1)
+        error_root_ori = rot_angle_sq(ref_R, scored_rotation)
+        tracking = (
+            torch.exp(-error_pos / cfg.body_pos_std**2)
+            + torch.exp(-error_ori / cfg.body_ori_std**2)
+            + torch.exp(-error_linvel / cfg.body_linvel_std**2)
+            + torch.exp(-error_angvel / cfg.body_angvel_std**2)
+            + 0.5 * torch.exp(-error_root_pos / cfg.root_pos_std**2)
+            + 0.5 * torch.exp(-error_root_ori / cfg.root_ori_std**2)
+        )
+        if cfg.w_amp > 0.0:
+            ankle_ids = list(cfg.amp_ankles)
+            z_pol = body_p[scored][..., ankle_ids, 2].max(dim=-1).values
+            z_ref = reference_body_p[..., ankle_ids, 2].max(dim=-1).values
+            amp_error = (z_pol - z_ref).abs().sub(cfg.amp_tol).clamp(min=0.0)
+            amp = (1.0 - amp_error / cfg.amp_scale).clamp(0.0, 1.0)
+            active = (z_ref > cfg.amp_min_height).float()
+            tracking = tracking + cfg.w_amp * amp * active
+        if cfg.w_speed > 0.0:
+            speed_ids = list(cfg.speed_bodies)
+            v_pol = body_v[scored][..., speed_ids, :].norm(dim=-1)
+            v_ref = reference_body_v[..., speed_ids, :].norm(dim=-1)
+            speed_error = (v_pol - v_ref).abs().sub(cfg.speed_tol).clamp(min=0.0)
+            speed = (1.0 - speed_error / cfg.speed_scale).clamp(0.0, 1.0)
+            active = (v_ref > cfg.speed_min).float()
+            tracking = tracking + cfg.w_speed * (speed * active).sum(-1) / active.sum(-1).clamp(
+                min=1.0
+            )
+        action_rate = ((action - previous_action) ** 2).sum(-1)
+        joint_limit = (
+            torch.relu(scored_joint_pos - self.soft_hi)
+            + torch.relu(self.soft_lo - scored_joint_pos)
+        ).sum(-1)
+        reward = (
+            tracking + cfg.w_action_rate * action_rate + cfg.w_joint_limit * joint_limit
+        ) * CONTROL_DT
+
+        error_height = (ref_p[..., 2] - scored_position[..., 2]).abs()
+        error_tilt = (ref_R[..., 2, 2] - scored_rotation[..., 2, 2]).abs()
+        alive = (1 - torch.sigmoid((error_height - cfg.term_height) / 0.02)) * (
+            1 - torch.sigmoid((error_tilt - cfg.term_tilt) / 0.04)
+        )
+        dones = 1 - alive
+
+        # Critic features cover all T + 1 states, sharing the FK and reference
+        # gathers above while retaining the original feature construction order.
+        all_ref_p, all_ref_R = reference_state[0], reference_state[1]
+        all_ref_body_p = reference_body_state[0]
+        all_ref_q = reference_state[4]
+        heading_t = yaw_mat(rotation).transpose(-1, -2)
+        critic_delta_rotation = yaw_mat(matmul(rotation, all_ref_R.transpose(-1, -2)))
+        critic_anchor = torch.cat((position[..., :2], all_ref_p[..., 2:3]), -1)
+        critic_ref_body_p = critic_anchor.unsqueeze(-2) + matvec(
+            critic_delta_rotation.unsqueeze(-3),
+            all_ref_body_p - all_ref_p.unsqueeze(-2),
+        )
+        body_error = matvec(heading_t.unsqueeze(-3), critic_ref_body_p - body_p).flatten(-2)
+        root_error = matvec(heading_t, all_ref_p - position)
+        relative_rotation = mat_to_6d(matmul(rotation.transpose(-1, -2), all_ref_R))
+        critic_features = torch.cat(
+            (
+                invariant_features(state),
+                all_ref_q - joint_pos,
+                body_error,
+                root_error,
+                relative_rotation,
+                normalized_context,
+            ),
+            -1,
+        )
+        return reward, dones, critic_features
 
     def termination(self, state: State, frames: torch.Tensor) -> torch.Tensor:
         """Return hard termination from root height and tilt deviations."""
