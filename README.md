@@ -302,9 +302,9 @@ The three seed-0 runs use mjwarp, 4096 environments, the complete 129,487-clip B
 
 Muon reaches the Adam 8000-iteration macro return in 4000 iterations (0.939500 versus 0.939490), although its 423 failed clips are not a strict success-rate match for Adam's 193 at 8000. At 8000 iterations, Muon improves macro return by 0.0108 and reduces failed clips from 193 to 166.
 
-Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. Since this is a seed-0 engineering comparison, `wm_structured` remains opt-in.
+Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. Its additional 3000-iteration checkpoint reaches 0.929833 macro return, 0.932974 frame-weighted return, and 297 failed clips. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. Since this is a seed-0 engineering comparison, `wm_structured` remains opt-in.
 
-![Adam, Muon, and Muon + structured WM: full-library evaluation and learner wall time at 2000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
+![Adam, Muon, and Muon + structured WM: full-library evaluation and learner wall time at 2000, 3000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
 
 Reproduce the Muon run after building `data/library/bones_seed_compact.pt`:
 
