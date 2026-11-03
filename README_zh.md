@@ -294,26 +294,34 @@ BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEE
 
 ### 使用 Muon 隐藏层优化的 BONES-SEED（8000 轮）
 
-可选 Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 `Linear` 权重矩阵；输入/输出层、向量参数、normalizer 以及 critic 仍使用 Adam。Muon 使用 `match_rms_adamw` 缩放，因此沿用原有学习率和余弦调度。默认配置仍为 Adam（`pi_opt: adam`、`wm_opt: adam`）。
+Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 `Linear.weight` 矩阵；输入/输出层、向量参数、normalizer 以及 critic 仍使用 Adam。Muon 使用 `match_rms_adamw` 缩放，因此沿用原有学习率和余弦调度。当前两个优化器默认均为 Muon（`pi_opt: muon`、`wm_opt: muon`），Adam 仍可显式选择。
 
-| checkpoint | 迭代轮数 | norm_return | 帧加权 | 失败段 | 同迭代 Adam 基线 |
-|---|---:|---:|---:|---:|---|
-| ckpt_002000.pt | 2000 | 0.895346 | 0.899637 | 1126 / 129,487（0.87%） | 0.8092，1901 段失败 |
-| [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487（0.33%） | 0.912482，660 段失败 |
-| ckpt_006000.pt | 6000 | 0.947208 | 0.950058 | 186 / 129,487（0.14%） | 0.9306，206 段失败 |
-| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487（0.13%） | 0.939490，193 段失败 |
+可选结构化世界模型（`algo.wm_structured=true`）默认关闭，默认行为仍是直接预测状态增量。打开后，模型参考 BlinkMimic 的 semi-implicit 形式，预测速度增量和位置残差修正；该选项不改变 policy 输入/输出契约。
 
-Muon 在 4000 轮达到 Adam 8000 轮的宏平均 `norm_return`：0.939500 vs 0.939490；4000 轮 learner 墙钟为 27.1 分钟，而 Adam 8000 轮为 48.1 分钟。这是迭代效率结论，不是严格成功率等价：Muon 4000 轮仍有 423 段失败，多于 Adam 8000 轮的 193 段，帧加权回报也低 0.0010。到完整 8000 轮时，Muon 将宏平均回报提高 0.0108，失败段从 193 降至 166，并将世界模型 8 步误差从 0.08759 降至 0.06252（-28.6%）。实测吞吐为 2.46 it/s，低于 Adam 的 2.70 it/s。
+以下三个 seed-0 run 均使用 mjwarp、4096 个环境、完整 129,487 段 BONES-SEED 库和相同调度：
 
-完整 checkpoint 扫描进一步支持“一半迭代达到相近 return”的观察：Muon 6000 轮在宏平均 return（0.947208 vs 0.939490）和失败段数（186 vs 193）上都超过 Adam 8000 轮，learner 墙钟为 40.6 分钟 vs 48.1 分钟。
+| 方法 | 迭代轮数 | norm_return | 帧加权 | 失败段 |
+|---|---:|---:|---:|---:|
+| Adam 基线 | 2000 | 0.809200 | 0.818700 | 1901 / 129,487（1.47%） |
+| Adam 基线 | 4000 | 0.912482 | 0.916519 | 660 / 129,487（0.51%） |
+| Adam 基线 | 6000 | 0.930600 | 0.934200 | 206 / 129,487（0.16%） |
+| Adam 基线 | 8000 | 0.939490 | 0.943325 | 193 / 129,487（0.15%） |
+| Muon | 2000 | 0.895346 | 0.899637 | 1126 / 129,487（0.87%） |
+| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487（0.33%） |
+| Muon | 6000 | 0.947208 | 0.950058 | 186 / 129,487（0.14%） |
+| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487（0.13%） |
+| Muon + 结构化 WM | 2000 | 0.898732 | 0.902762 | 722 / 129,487（0.56%） |
+| Muon + 结构化 WM | 4000 | 0.940363 | 0.943453 | 242 / 129,487（0.19%） |
+| Muon + 结构化 WM | 6000 | 0.948336 | 0.951015 | 195 / 129,487（0.15%） |
+| Muon + 结构化 WM | 8000 | 0.951722 | 0.954158 | 176 / 129,487（0.14%） |
 
-以上为 seed 0 且对照既有 Adam run 的工程实验结果；在完成同一代码版本的多 seed 验证前，默认优化器仍保持 Adam。
+Muon 在 4000 轮达到 Adam 8000 轮的宏平均 return（0.939500 vs 0.939490），但其 423 段失败不能视为与 Adam 8000 轮的 193 段严格等价。到 8000 轮时，Muon 将宏平均 return 提高 0.0108，失败段从 193 降至 166。
 
-![Muon 与 Adam：按迭代和墙钟对比训练奖励与世界模型误差](docs/assets/muon_vs_adam_training_curves.png)
+结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。由于这是 seed-0 工程对照，`wm_structured` 仍保持可选。
 
-![Muon 与 Adam：2000/4000/6000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
+![Adam、Muon 与 Muon + 结构化 WM：2000/4000/6000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
 
-构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现：
+构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现 Muon run：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
@@ -324,14 +332,11 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_boneseed_muon_001
 ```
 
-评估该 run 产生的 4000/8000 轮 checkpoint：
+结构化世界模型消融额外添加 `algo.wm_structured=true`。
+
+评估任一 run 产生的 checkpoint：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
-  --backend mjwarp \
-  --ckpt runs/supermimic_boneseed_muon_001/ckpt_004000.pt \
-  --num_envs 16384
-
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --backend mjwarp \
   --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \

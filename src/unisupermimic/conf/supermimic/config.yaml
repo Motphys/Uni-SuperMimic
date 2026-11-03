@@ -18,6 +18,7 @@ algo:
   hist: 10
   z_dim: 32
   wm_hidden: [2048, 2048, 2048]
+  wm_structured: false
   policy_hidden: [2048, 1024, 512, 256]
   critic_hidden: [256, 128]
   wm_window: 8
@@ -25,8 +26,8 @@ algo:
   wm_batch: 2048
   pi_batch: 4096
   lr: 4.0e-4
-  pi_opt: adam
-  wm_opt: adam
+  pi_opt: muon
+  wm_opt: muon
   no_sync: true
   pi_ema: 0.995
   gamma: 0.99

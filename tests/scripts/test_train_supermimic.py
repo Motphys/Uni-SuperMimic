@@ -74,12 +74,21 @@ def test_learner_config_uses_algorithm_dataclass_fields() -> None:
     learner_cfg = build_learner_config(cfg)
 
     assert learner_cfg.iterations == 12000
+    assert learner_cfg.pi_opt == "muon"
+    assert learner_cfg.wm_opt == "muon"
     assert learner_cfg.goal_frames == 10
     assert learner_cfg.hist == 10
     assert learner_cfg.wm_window == 8
     assert learner_cfg.horizon == 32
     assert learner_cfg.test_hidden_dims == (32, 16)
     assert not hasattr(learner_cfg, "num_envs")
+
+
+def test_structured_world_model_flag_passes_through_hydra() -> None:
+    cfg = _compose()
+    OmegaConf.update(cfg, "algo.wm_structured", True)
+
+    assert build_learner_config(cfg).wm_structured is True
 
 
 def test_eval_override_only_changes_evaluation_lifecycle() -> None:

@@ -294,26 +294,34 @@ At 8000 iterations this configuration already exceeds the 12000-iteration baseli
 
 ### BONES-SEED with Muon hidden-layer optimization (8000 iterations)
 
-The optional Muon optimizers update only the hidden `Linear` weight matrices of the policy encoder/decoder and world-model MLP. Input and output layers, vectors, normalizers, and the critic stay on Adam; Muon uses `match_rms_adamw` scaling so that the existing learning rate and cosine schedule are reused. Defaults remain Adam (`pi_opt: adam`, `wm_opt: adam`).
+The Muon optimizers update only the hidden `Linear.weight` matrices of the policy encoder/decoder and world-model MLP; input/output layers, vectors, normalizers, and the critic use Adam. Muon uses `match_rms_adamw` scaling, so the existing learning rate and cosine schedule are reused. Muon is now the default for both networks (`pi_opt: muon`, `wm_opt: muon`); Adam remains explicitly selectable.
 
-| checkpoint | iterations | norm_return | frame-weighted | failed clips | Adam baseline at the same iteration |
-|---|---:|---:|---:|---:|---|
-| ckpt_002000.pt | 2000 | 0.895346 | 0.899637 | 1126 / 129,487 (0.87%) | 0.8092, 1901 failed |
-| [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487 (0.33%) | 0.912482, 660 failed |
-| ckpt_006000.pt | 6000 | 0.947208 | 0.950058 | 186 / 129,487 (0.14%) | 0.9306, 206 failed |
-| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487 (0.13%) | 0.939490, 193 failed |
+The optional structured world model (`algo.wm_structured=true`) keeps direct increment prediction as the default. When enabled, it predicts velocity increments plus residual position corrections on top of a trapezoidal velocity drift, following BlinkMimic's semi-implicit formulation. It does not change the policy input/output contract.
 
-Muon reaches the Adam 8000-iteration macro `norm_return` in 4000 iterations: 0.939500 versus 0.939490. The 4000-iteration learner wall time is 27.1 minutes versus 48.1 minutes for Adam at 8000 iterations. This is an iteration-efficiency result rather than a strict success-rate match: Muon at 4000 iterations has 423 failed clips versus 193 for Adam at 8000, and its frame-weighted return is lower by 0.0010. At the full 8000 iterations, Muon improves macro return by 0.0108, reduces failed clips from 193 to 166, and lowers the world-model 8-step error from 0.08759 to 0.06252 (-28.6%). Its measured throughput is 2.46 versus 2.70 iterations/second for Adam.
+The three seed-0 runs use mjwarp, 4096 environments, the complete 129,487-clip BONES-SEED library, and the same schedule:
 
-The complete checkpoint sweep strengthens the halfway-return observation: Muon at 6000 iterations exceeds Adam at 8000 iterations on both macro return (0.947208 vs 0.939490) and failed clips (186 vs 193), while using 40.6 versus 48.1 minutes of learner wall time.
+| Method | Iterations | norm_return | Frame-weighted | Failed clips |
+|---|---:|---:|---:|---:|
+| Adam baseline | 2000 | 0.809200 | 0.818700 | 1901 / 129,487 (1.47%) |
+| Adam baseline | 4000 | 0.912482 | 0.916519 | 660 / 129,487 (0.51%) |
+| Adam baseline | 6000 | 0.930600 | 0.934200 | 206 / 129,487 (0.16%) |
+| Adam baseline | 8000 | 0.939490 | 0.943325 | 193 / 129,487 (0.15%) |
+| Muon | 2000 | 0.895346 | 0.899637 | 1126 / 129,487 (0.87%) |
+| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487 (0.33%) |
+| Muon | 6000 | 0.947208 | 0.950058 | 186 / 129,487 (0.14%) |
+| [Muon](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487 (0.13%) |
+| Muon + structured WM | 2000 | 0.898732 | 0.902762 | 722 / 129,487 (0.56%) |
+| Muon + structured WM | 4000 | 0.940363 | 0.943453 | 242 / 129,487 (0.19%) |
+| Muon + structured WM | 6000 | 0.948336 | 0.951015 | 195 / 129,487 (0.15%) |
+| Muon + structured WM | 8000 | 0.951722 | 0.954158 | 176 / 129,487 (0.14%) |
 
-These are seed-0 engineering-comparison numbers against the existing Adam run; the optimizer default remains Adam until a same-checkout, multi-seed study is completed.
+Muon reaches the Adam 8000-iteration macro return in 4000 iterations (0.939500 versus 0.939490), although its 423 failed clips are not a strict success-rate match for Adam's 193 at 8000. At 8000 iterations, Muon improves macro return by 0.0108 and reduces failed clips from 193 to 166.
 
-![Muon versus Adam: training reward and world-model error by iteration and wall-clock time](docs/assets/muon_vs_adam_training_curves.png)
+Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. Since this is a seed-0 engineering comparison, `wm_structured` remains opt-in.
 
-![Muon versus Adam: full-library evaluation at 2000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
+![Adam, Muon, and Muon + structured WM: full-library evaluation at 2000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
 
-Reproduce the run after building `data/library/bones_seed_compact.pt`:
+Reproduce the Muon run after building `data/library/bones_seed_compact.pt`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
@@ -324,14 +332,11 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_boneseed_muon_001
 ```
 
-Evaluate the 4000- and 8000-iteration checkpoints produced by that run:
+Add `algo.wm_structured=true` for the structured world-model ablation.
+
+Evaluate a checkpoint produced by either run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
-  --backend mjwarp \
-  --ckpt runs/supermimic_boneseed_muon_001/ckpt_004000.pt \
-  --num_envs 16384
-
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --backend mjwarp \
   --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
