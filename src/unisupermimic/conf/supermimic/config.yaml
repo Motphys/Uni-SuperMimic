@@ -25,6 +25,8 @@ algo:
   wm_batch: 2048
   pi_batch: 4096
   lr: 4.0e-4
+  pi_opt: adam
+  wm_opt: adam
   no_sync: true
   pi_ema: 0.995
   gamma: 0.99

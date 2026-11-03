@@ -187,6 +187,14 @@ uv run unisupermimic-train \
 
 续训或评估 MuJoCo、Motrix run 时，使用与训练相同的 `task=g1_super_mimic/<backend>` 覆盖。Motrix 使用固定摩擦，保留质心和关节偏置域随机化。其他配置覆盖使用 Hydra 语法，例如快速 smoke 可覆盖 `algo.num_envs`、`algo.iterations`、`algo.wm_hidden`、`algo.policy_hidden` 和 `algo.compile=false`。默认完整配置见 `src/unisupermimic/conf/supermimic/config.yaml`。
 
+默认优化器仍为 Adam。如需对 policy 和 world model 的隐藏层权重矩阵启用 Muon（输入/输出层、向量参数、normalizer 与 critic 仍使用 Adam），添加：
+
+```bash
+algo.pi_opt=muon algo.wm_opt=muon
+```
+
+Muon 使用 `match_rms_adamw` 缩放，因此沿用现有 `algo.lr` 和余弦学习率调度。两个选项也可以单独启用。
+
 ## 评估
 
 评估从每段动作的首帧开始，关闭观测/动作噪声，并跑完整个 clip。已结束的环境会被回收给待评估动作；调度器优先启动较长 clip，避免固定 batch 出现长空闲尾巴。独立评估器默认最多使用 16,384 个并行环境，可用 `unisupermimic-eval --num_envs N` 适配较小 GPU。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
@@ -283,6 +291,48 @@ BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEE
 ![EMA + no-sync + lr：截至 8000 轮的全库评估与训练奖励](docs/assets/boneseed_optimized_curve.png)
 
 在 8000 轮时，该配置已超过 12000 轮基线的归一化回报（0.9395 vs 0.9243），并将失败段数减半（193 vs 350）。
+
+### 使用 Muon 隐藏层优化的 BONES-SEED（8000 轮）
+
+可选 Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 `Linear` 权重矩阵；输入/输出层、向量参数、normalizer 以及 critic 仍使用 Adam。Muon 使用 `match_rms_adamw` 缩放，因此沿用原有学习率和余弦调度。默认配置仍为 Adam（`pi_opt: adam`、`wm_opt: adam`）。
+
+| checkpoint | 迭代轮数 | norm_return | 帧加权 | 失败段 | 同迭代 Adam 基线 |
+|---|---:|---:|---:|---:|---|
+| [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487（0.33%） | 0.912482，660 段失败 |
+| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487（0.13%） | 0.939490，193 段失败 |
+
+Muon 在 4000 轮达到 Adam 8000 轮的宏平均 `norm_return`：0.939500 vs 0.939490；4000 轮 learner 墙钟为 27.1 分钟，而 Adam 8000 轮为 48.1 分钟。这是迭代效率结论，不是严格成功率等价：Muon 4000 轮仍有 423 段失败，多于 Adam 8000 轮的 193 段，帧加权回报也低 0.0010。到完整 8000 轮时，Muon 将宏平均回报提高 0.0108，失败段从 193 降至 166，并将世界模型 8 步误差从 0.08759 降至 0.06252（-28.6%）。实测吞吐为 2.46 it/s，低于 Adam 的 2.70 it/s。
+
+以上为 seed 0 且对照既有 Adam run 的工程实验结果；在完成同一代码版本的多 seed 验证前，默认优化器仍保持 Adam。
+
+![Muon 与 Adam：按迭代和墙钟对比训练奖励与世界模型误差](docs/assets/muon_vs_adam_training_curves.png)
+
+![Muon 与 Adam：4000/8000 轮全库评估](docs/assets/muon_vs_adam_evaluation.png)
+
+构建 `data/library/bones_seed_compact.pt` 后，可按以下命令复现：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  algo.iterations=8000 \
+  algo.pi_opt=muon \
+  algo.wm_opt=muon \
+  training.log_dir=runs/supermimic_boneseed_muon_001
+```
+
+评估该 run 产生的 4000/8000 轮 checkpoint：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_muon_001/ckpt_004000.pt \
+  --num_envs 16384
+
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
+  --num_envs 16384
+```
 
 ## 测试
 

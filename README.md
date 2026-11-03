@@ -187,6 +187,14 @@ uv run unisupermimic-train \
 
 Use the same `task=g1_super_mimic/<backend>` override when resuming or evaluating a MuJoCo or Motrix run. Motrix uses fixed friction; center-of-mass and joint-offset domain randomization remain enabled. Use Hydra syntax for other configuration overrides. For a quick smoke run, override options such as `algo.num_envs`, `algo.iterations`, `algo.wm_hidden`, `algo.policy_hidden`, and `algo.compile=false`. See `src/unisupermimic/conf/supermimic/config.yaml` for the complete default configuration.
 
+The optimizer remains Adam by default. To use Muon for the hidden weight matrices of the policy and world model (with Adam retained for input/output layers, vectors, normalizers, and the critic), add:
+
+```bash
+algo.pi_opt=muon algo.wm_opt=muon
+```
+
+Muon uses `match_rms_adamw` scaling, so the existing `algo.lr` and cosine schedule are reused. The two options can also be enabled independently.
+
 ## Evaluation
 
 Evaluation starts every motion from its first frame, disables observation and action noise, and runs the complete clip. Finished environments are recycled for pending clips, with longer clips scheduled first to avoid a long idle batch tail. The standalone evaluator uses at most 16,384 parallel environments by default; use `unisupermimic-eval --num_envs N` to fit a smaller GPU. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
@@ -283,6 +291,48 @@ Building on the fused 3×3 rotations and fused Adam already in this repository, 
 ![EMA + no-sync + lr: full-library evaluation and training reward through iteration 8000](docs/assets/boneseed_optimized_curve.png)
 
 At 8000 iterations this configuration already exceeds the 12000-iteration baseline on normalized return (0.9395 vs 0.9243) and halves the number of failed clips (193 vs 350).
+
+### BONES-SEED with Muon hidden-layer optimization (8000 iterations)
+
+The optional Muon optimizers update only the hidden `Linear` weight matrices of the policy encoder/decoder and world-model MLP. Input and output layers, vectors, normalizers, and the critic stay on Adam; Muon uses `match_rms_adamw` scaling so that the existing learning rate and cosine schedule are reused. Defaults remain Adam (`pi_opt: adam`, `wm_opt: adam`).
+
+| checkpoint | iterations | norm_return | frame-weighted | failed clips | Adam baseline at the same iteration |
+|---|---:|---:|---:|---:|---|
+| [ckpt_004000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_004000.pt) | 4000 | 0.939500 | 0.942356 | 423 / 129,487 (0.33%) | 0.912482, 660 failed |
+| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_muon_ckpt_008000.pt) | 8000 | 0.950259 | 0.953015 | 166 / 129,487 (0.13%) | 0.939490, 193 failed |
+
+Muon reaches the Adam 8000-iteration macro `norm_return` in 4000 iterations: 0.939500 versus 0.939490. The 4000-iteration learner wall time is 27.1 minutes versus 48.1 minutes for Adam at 8000 iterations. This is an iteration-efficiency result rather than a strict success-rate match: Muon at 4000 iterations has 423 failed clips versus 193 for Adam at 8000, and its frame-weighted return is lower by 0.0010. At the full 8000 iterations, Muon improves macro return by 0.0108, reduces failed clips from 193 to 166, and lowers the world-model 8-step error from 0.08759 to 0.06252 (-28.6%). Its measured throughput is 2.46 versus 2.70 iterations/second for Adam.
+
+These are seed-0 engineering-comparison numbers against the existing Adam run; the optimizer default remains Adam until a same-checkout, multi-seed study is completed.
+
+![Muon versus Adam: training reward and world-model error by iteration and wall-clock time](docs/assets/muon_vs_adam_training_curves.png)
+
+![Muon versus Adam: full-library evaluation at 4000 and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
+
+Reproduce the run after building `data/library/bones_seed_compact.pt`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  algo.iterations=8000 \
+  algo.pi_opt=muon \
+  algo.wm_opt=muon \
+  training.log_dir=runs/supermimic_boneseed_muon_001
+```
+
+Evaluate the 4000- and 8000-iteration checkpoints produced by that run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_muon_001/ckpt_004000.pt \
+  --num_envs 16384
+
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
+  --num_envs 16384
+```
 
 ## Tests
 
