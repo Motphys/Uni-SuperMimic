@@ -87,3 +87,17 @@ def test_policy_shape_mismatch_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(CrossBackendIncompatibleError, match="algo.policy_hidden"):
         resolve_sim2sim_config(tmp_path, target, strict=True)
+
+
+def test_structured_world_model_mismatch_fails_closed(tmp_path: Path) -> None:
+    source = _cfg()
+    OmegaConf.update(source, "algo.wm_structured", True)
+    target = _cfg()
+    OmegaConf.update(target, "algo.wm_structured", False)
+    (tmp_path / "run_config.json").write_text(
+        json.dumps({"contract_snapshot": extract_contract_snapshot(source)}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CrossBackendIncompatibleError, match="algo.wm_structured"):
+        resolve_sim2sim_config(tmp_path, target, strict=True)

@@ -483,6 +483,9 @@ def make_eval_env(
         source_motion_files = contract.get("env.commands.motion.motion_files")
         if source_motion_files is not None:
             OmegaConf.update(cfg, "env.commands.motion.motion_files", source_motion_files)
+        source_wm_structured = contract.get("algo.wm_structured")
+        if source_wm_structured is not None:
+            OmegaConf.update(cfg, "algo.wm_structured", bool(source_wm_structured))
     clip_count = _motion_count(cfg)
     if num_envs is None:
         num_envs = min(clip_count, default_num_envs)

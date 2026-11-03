@@ -148,6 +148,63 @@ def test_world_model_integrates_frame_local_increments() -> None:
     torch.testing.assert_close(next_state[5], increment[14:16].unsqueeze(0))
 
 
+def test_structured_world_model_targets_round_trip_through_integration() -> None:
+    torch.manual_seed(7)
+    model = WorldModel(
+        hidden=(4,),
+        num_joints=3,
+        context_dim=2,
+        structured=True,
+        dt=0.1,
+    )
+    state = _state(5, 3)
+    correction = torch.randn(5, model.out_dim)
+
+    next_state = model.integrate(state, correction)
+
+    torch.testing.assert_close(model.targets(state, next_state), correction)
+
+
+def test_structured_world_model_zero_output_follows_velocity_drift() -> None:
+    model = WorldModel(hidden=(4,), num_joints=2, context_dim=1, structured=True, dt=0.02)
+    state = (
+        torch.tensor([[1.0, 2.0, 3.0]]),
+        torch.eye(3).unsqueeze(0),
+        torch.tensor([[4.0, 5.0, 6.0]]),
+        torch.tensor([[0.1, 0.2, 0.3]]),
+        torch.tensor([[1.0, 2.0]]),
+        torch.tensor([[7.0, 8.0]]),
+    )
+
+    next_state = model.step(state, torch.zeros(1, 2), torch.zeros(1, 1))
+
+    old_weight = 0.02 * (1 - model.DRIFT_NEW_VELOCITY_WEIGHT)
+    new_weight = 0.02 * model.DRIFT_NEW_VELOCITY_WEIGHT
+    torch.testing.assert_close(next_state[0], state[0] + (old_weight + new_weight) * state[2])
+    torch.testing.assert_close(next_state[2], state[2])
+    torch.testing.assert_close(next_state[3], state[3])
+    torch.testing.assert_close(next_state[4], state[4] + (old_weight + new_weight) * state[5])
+    torch.testing.assert_close(next_state[5], state[5])
+
+
+def test_unstructured_checkpoint_without_increment_norm_remains_loadable() -> None:
+    model = WorldModel(hidden=(4,), num_joints=2, context_dim=1)
+    with torch.no_grad():
+        model.out_norm.mean.normal_()
+        model.out_norm.var.fill_(2.0)
+        model.out_norm.count.fill_(12.0)
+    legacy_state = {
+        key: value for key, value in model.state_dict().items() if not key.startswith("inc_norm.")
+    }
+    restored = WorldModel(hidden=(4,), num_joints=2, context_dim=1)
+
+    restored.load_state_dict(legacy_state)
+
+    torch.testing.assert_close(restored.inc_norm.mean, restored.out_norm.mean)
+    torch.testing.assert_close(restored.inc_norm.var, restored.out_norm.var)
+    torch.testing.assert_close(restored.inc_norm.count, restored.out_norm.count)
+
+
 def test_policy_and_critic_shapes_and_dtypes() -> None:
     batch_size = 4
     num_joints = 3

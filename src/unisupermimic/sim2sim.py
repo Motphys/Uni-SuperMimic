@@ -19,6 +19,7 @@ SUPERMIMIC_DENYLIST = [
     "algo.hist",
     "algo.z_dim",
     "algo.wm_hidden",
+    "algo.wm_structured",
     "algo.policy_hidden",
     "algo.critic_hidden",
     "algo.wm_window",
