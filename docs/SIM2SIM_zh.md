@@ -1,10 +1,10 @@
-# 面向 Repro sim2sim 的部署导出
+# 本仓库内部署导出与 sim2sim 查看器
 
 Languages: [English](SIM2SIM.md) | 简体中文
 
-这个导出器为 Uni-SuperMimic checkpoint 生成显式契约的部署 bundle。它不改变训练、
-评估或策略契约。生成的 artifacts 可由识别 `contract=unisupermimic_v1` 的
-SuperMimic-Repro-Sim2Real 部署 runtime 消费。
+这个模块为 Uni-SuperMimic checkpoint 生成显式契约的部署 bundle，并能在本仓库内用
+MuJoCo 交互查看器回放该 bundle。它不改变训练、评估或策略契约。生成的 artifacts
+也可以交给识别 `contract=unisupermimic_v1` 的部署 runtime 消费。
 
 ## 契约
 
@@ -62,20 +62,53 @@ uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd all \
 使用 `--cmd config`、`--cmd clips`、`--cmd onnx` 或 `--cmd model` 可重建已有
 bundle 的部分内容。`--cmd check --check-clip PATH` 在导出后校验存储契约。
 
-## Repro sim2sim
+## 交互式 sim2sim 查看器
 
-在支持 `unisupermimic_v1` runtime 的 SuperMimic-Repro-Sim2Real checkout 中，将
-导出的 artifact 根目录和 clip 目录传给现有部署 gates：
+训练完成后，可以直接从一个 checkpoint 和一个动作源打开原生 MuJoCo viewer。该命令
+会创建临时部署 bundle，以 50 Hz 运行 ONNX，并以 1 kHz 推进本仓库的 G1 训练 MJCF：
 
 ```bash
-python scripts/deploy/sim2sim.py --cmd g2,g3 \
-  --ckpt ckpt_012000 \
-  --artifacts /path/to/deploy_artifacts_uni \
-  --clips walk1_subject1 \
-  --tag uni_walk1 \
-  --workers 8
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd view \
+  --checkpoint runs/supermimic_001/ckpt_012000.pt \
+  --motion src/unisupermimic/assets/motions/g1/lafan1_supermimic/walk1_subject1.csv \
+  --clip-name walk1_subject1 \
+  --loop
 ```
 
-不要在没有对应 `deploy_config.json` 和 Uni 导出 clip 的情况下，把 Uni policy 复制到
-Repro native artifact 目录。Repro native 与 Uni 使用不同的 observation 宽度、
-history layout 和 goal 表。
+紧凑 BONES-SEED 库需要显式指定 clip：
+
+```bash
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd view \
+  --checkpoint runs/supermimic_boneseed_001/ckpt_012000.pt \
+  --motion data/library/bones_seed_compact.pt \
+  --clip-name CLIP_NAME \
+  --loop
+```
+
+实心机器人由导出的 ONNX policy 控制；半透明 ghost 是无接触的参考机体。常用选项：
+
+```text
+--start-frame N   从指定参考帧开始
+--loop            播完后重播
+--no-ghost        只显示 policy 机器人
+--headless        无窗口运行（还需 --max-steps N）
+```
+
+已有 bundle 可直接查看，无需重新导出：
+
+```bash
+uv run python -m unisupermimic.deploy.sim2sim --cmd view \
+  --config deploy_artifacts_uni/ckpt_012000/deploy_config.json \
+  --onnx deploy_artifacts_uni/ckpt_012000/policy.onnx \
+  --clip deploy_artifacts_uni/clips/walk1_subject1.npz \
+  --loop
+```
+
+该查看器使用本仓库自己的 G1 MJCF 和训练 position actuator。它是部署契约回放，
+不能替代外部吊架下的分阶段实机安全测试。
+
+## Artifact 安全
+
+viewer 和导出器会显式拒绝与 `unisupermimic_v1` 不匹配的 policy、配置或 clip。
+不要手工混用来自不同 policy family 的 artifacts：observation 宽度、history
+layout、关节顺序、action target 公式和 goal layout 都必须一致。

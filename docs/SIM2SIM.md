@@ -1,11 +1,12 @@
-# Deployment export for Repro sim2sim
+# Same-repository deployment export and sim2sim viewer
 
 Languages: English | [简体中文](SIM2SIM_zh.md)
 
-This exporter produces a contract-explicit deployment bundle for a Uni-SuperMimic
-checkpoint. It does not change training, evaluation, or the policy contract. The
-generated artifacts can be consumed by a SuperMimic-Repro-Sim2Real deployment
-runtime that recognizes `contract=unisupermimic_v1`.
+This module produces a contract-explicit deployment bundle for a Uni-SuperMimic
+checkpoint and can replay that bundle through an interactive, same-repository
+MuJoCo deployment viewer. It does not change training, evaluation, or the policy
+contract. The generated artifacts can also be consumed by a deployment runtime
+that recognizes `contract=unisupermimic_v1`.
 
 ## Contract
 
@@ -66,21 +67,57 @@ Use `--cmd config`, `--cmd clips`, `--cmd onnx`, or `--cmd model` to regenerate
 part of an existing bundle. `--cmd check --check-clip PATH` validates the stored
 contract after export.
 
-## Repro sim2sim
+## Interactive sim2sim viewer
 
-From a SuperMimic-Repro-Sim2Real checkout with `unisupermimic_v1` runtime support,
-pass the exported artifact root and clip directory to its existing deployment
-gates:
+After training, open the native MuJoCo viewer directly from a checkpoint and one
+motion source. The command creates a temporary deployment bundle, runs ONNX at
+50 Hz, and advances the repository's G1 training MJCF at 1 kHz:
 
 ```bash
-python scripts/deploy/sim2sim.py --cmd g2,g3 \
-  --ckpt ckpt_012000 \
-  --artifacts /path/to/deploy_artifacts_uni \
-  --clips walk1_subject1 \
-  --tag uni_walk1 \
-  --workers 8
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd view \
+  --checkpoint runs/supermimic_001/ckpt_012000.pt \
+  --motion src/unisupermimic/assets/motions/g1/lafan1_supermimic/walk1_subject1.csv \
+  --clip-name walk1_subject1 \
+  --loop
 ```
 
-Do not copy a Uni policy into a native Repro artifact directory without its
-`deploy_config.json` and exported Uni clip. Repro native and Uni use different
-observation widths, history layouts, and goal tables.
+For a compact BONES-SEED library, specify the clip explicitly:
+
+```bash
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd view \
+  --checkpoint runs/supermimic_boneseed_001/ckpt_012000.pt \
+  --motion data/library/bones_seed_compact.pt \
+  --clip-name CLIP_NAME \
+  --loop
+```
+
+The solid robot is commanded by the exported ONNX policy. The translucent ghost
+is a contact-free reference body. Useful options are:
+
+```text
+--start-frame N   start at a reference frame
+--loop            restart after the final frame
+--no-ghost        show only the policy robot
+--headless        run without a window (also pass --max-steps N)
+```
+
+An already exported bundle can be viewed without recreating it:
+
+```bash
+uv run python -m unisupermimic.deploy.sim2sim --cmd view \
+  --config deploy_artifacts_uni/ckpt_012000/deploy_config.json \
+  --onnx deploy_artifacts_uni/ckpt_012000/policy.onnx \
+  --clip deploy_artifacts_uni/clips/walk1_subject1.npz \
+  --loop
+```
+
+This viewer uses the repository's own G1 MJCF and training position actuators.
+It is a deployment-contract replay, not a substitute for staged real-robot safety
+testing on an external gantry.
+
+## Artifact safety
+
+The viewer and exporter deliberately reject a policy, configuration, or clip whose
+contract does not match `unisupermimic_v1`. Do not manually mix artifacts from a
+different policy family: observation width, history layout, joint order, action
+target formula, and goal layout must all match.

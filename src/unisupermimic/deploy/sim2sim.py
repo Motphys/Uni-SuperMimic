@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -326,7 +327,11 @@ def check(out: Path, checkpoint: str | Path, clip: str | Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cmd", default="all", help="config | clips | onnx | model | all | check")
+    parser.add_argument(
+        "--cmd",
+        default="all",
+        help="config | clips | onnx | model | all | check | view",
+    )
     parser.add_argument("--checkpoint", type=Path, help="Uni ckpt_XXXXXX.pt / last.pt")
     parser.add_argument("--out", type=Path, default=REPO / "deploy_artifacts_uni")
     parser.add_argument("--motion", nargs="+", type=Path, help="CSV motion(s) or one compact .pt")
@@ -341,12 +346,33 @@ def main() -> None:
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--check-clip", type=Path)
+    parser.add_argument("--config", type=Path, help="existing deploy_config.json for --cmd view")
+    parser.add_argument("--onnx", type=Path, help="existing policy.onnx for --cmd view")
+    parser.add_argument("--clip", type=Path, help="existing exported clip .npz for --cmd view")
+    parser.add_argument("--robot", type=Path, help="robot MJCF used to build the visual ghost")
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument("--loop", action="store_true", help="restart the clip in --cmd view")
+    parser.add_argument(
+        "--no-ghost",
+        action="store_true",
+        help="do not attach the visual reference robot in --cmd view",
+    )
+    parser.add_argument("--headless", action="store_true", help="run --cmd view without a window")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="stop --cmd view after this many policy steps; required by --headless",
+    )
     args = parser.parse_args()
     cmds = set(args.cmd.split(","))
     if cmds == {"all"}:
         cmds = {"config", "clips", "onnx", "model"}
-    if not cmds <= {"config", "clips", "onnx", "model", "all", "check"}:
+    if not cmds <= {"config", "clips", "onnx", "model", "all", "check", "view"}:
         parser.error(f"unknown command in {args.cmd}")
+    if "view" in cmds and len(cmds) != 1:
+        parser.error("--cmd view cannot be combined with other commands")
+    if "view" in cmds and args.headless and args.max_steps is None:
+        parser.error("--headless requires --max-steps")
     if cmds & {"config", "onnx", "check"} and args.checkpoint is None:
         parser.error("--checkpoint is required for config/onnx/check")
     if "clips" in cmds and not args.motion:
@@ -356,6 +382,59 @@ def main() -> None:
     )
     if needs_compact_selection and not args.clip_name:
         parser.error("compact .pt export requires one or more --clip-name values")
+
+    if "view" in cmds:
+        from unisupermimic.deploy.viewer import launch
+
+        existing_artifacts = (
+            args.config is not None or args.onnx is not None or args.clip is not None
+        )
+        if existing_artifacts:
+            if not (args.config is not None and args.onnx is not None and args.clip is not None):
+                parser.error("--cmd view needs --config, --onnx, and --clip together")
+            launch(
+                config_path=args.config,
+                policy_path=args.onnx,
+                clip_path=args.clip,
+                scene=args.scene,
+                robot=args.robot or args.mjcf,
+                start_frame=args.start_frame,
+                loop=args.loop,
+                ghost=not args.no_ghost,
+                headless=args.headless,
+                max_steps=args.max_steps,
+            )
+        else:
+            if args.checkpoint is None or not args.motion or len(args.clip_name or []) != 1:
+                parser.error(
+                    "--cmd view needs either existing artifacts or "
+                    "--checkpoint, --motion, and exactly one --clip-name"
+                )
+            with tempfile.TemporaryDirectory(prefix="unisupermimic-sim2sim-") as temporary:
+                temporary_out = Path(temporary)
+                config_out = temporary_out / checkpoint_tag(args.checkpoint)
+                write_config(args.checkpoint, config_out, args.mjcf)
+                export_onnx(args.checkpoint, temporary_out, args.opset)
+                exported = export_clips(
+                    args.motion,
+                    temporary_out,
+                    mjcf=args.mjcf,
+                    src_fps=args.src_fps,
+                    names=args.clip_name,
+                )
+                launch(
+                    config_path=config_out / "deploy_config.json",
+                    policy_path=temporary_out / checkpoint_tag(args.checkpoint) / "policy.onnx",
+                    clip_path=exported[0],
+                    scene=args.scene,
+                    robot=args.robot or args.mjcf,
+                    start_frame=args.start_frame,
+                    loop=args.loop,
+                    ghost=not args.no_ghost,
+                    headless=args.headless,
+                    max_steps=args.max_steps,
+                )
+        return
 
     report: dict[str, object] = {}
     if "model" in cmds:

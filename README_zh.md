@@ -199,7 +199,7 @@ Muon 使用 `match_rms_adamw` 缩放，因此沿用现有 `algo.lr` 和余弦学
 
 评估从每段动作的首帧开始，关闭观测/动作噪声，并跑完整个 clip。已结束的环境会被回收给待评估动作；调度器优先启动较长 clip，避免固定 batch 出现长空闲尾巴。独立评估器默认最多使用 16,384 个并行环境，可用 `unisupermimic-eval --num_envs N` 适配较小 GPU。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
 
-如需为外部 Repro 部署 runtime 导出 checkpoint，请参见[面向 Repro sim2sim 的部署导出](docs/SIM2SIM_zh.md)。
+如需导出 checkpoint，并在本仓库的 MuJoCo sim2sim 查看器中检查效果，请参见[本仓库内部署导出与 sim2sim 查看器](docs/SIM2SIM_zh.md)。
 
 独立评估和视频导出入口支持 `--backend mjwarp`、`--backend mujoco`、`--backend motrix`，默认为 mjwarp：
 
