@@ -319,11 +319,6 @@ class MotionLib:
             return reference[..., :3], quat_to_mat(reference[..., 3:7])
         return self.root_p[window], self.root_R[window]
 
-    def future_frames(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Return frames+1 through frames+K, clamped at each clip's last frame."""
-        end = self.clip_end[self.clip_id[frames]]
-        future = frames.unsqueeze(-1) + torch.arange(1, num_frames + 1, device=frames.device)
-        return torch.minimum(future, end.unsqueeze(-1))
 
     def ref_state(self, frames: torch.Tensor) -> State:
         if self.compact:
