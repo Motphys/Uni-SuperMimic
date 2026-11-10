@@ -1,5 +1,7 @@
 # Deployment export for Repro sim2sim
 
+Languages: English | [简体中文](SIM2SIM_zh.md)
+
 This exporter produces a contract-explicit deployment bundle for a Uni-SuperMimic
 checkpoint. It does not change training, evaluation, or the policy contract. The
 generated artifacts can be consumed by a SuperMimic-Repro-Sim2Real deployment
@@ -32,7 +34,7 @@ at runtime, so use `uv run --with onnxruntime` or provide an environment that
 already contains them:
 
 ```bash
-uv run --with onnxruntime python -m unisupermimic.deploy.export --cmd all \
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd all \
   --checkpoint runs/supermimic_001/ckpt_012000.pt \
   --motion src/unisupermimic/assets/motions/g1/lafan1_supermimic/walk1_subject1.csv \
   --clip-name walk1_subject1 \
@@ -43,7 +45,7 @@ A compact BONES-SEED library is memory-mapped and contains many clips. Name the
 clips to export explicitly:
 
 ```bash
-uv run --with onnxruntime python -m unisupermimic.deploy.export --cmd all \
+uv run --with onnxruntime python -m unisupermimic.deploy.sim2sim --cmd all \
   --checkpoint runs/supermimic_boneseed_001/ckpt_012000.pt \
   --motion data/library/bones_seed_compact.pt \
   --clip-name CLIP_NAME \

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from unisupermimic.deploy.export import export_onnx, load_policy
+from unisupermimic.deploy.sim2sim import export_onnx, load_policy
 from unisupermimic.rl.algos.supermimic.networks import Policy
 
 
