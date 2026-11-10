@@ -83,7 +83,10 @@ def rollout_qpos(
             history = obs.unsqueeze(1).repeat(1, hist, 1)
         else:
             history = torch.cat((history[:, 1:], obs.unsqueeze(1)), dim=1)
-        action = policy(history, mdp.goal(current["f"], goal_frames))
+        action = policy(
+            history,
+            mdp.goal(unflatten_state(current["s"]), current["f"], goal_frames),
+        )
         state = env.step(action)
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
         if bool(transition["done"][clip_index].item()):

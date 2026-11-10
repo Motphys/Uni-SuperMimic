@@ -25,6 +25,7 @@ from .kinematics import G1Kinematics
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50
+GOAL_STRIDE = 5
 
 
 class MotionLib:
@@ -287,41 +288,42 @@ class MotionLib:
         new.kin = self.kin.to(device)
         return new
 
+    def goal_indices(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Windowed frame indices ``t, t+s, ..., t+(K-1)*s`` clamped at clip ends.
+
+        Matches the upstream SuperMimic goal window: ``K`` frames spaced
+        ``GOAL_STRIDE`` control steps apart (0.1 s at 50 Hz), clamped to the
+        last frame of each clip so the window never bleeds into the next one.
+        """
+        end = self.clip_end[self.clip_id[frames]]
+        offsets = torch.arange(num_frames, device=frames.device) * GOAL_STRIDE
+        return torch.minimum(frames.unsqueeze(-1) + offsets, end.unsqueeze(-1))
+
+    def goal_content(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Per-frame joint targets ``[joint_pos, joint_vel]``, ``(B, K * 2J)``."""
+        window = self.goal_indices(frames, num_frames)
+        if self.compact:
+            reference = self._ref[window].float()
+            content = torch.cat((reference[..., 7:36], reference[..., 42:71]), -1)
+        else:
+            content = torch.cat((self.q[window], self.qd[window]), -1)
+        return content.reshape(frames.shape[0], -1)
+
+    def goal_anchor(
+        self, frames: torch.Tensor, num_frames: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Windowed root pose ``(pos (B, K, 3), rotmat (B, K, 3, 3))``."""
+        window = self.goal_indices(frames, num_frames)
+        if self.compact:
+            reference = self._ref[window].float()
+            return reference[..., :3], quat_to_mat(reference[..., 3:7])
+        return self.root_p[window], self.root_R[window]
+
     def future_frames(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Return frames+1 through frames+K, clamped at each clip's last frame."""
         end = self.clip_end[self.clip_id[frames]]
         future = frames.unsqueeze(-1) + torch.arange(1, num_frames + 1, device=frames.device)
         return torch.minimum(future, end.unsqueeze(-1))
-
-    def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Build future reference features in the current reference heading frame."""
-        future = self.future_frames(frames, num_frames)
-        if self.compact:
-            reference = self._ref[future].float()
-            current_rotation = quat_to_mat(self._ref[frames, 3:7].float())
-            root_p = reference[..., :3]
-            root_R = quat_to_mat(reference[..., 3:7])
-            root_v = reference[..., 36:39]
-            root_w = reference[..., 39:42]
-            root_v_local = matvec(root_R.transpose(-1, -2), root_v)
-            root_w_local = matvec(root_R.transpose(-1, -2), root_w)
-            q, qd = reference[..., 7:36], reference[..., 42:71]
-            current_p = self._ref[frames, :3].float()
-        else:
-            current_rotation = self.root_R[frames]
-            root_p = self.root_p[future]
-            root_R = self.root_R[future]
-            root_v_local = self.root_v_local[future]
-            root_w_local = self.root_w_local[future]
-            q, qd = self.q[future], self.qd[future]
-            current_p = self.root_p[frames]
-        heading_t = yaw_mat(current_rotation).transpose(-1, -2).unsqueeze(1)
-        position_delta = matvec(heading_t, root_p - current_p.unsqueeze(1))
-        rotation = mat_to_6d(matmul(heading_t, root_R))
-        features = torch.cat(
-            (position_delta, rotation, root_v_local, root_w_local, q, qd * 0.1), -1
-        )
-        return features.reshape(frames.shape[0], -1)
 
     def ref_state(self, frames: torch.Tensor) -> State:
         if self.compact:

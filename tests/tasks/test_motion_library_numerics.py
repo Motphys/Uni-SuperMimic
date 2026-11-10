@@ -42,7 +42,7 @@ def test_entire_library_local_velocity_matches_independent_cpu64(library: Motion
 
 def test_large_goal_batch_equals_same_rows_in_safe_chunks(library: MotionLib) -> None:
     frames = torch.arange(8192, device="cuda", dtype=torch.long)
-    big = library.goal(frames, 10)
-    small = torch.cat([library.goal(chunk, 10) for chunk in frames.split(512)])
+    big = library.goal_content(frames, 10)
+    small = torch.cat([library.goal_content(chunk, 10) for chunk in frames.split(512)])
     assert big.shape == small.shape
     torch.testing.assert_close(big, small, rtol=0, atol=2e-4)

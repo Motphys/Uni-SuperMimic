@@ -45,7 +45,8 @@ class FakeMdp:
     def add_noise(self, obs):
         raise AssertionError("evaluation must not add observation noise")
 
-    def goal(self, frames, num_frames):
+    def goal(self, state, frames, num_frames):
+        del state
         self.goal_calls.append(num_frames)
         return frames.float().unsqueeze(-1).expand(-1, self.goal_frame_dim * num_frames)
 
@@ -265,7 +266,7 @@ def test_evaluate_recycles_environments_for_pending_clips(monkeypatch) -> None:
                 goal_frame_dim=1,
                 max_step_reward=1.0,
                 motion=motion,
-                goal=lambda frames, num_frames: frames.float().unsqueeze(-1),
+                goal=lambda state, frames, num_frames: frames.float().unsqueeze(-1),
                 obs=lambda state, action, context, frames: frames.float().unsqueeze(-1),
             )
             self.state = None
