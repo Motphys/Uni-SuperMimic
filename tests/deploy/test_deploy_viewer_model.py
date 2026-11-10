@@ -4,15 +4,20 @@ import mujoco
 import numpy as np
 import pytest
 
-from unisupermimic.deploy.sim2sim import DEFAULT_ASSETS, DEFAULT_MJCF, DEFAULT_SCENE
-from unisupermimic.deploy.viewer import ViewerRobot, build_ghost_model
+from unisupermimic.deploy.sim2sim import (
+    DEFAULT_ASSETS,
+    DEFAULT_MJCF,
+    DEFAULT_SCENE,
+    ViewerRobot,
+    build_ghost_model,
+)
 
 
 @pytest.mark.slow
 def test_ghost_viewer_model_keeps_one_actuated_robot_and_contact_free_reference():
     if not DEFAULT_ASSETS.is_dir():
         pytest.skip("full G1 assets are not distributed")
-    from unisupermimic.deploy.runtime import NUM_JOINTS
+    from unisupermimic.deploy.sim2sim import NUM_JOINTS
     from unisupermimic.tasks.motion_tracking.g1.supermimic.robot import G1_JOINT_NAMES
 
     model = build_ghost_model(DEFAULT_SCENE, DEFAULT_MJCF)

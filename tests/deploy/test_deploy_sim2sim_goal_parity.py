@@ -2,8 +2,14 @@ import numpy as np
 import pytest
 import torch
 
-from unisupermimic.deploy.runtime import DeployConfig, UniClip, UniDeployCore
-from unisupermimic.deploy.sim2sim import DEFAULT_ASSETS, DEFAULT_MJCF, export_clips
+from unisupermimic.deploy.sim2sim import (
+    DEFAULT_ASSETS,
+    DEFAULT_MJCF,
+    DeployConfig,
+    UniClip,
+    UniDeployCore,
+    export_clips,
+)
 from unisupermimic.tasks.motion_tracking.g1.supermimic.kinematics import G1Kinematics
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import MotionLib
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from unisupermimic.deploy.runtime import (
+from unisupermimic.deploy.sim2sim import (
     NUM_JOINTS,
     DeployConfig,
     UniClip,
