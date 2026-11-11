@@ -42,18 +42,18 @@ def test_critic_batches_chunk_at_4096_without_losing_gradients(monkeypatch) -> N
     learner = object.__new__(SuperMimicLearner)
     sizes = []
 
-    def critic_fn(state, frames, context):
+    def critic_fn(state, frames, context, goal):
         sizes.append(len(frames))
-        return torch.cat((state[0].square(), frames[:, None].float(), context), -1)
+        return torch.cat((state[0].square(), frames[:, None].float(), context, goal), -1)
 
     learner._critic_input_fn = critic_fn
     count = 8201
     position = torch.arange(count * 3, dtype=torch.float32).reshape(count, 3) / count
     state = (position.clone().requires_grad_(),) + tuple(position for _ in range(5))
     frames = torch.arange(count)
-    context = position[:, :2]
-    output = learner._batched_critic_input(state, frames, context)
+    context, goal = position[:, :1], position[:, 1:]
+    output = learner._batched_critic_input(state, frames, context, goal)
     assert sizes == [4096, 4096, 9]
-    assert torch.equal(output, critic_fn(state, frames, context))
+    assert torch.equal(output, critic_fn(state, frames, context, goal))
     output.sum().backward()
     assert torch.equal(state[0].grad, 2 * state[0].detach())

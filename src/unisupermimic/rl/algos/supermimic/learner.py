@@ -292,7 +292,7 @@ class SuperMimicLearner:
                 info["f"],
                 self.mdp.normalize_context(info["xi"]),
             )
-        return int(features.shape[-1])
+        return int(features.shape[-1] + self.mdp.goal_frame_dim * self.cfg.goal_frames)
 
     def _wm_rollout(
         self, states: torch.Tensor, actions: torch.Tensor, contexts: torch.Tensor
@@ -357,8 +357,9 @@ class SuperMimicLearner:
         state: State,
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
+        goal: torch.Tensor,
     ) -> torch.Tensor:
-        return self.mdp.critic_features(state, frames, normalized_context)
+        return torch.cat((self.mdp.critic_features(state, frames, normalized_context), goal), -1)
 
     def _batched_reward_term(
         self,
@@ -388,9 +389,10 @@ class SuperMimicLearner:
         state: State,
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
+        goal: torch.Tensor,
     ) -> torch.Tensor:
         if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
-            return self._critic_input_fn(state, frames, normalized_context)
+            return self._critic_input_fn(state, frames, normalized_context, goal)
         parts = []
         for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
             stop = start + _SAFE_GEOMETRY_BATCH
@@ -399,6 +401,7 @@ class SuperMimicLearner:
                     cast(State, tuple(item[start:stop] for item in state)),
                     frames[start:stop],
                     normalized_context[start:stop],
+                    goal[start:stop],
                 )
             )
         return torch.cat(parts)
@@ -512,9 +515,10 @@ class SuperMimicLearner:
         _set_requires_grad(self.critic, False)
 
         batch_size = self.cfg.pi_batch
-        goal = self.mdp.goal(state, frames, self.cfg.goal_frames)
+        initial_goal = self.mdp.goal(state, frames, self.cfg.goal_frames)
+        goal = initial_goal
         initial_state = state
-        states, actions, previous_actions, all_frames = [], [], [], []
+        states, actions, previous_actions, all_frames, goals = [], [], [], [], []
         try:
             for _ in range(self.cfg.horizon):
                 previous_actions.append(previous_action)
@@ -530,6 +534,7 @@ class SuperMimicLearner:
                 states.append(state)
                 actions.append(previous_action)
                 all_frames.append(frames)
+                goals.append(goal)
 
             def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
                 return torch.stack(parts).flatten(0, 1)
@@ -553,7 +558,9 @@ class SuperMimicLearner:
             reward_sum = (continuation * rewards).detach().sum(0)
             detached_rewards, detached_dones = rewards.detach(), dones.detach()
             if not self.cfg.no_critic:
-                bootstrap = self.critic(self._critic_input_fn(state, frames, normalized_context))
+                bootstrap = self.critic(
+                    self._critic_input_fn(state, frames, normalized_context, goal)
+                )
                 objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
                     bootstrap * self._v_std + self._v_mean
                 )
@@ -597,13 +604,16 @@ class SuperMimicLearner:
                 critic_frames = torch.cat(
                     (start["f"].unsqueeze(0), torch.stack(all_frames)), 0
                 ).flatten()
+                critic_goals = torch.cat(
+                    (initial_goal.unsqueeze(0), torch.stack(goals)), 0
+                ).flatten(0, 1)
                 critic_context = (
                     normalized_context.unsqueeze(0)
                     .expand(self.cfg.horizon + 1, -1, -1)
                     .flatten(0, 1)
                 )
                 critic_input = self._batched_critic_input(
-                    critic_states, critic_frames, critic_context
+                    critic_states, critic_frames, critic_context, critic_goals
                 ).view(self.cfg.horizon + 1, batch_size, -1)
             self.critic.norm.update(critic_input)
             with torch.no_grad():

@@ -11,11 +11,11 @@ from unisupermimic.rl.algos.supermimic.geometry import mat_to_quat
 from unisupermimic.rl.contracts.supermimic import SuperMimicMdpProtocol
 from unisupermimic.tasks.motion_tracking.g1.supermimic.kinematics import G1Kinematics
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import (
+    CRITIC_EXTRA,
     GOAL_FRAME_DIM,
     INV_DIM,
     MAX_STEP_REWARD,
     MDP,
-    WM_GOAL_FRAME_DIM,
     RewardCfg,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import CONTROL_DT, MotionLib
@@ -243,7 +243,7 @@ def test_observation_context_critic_and_clip_queries(library) -> None:
     normalized = mdp.normalize_context(context)
     torch.testing.assert_close(normalized[0], torch.cat((torch.zeros(1), torch.ones(32))))
     critic = mdp.critic_features(state, frames, normalized)
-    assert critic.shape == (2, INV_DIM + WM_GOAL_FRAME_DIM * mdp.goal_frames + mdp.context_dim)
+    assert critic.shape == (2, INV_DIM + CRITIC_EXTRA)
 
     query_frames = torch.tensor([0, 50, 100, 102, 108])
     info = mdp.clip_info(query_frames)

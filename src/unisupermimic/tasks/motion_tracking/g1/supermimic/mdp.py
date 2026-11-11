@@ -32,6 +32,7 @@ GOAL_FRAME_DIM = 2 * NUM_J + 6
 WM_GOAL_FRAME_DIM = 2 * NUM_J + 3 + 6
 XI_DIM = 33
 INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
+CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
 
 # Noise half-widths match upstream's proprio spec: gravity 0.05, ang_vel 0.2,
 # joint_pos 0.01, joint_vel 0.5, actions 0.
@@ -294,20 +295,35 @@ class MDP:
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the upstream-aligned privileged critic input.
-
-        Layout ``rep_state || wm_goal || sim_ctx``: the invariant state
-        features, the full goal window (joint-target content plus the anchor's
-        relative position and orientation), and the normalized sim context —
-        mirroring the original critic observation group.
-        """
-        content, rel_pos, rel_ori = self._goal_parts(state, frames, self.goal_frames)
+        """Ablation: pre-alignment critic features (invariant state, goal
+        errors, and normalized simulation context), without the goal window."""
+        motion = self.motion
+        position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
+        heading_t = yaw_mat(rotation).transpose(-1, -2)
+        ref_p, ref_R, _, _, ref_q, _ = motion.ref_state(frames)
+        body_p = self.kin.forward(
+            position,
+            rotation,
+            linear_velocity,
+            angular_velocity,
+            joint_pos,
+            joint_vel,
+        )[0]
+        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
+        anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
+        ref_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), motion.body_state(frames)[0] - ref_p.unsqueeze(-2)
+        )
+        body_error = matvec(heading_t.unsqueeze(-3), ref_body_p - body_p).flatten(-2)
+        root_error = matvec(heading_t, ref_p - position)
+        relative_rotation = mat_to_6d(matmul(rotation.transpose(-1, -2), ref_R))
         return torch.cat(
             (
                 invariant_features(state),
-                content,
-                rel_pos,
-                rel_ori,
+                ref_q - joint_pos,
+                body_error,
+                root_error,
+                relative_rotation,
                 normalized_context,
             ),
             -1,
