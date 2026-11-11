@@ -200,25 +200,16 @@ def test_compact_library_matches_full_motion(library, tmp_path) -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_goal_window_clamps_and_matches_upstream_layout(library) -> None:
+def test_goal_window_clamps_at_clip_boundaries(library) -> None:
     _, motion, mdp = library
     frames = torch.tensor([100, 105])
-    window = motion.goal_indices(frames, 4)
-    assert window.tolist() == [[100, 101, 101, 101], [105, 108, 108, 108]]
-
+    future = motion.future_frames(frames, 4)
+    assert future.tolist() == [[101, 101, 101, 101], [106, 107, 108, 108]]
     state = motion.ref_state(frames)
     goal = mdp.goal(state, frames, 4)
     assert goal.shape == (2, 4 * GOAL_FRAME_DIM)
-    # Content is raw joint targets per frame: [q(29), qd(29)].
-    torch.testing.assert_close(goal[0, :29], motion.q[100])
-    torch.testing.assert_close(goal[0, 29:58], motion.qd[100])
-    # Anchor orientation relative to the current root is identity for the
-    # reference state itself, in rot6d form per frame.
-    torch.testing.assert_close(
-        goal[:, 232:238],
-        torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).expand(2, 6),
-    )
-    torch.testing.assert_close(goal[1, 238:244], goal[1, 244:250])
+    torch.testing.assert_close(goal[0, :3], torch.tensor([0.02, 0.002, 0.0]))
+    torch.testing.assert_close(goal[0, 3:6], goal[0, 76:79])
 
 
 def test_observation_context_critic_and_clip_queries(library) -> None:

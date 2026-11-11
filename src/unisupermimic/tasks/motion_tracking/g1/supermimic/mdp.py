@@ -26,10 +26,9 @@ NUM_J = 29
 # Upstream-aligned sensor proprio: [gravity_b(3), base_ang_vel(3),
 # joint_pos_rel(N), joint_vel(N), last_action(N)].
 OBS_DIM = 3 + 3 + NUM_J + NUM_J + NUM_J
-# Actor goal per frame: [joint_pos(N), joint_vel(N)] content plus the anchor's
-# relative rot6d (6). The critic's wm goal additionally carries rel_pos(3).
-GOAL_FRAME_DIM = 2 * NUM_J + 6
-WM_GOAL_FRAME_DIM = 2 * NUM_J + 3 + 6
+# Ablation: pre-alignment stride-1 heading-frame goal features per frame.
+GOAL_FRAME_DIM = 73
+WM_GOAL_FRAME_DIM = 73
 XI_DIM = 33
 INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 
@@ -148,21 +147,9 @@ class MDP:
         return obs + (2 * torch.rand_like(obs) - 1) * self.obs_noise
 
     def goal(self, state: State, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Actor goal: joint-target window plus anchor orientations relative to the root."""
-        content, _, rel_ori = self._goal_parts(state, frames, num_frames)
-        return torch.cat((content, rel_ori), -1)
-
-    def _goal_parts(
-        self, state: State, frames: torch.Tensor, num_frames: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(content, rel_pos_b, rel_ori)`` of the goal window vs. the current root."""
-        position, rotation = state[0], state[1]
-        target_pos, target_rot = self.motion.goal_anchor(frames, num_frames)
-        rotation_t = rotation.unsqueeze(-3)
-        rel_pos = matvec(rotation_t, target_pos - position.unsqueeze(-2)).flatten(-2)
-        rel_ori = mat_to_6d(matmul(rotation_t, target_rot)).flatten(-2)
-        content = self.motion.goal_content(frames, num_frames)
-        return content, rel_pos, rel_ori
+        """Ablation: pre-alignment goal window (state-independent)."""
+        del state
+        return self.motion.goal(frames, num_frames)
 
     @overload
     def reward(
@@ -294,20 +281,16 @@ class MDP:
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the upstream-aligned privileged critic input.
+        """Return the privileged critic input: ``rep_state || goal || sim_ctx``.
 
-        Layout ``rep_state || wm_goal || sim_ctx``: the invariant state
-        features, the full goal window (joint-target content plus the anchor's
-        relative position and orientation), and the normalized sim context —
-        mirroring the original critic observation group.
+        Ablation: the goal block uses the pre-alignment stride-1 heading-frame
+        window instead of the upstream anchor window.
         """
-        content, rel_pos, rel_ori = self._goal_parts(state, frames, self.goal_frames)
+        goal = self.motion.goal(frames, self.goal_frames)
         return torch.cat(
             (
                 invariant_features(state),
-                content,
-                rel_pos,
-                rel_ori,
+                goal,
                 normalized_context,
             ),
             -1,
