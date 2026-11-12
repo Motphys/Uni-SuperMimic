@@ -11,10 +11,11 @@ from unisupermimic.rl.algos.supermimic.geometry import mat_to_quat
 from unisupermimic.rl.contracts.supermimic import SuperMimicMdpProtocol
 from unisupermimic.tasks.motion_tracking.g1.supermimic.kinematics import G1Kinematics
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import (
-    CRITIC_EXTRA,
+    GOAL_FRAME_DIM,
     INV_DIM,
     MAX_STEP_REWARD,
     MDP,
+    WM_GOAL_FRAME_DIM,
     RewardCfg,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import CONTROL_DT, MotionLib
@@ -171,16 +172,16 @@ def test_compact_library_matches_full_motion(library, tmp_path) -> None:
     compact = MotionLib([str(path)], kin, "cpu")
     compact_mdp = MDP(kin, compact, mdp.default_q)
     frames = torch.tensor([0, 49, 100, 105])
+    state = motion.ref_state(frames)
 
     assert compact_motion_clip_count(str(path)) == 2
     assert compact.num_bins == motion.num_bins
     assert compact.frame_bin.tolist() == motion.frame_bin.tolist()
-    torch.testing.assert_close(compact.goal(frames, 4), motion.goal(frames, 4))
+    torch.testing.assert_close(compact_mdp.goal(state, frames, 4), mdp.goal(state, frames, 4))
     for actual, expected in zip(compact.body_state(frames), motion.body_state(frames)):
         torch.testing.assert_close(actual, expected)
     for actual, expected in zip(compact.ref_state(frames), motion.ref_state(frames)):
         torch.testing.assert_close(actual, expected)
-    state = motion.ref_state(frames)
     action = torch.zeros((len(frames), 29))
     context = torch.zeros((len(frames), 33))
     torch.testing.assert_close(
@@ -199,36 +200,30 @@ def test_compact_library_matches_full_motion(library, tmp_path) -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_future_goal_clamps_at_clip_boundaries(library) -> None:
+def test_goal_window_clamps_at_clip_boundaries(library) -> None:
     _, motion, mdp = library
     frames = torch.tensor([100, 105])
     future = motion.future_frames(frames, 4)
     assert future.tolist() == [[101, 101, 101, 101], [106, 107, 108, 108]]
-    goal = mdp.goal(frames, 4)
-    assert goal.shape == (2, 4 * mdp.goal_frame_dim)
+    state = motion.ref_state(frames)
+    goal = mdp.goal(state, frames, 4)
+    assert goal.shape == (2, 4 * GOAL_FRAME_DIM)
     torch.testing.assert_close(goal[0, :3], torch.tensor([0.02, 0.002, 0.0]))
     torch.testing.assert_close(goal[0, 3:6], goal[0, 76:79])
-
-    first_goal = motion.goal(torch.tensor([0]), 1)
-    assert first_goal.shape == (1, 73)
-    torch.testing.assert_close(first_goal[0, :3], torch.tensor([0.02, 0.002, 0.0]))
-    torch.testing.assert_close(first_goal[0, 9:12], torch.tensor([1.0, 0.1, 0.0]))
 
 
 def test_observation_context_critic_and_clip_queries(library) -> None:
     _, motion, mdp = library
     assert isinstance(mdp, SuperMimicMdpProtocol)
-    assert (mdp.num_joints, mdp.obs_dim, mdp.context_dim) == (29, 99, 33)
+    assert (mdp.num_joints, mdp.obs_dim, mdp.context_dim) == (29, 93, 33)
     frames = torch.tensor([0, 102])
     state = motion.ref_state(frames)
     previous_action = torch.zeros(2, 29)
     context = torch.zeros(2, 33)
     obs = mdp.obs(state, previous_action, context, frames)
-    assert obs.shape == (2, 99)
-    torch.testing.assert_close(obs[:, :29], torch.zeros(2, 29))
-    torch.testing.assert_close(
-        obs[:, -6:], torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).expand(2, 6)
-    )
+    assert obs.shape == (2, 93)
+    torch.testing.assert_close(obs[:, :3], torch.tensor([0.0, 0.0, -1.0]).expand(2, 3))
+    torch.testing.assert_close(obs[:, 6:35], torch.zeros(2, 29), rtol=0, atol=1e-6)
     noisy = mdp.add_noise(obs)
     assert noisy.shape == obs.shape
     torch.testing.assert_close(noisy[:, 64:93], previous_action)
@@ -239,7 +234,7 @@ def test_observation_context_critic_and_clip_queries(library) -> None:
     normalized = mdp.normalize_context(context)
     torch.testing.assert_close(normalized[0], torch.cat((torch.zeros(1), torch.ones(32))))
     critic = mdp.critic_features(state, frames, normalized)
-    assert critic.shape == (2, INV_DIM + CRITIC_EXTRA)
+    assert critic.shape == (2, INV_DIM + WM_GOAL_FRAME_DIM * mdp.goal_frames + mdp.context_dim)
 
     query_frames = torch.tensor([0, 50, 100, 102, 108])
     info = mdp.clip_info(query_frames)
@@ -263,14 +258,20 @@ def test_observation_supports_bptt_history(library) -> None:
 
     obs = mdp.obs(state, previous_action, context, frames)
 
-    assert obs.shape == (2, 3, 99)
-    torch.testing.assert_close(obs[..., :29], state[4] - mdp.default_q)
+    assert obs.shape == (2, 3, 93)
+    torch.testing.assert_close(obs[..., 6:35], state[4] - mdp.default_q)
 
 
 def test_mdp_rejects_batched_default_joint_positions(library) -> None:
     kin, motion, _ = library
     with pytest.raises(ValueError, match="default_q must have shape"):
         MDP(kin, motion, torch.zeros(2, 29))
+
+
+def test_mdp_rejects_invalid_goal_frame_count(library) -> None:
+    kin, motion, _ = library
+    with pytest.raises(ValueError, match="goal_frames must be positive"):
+        MDP(kin, motion, torch.zeros(29), goal_frames=0)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
@@ -291,9 +292,12 @@ def test_mdp_to_copies_tensors_without_touching_original(library) -> None:
     assert mdp.motion.root_p.device.type == "cpu"
 
     frames = torch.tensor([0, 51, 102, 108], device="mps")
-    goal = moved.goal(frames, 2)
+    reference_state = moved.motion.ref_state(frames)
+    goal = moved.goal(reference_state, frames, 2)
     assert goal.device.type == "mps"
-    torch.testing.assert_close(goal.cpu(), mdp.goal(frames.cpu(), 2))
+    torch.testing.assert_close(
+        goal.cpu(), mdp.goal(mdp.motion.ref_state(frames.cpu()), frames.cpu(), 2)
+    )
     state = moved.motion.ref_state(frames)
     zeros = torch.zeros(4, 29, device="mps")
     reward = moved.reward(state, frames, zeros, zeros)

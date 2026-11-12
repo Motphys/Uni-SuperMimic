@@ -116,6 +116,11 @@ def main(cfg: DictConfig) -> None:
     ensure_registries()
     if float(cfg.algo.gamma) != float(cfg.env.commands.motion.gamma):
         raise ValueError("SuperMimic requires algo.gamma == env.commands.motion.gamma")
+    if int(cfg.algo.goal_frames) != int(cfg.env.commands.motion.goal_frames):
+        raise ValueError(
+            "SuperMimic requires algo.goal_frames == env.commands.motion.goal_frames "
+            "(the critic goal window is sized by the command)"
+        )
     seed_info = apply_configured_training_seed(cfg, torch_runtime=True, cuda=True)
     device = get_default_device()
     bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)

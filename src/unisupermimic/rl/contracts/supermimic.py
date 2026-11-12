@@ -39,7 +39,12 @@ class SuperMimicMdpProtocol(Protocol):
 
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor: ...
 
-    def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor: ...
+    def goal(
+        self,
+        state: State,
+        frames: torch.Tensor,
+        num_frames: int,
+    ) -> torch.Tensor: ...
 
     def reward(
         self,

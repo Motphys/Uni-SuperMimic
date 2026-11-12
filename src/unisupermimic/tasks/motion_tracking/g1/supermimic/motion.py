@@ -287,12 +287,6 @@ class MotionLib:
         new.kin = self.kin.to(device)
         return new
 
-    def future_frames(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Return frames+1 through frames+K, clamped at each clip's last frame."""
-        end = self.clip_end[self.clip_id[frames]]
-        future = frames.unsqueeze(-1) + torch.arange(1, num_frames + 1, device=frames.device)
-        return torch.minimum(future, end.unsqueeze(-1))
-
     def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Build future reference features in the current reference heading frame."""
         future = self.future_frames(frames, num_frames)
@@ -322,6 +316,12 @@ class MotionLib:
             (position_delta, rotation, root_v_local, root_w_local, q, qd * 0.1), -1
         )
         return features.reshape(frames.shape[0], -1)
+
+    def future_frames(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Return frames+1 through frames+K, clamped at each clip's last frame."""
+        end = self.clip_end[self.clip_id[frames]]
+        future = frames.unsqueeze(-1) + torch.arange(1, num_frames + 1, device=frames.device)
+        return torch.minimum(future, end.unsqueeze(-1))
 
     def ref_state(self, frames: torch.Tensor) -> State:
         if self.compact:

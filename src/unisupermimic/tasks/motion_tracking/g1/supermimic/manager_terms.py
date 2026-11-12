@@ -240,6 +240,7 @@ class SuperMimicCommand(CommandTerm):
                 speed_scale=cfg.speed_scale,
                 speed_bodies=cfg.speed_bodies,
             ),
+            goal_frames=cfg.goal_frames,
         )
         self.gamma = float(cfg.gamma)
         self.eval_mode = cfg.eval_mode
@@ -326,7 +327,7 @@ class SuperMimicCommand(CommandTerm):
         return self.mdp.obs(self.state(), self.a_prev, self.xi, self.f)
 
     def goal(self, num_frames: int) -> torch.Tensor:
-        return self.mdp.goal(self.f, num_frames)
+        return self.mdp.goal(self.state(), self.f, num_frames)
 
     def request_frames(self, frames: torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
         """Set frames for the next full or partial reset."""
