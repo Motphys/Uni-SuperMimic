@@ -71,7 +71,8 @@ def test_rollout_qpos_trims_continuous_rollout(monkeypatch) -> None:
         def obs(self, state, previous_action, context, frames):
             return torch.zeros(frames.shape[0], 1)
 
-        def goal(self, frames, num_frames):
+        def goal(self, state, frames, num_frames):
+            del state
             return torch.zeros(frames.shape[0], num_frames)
 
     class FakeEnv:

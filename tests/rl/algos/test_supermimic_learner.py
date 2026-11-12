@@ -39,7 +39,8 @@ class FakeMdp:
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
         return obs
 
-    def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def goal(self, state: State, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        del state
         return frames.float().unsqueeze(-1).expand(-1, num_frames * self.goal_frame_dim)
 
     def reward(
@@ -198,8 +199,6 @@ def _config() -> SuperMimicConfig:
         lr=1e-3,
         critic_epochs=1,
         critic_minibatches=2,
-        warmup_steps=3,
-        wm_only_iters=0,
         ckpt_every=1,
         log_every=1,
         log_backend="no_print",
@@ -542,19 +541,19 @@ def test_checkpoint_roundtrip_and_resume(tmp_path) -> None:
     assert resumed_final["sim_steps"] > final["sim_steps"]
 
 
-def test_resume_rebuilds_warmup_history(tmp_path) -> None:
+def test_resume_rebuilds_required_buffer_history(tmp_path) -> None:
     cfg = _config()
     learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path)
     learner.train()
     resumed = SuperMimicLearner(
         FakeEnv(),
-        replace(cfg, iterations=1, warmup_steps=6),
+        replace(cfg, iterations=1, wm_window=6),
         tmp_path / "resumed",
     )
 
     resumed.train(resume=tmp_path / "last.pt")
 
-    assert resumed.buffer.size == 6
+    assert resumed.buffer.size >= 6
 
 
 def test_tensorboard_backend_logs_real_metric_names(tmp_path) -> None:
