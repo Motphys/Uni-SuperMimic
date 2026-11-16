@@ -143,7 +143,9 @@ def evaluate(
             history = obs.unsqueeze(1).repeat(1, hist, 1)
         else:
             history = torch.cat((history[:, 1:], obs.unsqueeze(1)), dim=1)
-        goal = mdp.goal(current["f"], goal_frames).to(inference_device)
+        goal = mdp.goal(unflatten_state(current["s"]), current["f"], goal_frames).to(
+            inference_device
+        )
         action = policy(history, goal)
         state = env.step(action.to(env.device))
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
@@ -266,7 +268,9 @@ class SuperMimicPlaybackSession:
             self.history = obs.unsqueeze(1).repeat(1, self.hist, 1)
         else:
             self.history = torch.cat((self.history[:, 1:], obs.unsqueeze(1)), dim=1)
-        goal = self.mdp.goal(current["f"], self.goal_frames).to(self.inference_device)
+        goal = self.mdp.goal(unflatten_state(current["s"]), current["f"], self.goal_frames).to(
+            self.inference_device
+        )
         action = self.policy(self.history, goal)
         state = self.env.step(action.to(self.env.device))
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]

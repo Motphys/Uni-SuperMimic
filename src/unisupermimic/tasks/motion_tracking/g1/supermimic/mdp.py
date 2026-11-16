@@ -23,30 +23,26 @@ from .motion import CONTROL_DT, MotionLib
 
 STATE_DIM = 71
 NUM_J = 29
-OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
+# Upstream-aligned sensor proprio: [gravity_b(3), base_ang_vel(3),
+# joint_pos_rel(N), joint_vel(N), last_action(N)].
+OBS_DIM = 3 + 3 + NUM_J + NUM_J + NUM_J
+# Local goal encoding (kept): dense stride-1 window of heading-frame features —
+# root position delta, rot6d, local velocities, and joint targets per frame.
+# The same per-frame width feeds the critic's goal block.
 GOAL_FRAME_DIM = 73
+WM_GOAL_FRAME_DIM = 73
 XI_DIM = 33
 INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
-CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
 
+# Noise half-widths match upstream's proprio spec: gravity 0.05, ang_vel 0.2,
+# joint_pos 0.01, joint_vel 0.5, actions 0.
 OBS_NOISE = torch.cat(
     (
+        torch.full((3,), 0.05),
+        torch.full((3,), 0.05),
         torch.full((29,), 0.01),
         torch.full((29,), 0.5),
-        torch.full((3,), 0.2),
-        torch.full((3,), 0.05),
         torch.zeros(29),
-        torch.full((6,), 0.05),
-    )
-)
-OBS_SCALE = torch.cat(
-    (
-        torch.ones(29),
-        torch.full((29,), 0.1),
-        torch.full((3,), 0.25),
-        torch.ones(3),
-        torch.ones(29),
-        torch.ones(6),
     )
 )
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
@@ -90,6 +86,7 @@ class MDP:
         motion: MotionLib,
         default_q: torch.Tensor,
         cfg: RewardCfg | None = None,
+        goal_frames: int = 10,
     ):
         if default_q.shape != (NUM_J,):
             raise ValueError(
@@ -98,6 +95,9 @@ class MDP:
         self.kin = kin
         self.motion = motion
         self.cfg = RewardCfg() if cfg is None else cfg
+        if isinstance(goal_frames, bool) or goal_frames <= 0:
+            raise ValueError(f"goal_frames must be positive, got {goal_frames}")
+        self.goal_frames = goal_frames
         self.default_q = default_q
         middle = (kin.q_lo + kin.q_hi) / 2
         half_range = (kin.q_hi - kin.q_lo) / 2
@@ -105,7 +105,6 @@ class MDP:
         self.soft_hi = middle + half_range * self.cfg.soft_limit_factor
         device = default_q.device
         self.obs_noise = OBS_NOISE.to(device)
-        self.obs_scale = OBS_SCALE.to(device)
 
     def to(self, device: str | torch.device) -> MDP:
         """Return a copy on ``device``; the original instance is left untouched."""
@@ -115,7 +114,7 @@ class MDP:
         new = copy.copy(self)
         new.kin = self.kin.to(device)
         new.motion = self.motion.to(device)
-        for name in ("default_q", "soft_lo", "soft_hi", "obs_noise", "obs_scale"):
+        for name in ("default_q", "soft_lo", "soft_hi", "obs_noise"):
             setattr(new, name, getattr(self, name).to(device))
         return new
 
@@ -126,20 +125,22 @@ class MDP:
         context: torch.Tensor,
         frames: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the 99D noise-free proprioceptive observation."""
+        """Return the upstream-aligned 93D noise-free sensor observation.
+
+        Layout: ``[projected_gravity(3), base_ang_vel(3), joint_pos_rel(N),
+        joint_vel(N), last_action(N)]`` — the same channel order and widths as
+        the original implementation's proprio group.
+        """
         _, rotation, _, angular_velocity, joint_pos, joint_vel = state
         rotation_t = rotation.transpose(-1, -2)
-        default_offset = context[..., 1:30]
         gravity = -rotation[..., 2, :]
-        relative_rotation = mat_to_6d(matmul(rotation_t, self.motion.ref_state(frames)[1]))
         return torch.cat(
             (
-                joint_pos - self.default_q - default_offset,
-                joint_vel,
-                matvec(rotation_t, angular_velocity),
                 gravity,
+                matvec(rotation_t, angular_velocity),
+                joint_pos - self.default_q,
+                joint_vel,
                 previous_action,
-                relative_rotation,
             ),
             -1,
         )
@@ -147,7 +148,9 @@ class MDP:
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
         return obs + (2 * torch.rand_like(obs) - 1) * self.obs_noise
 
-    def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def goal(self, state: State, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Return the local goal window (state-independent, heading-frame)."""
+        del state
         return self.motion.goal(frames, num_frames)
 
     @overload
@@ -280,34 +283,16 @@ class MDP:
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
     ) -> torch.Tensor:
-        """Return invariant state, goal errors, and normalized simulation context."""
-        motion = self.motion
-        position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
-        heading_t = yaw_mat(rotation).transpose(-1, -2)
-        ref_p, ref_R, _, _, ref_q, _ = motion.ref_state(frames)
-        body_p = self.kin.forward(
-            position,
-            rotation,
-            linear_velocity,
-            angular_velocity,
-            joint_pos,
-            joint_vel,
-        )[0]
-        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
-        anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
-        ref_body_p = anchor.unsqueeze(-2) + matvec(
-            delta_rotation.unsqueeze(-3), motion.body_state(frames)[0] - ref_p.unsqueeze(-2)
-        )
-        body_error = matvec(heading_t.unsqueeze(-3), ref_body_p - body_p).flatten(-2)
-        root_error = matvec(heading_t, ref_p - position)
-        relative_rotation = mat_to_6d(matmul(rotation.transpose(-1, -2), ref_R))
+        """Return the privileged critic input: ``rep_state || goal || sim_ctx``.
+
+        The goal block is the same dense local window the policy consumes, so
+        actor and critic share one goal representation.
+        """
+        goal = self.motion.goal(frames, self.goal_frames)
         return torch.cat(
             (
                 invariant_features(state),
-                ref_q - joint_pos,
-                body_error,
-                root_error,
-                relative_rotation,
+                goal,
                 normalized_context,
             ),
             -1,

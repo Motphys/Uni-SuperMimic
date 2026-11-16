@@ -58,8 +58,6 @@ class SuperMimicConfig:
     critic_epochs: int = 5
     critic_minibatches: int = 4
     no_critic: bool = False
-    warmup_steps: int = 64
-    wm_only_iters: int = 500
     lr_decay_iters: int = 250_000
     ckpt_every: int = 2000
     log_every: int = 50
@@ -294,7 +292,7 @@ class SuperMimicLearner:
                 info["f"],
                 self.mdp.normalize_context(info["xi"]),
             )
-        return int(features.shape[-1] + self.mdp.goal_frame_dim * self.cfg.goal_frames)
+        return int(features.shape[-1])
 
     def _wm_rollout(
         self, states: torch.Tensor, actions: torch.Tensor, contexts: torch.Tensor
@@ -340,7 +338,7 @@ class SuperMimicLearner:
         next_frames = frames + 1
         obs = self.mdp.add_noise(self.mdp.obs(next_state, action, context, next_frames))
         next_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
-        next_goal = self.mdp.goal(next_frames, self.cfg.goal_frames)
+        next_goal = self.mdp.goal(next_state, next_frames, self.cfg.goal_frames)
         return next_state, action, next_hist, next_frames, next_goal
 
     def _reward_term(
@@ -359,9 +357,8 @@ class SuperMimicLearner:
         state: State,
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
-        goal: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.cat((self.mdp.critic_features(state, frames, normalized_context), goal), -1)
+        return self.mdp.critic_features(state, frames, normalized_context)
 
     def _batched_reward_term(
         self,
@@ -391,10 +388,9 @@ class SuperMimicLearner:
         state: State,
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
-        goal: torch.Tensor,
     ) -> torch.Tensor:
         if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
-            return self._critic_input_fn(state, frames, normalized_context, goal)
+            return self._critic_input_fn(state, frames, normalized_context)
         parts = []
         for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
             stop = start + _SAFE_GEOMETRY_BATCH
@@ -403,7 +399,6 @@ class SuperMimicLearner:
                     cast(State, tuple(item[start:stop] for item in state)),
                     frames[start:stop],
                     normalized_context[start:stop],
-                    goal[start:stop],
                 )
             )
         return torch.cat(parts)
@@ -419,7 +414,7 @@ class SuperMimicLearner:
             self.obs_hist = torch.where(
                 fresh[:, None, None], obs.unsqueeze(1).expand_as(self.obs_hist), shifted
             )
-            goal = self.mdp.goal(info["f"], self.cfg.goal_frames)
+            goal = self.mdp.goal(state, info["f"], self.cfg.goal_frames)
             self.pi.obs_norm.update(obs)
             self.pi.goal_norm.update(goal)
             action = self.pi(self.obs_hist, goal)
@@ -517,10 +512,9 @@ class SuperMimicLearner:
         _set_requires_grad(self.critic, False)
 
         batch_size = self.cfg.pi_batch
-        initial_goal = self.mdp.goal(frames, self.cfg.goal_frames)
-        goal = initial_goal
+        goal = self.mdp.goal(state, frames, self.cfg.goal_frames)
         initial_state = state
-        states, actions, previous_actions, all_frames, goals = [], [], [], [], []
+        states, actions, previous_actions, all_frames = [], [], [], []
         try:
             for _ in range(self.cfg.horizon):
                 previous_actions.append(previous_action)
@@ -536,7 +530,6 @@ class SuperMimicLearner:
                 states.append(state)
                 actions.append(previous_action)
                 all_frames.append(frames)
-                goals.append(goal)
 
             def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
                 return torch.stack(parts).flatten(0, 1)
@@ -560,9 +553,7 @@ class SuperMimicLearner:
             reward_sum = (continuation * rewards).detach().sum(0)
             detached_rewards, detached_dones = rewards.detach(), dones.detach()
             if not self.cfg.no_critic:
-                bootstrap = self.critic(
-                    self._critic_input_fn(state, frames, normalized_context, goal)
-                )
+                bootstrap = self.critic(self._critic_input_fn(state, frames, normalized_context))
                 objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
                     bootstrap * self._v_std + self._v_mean
                 )
@@ -606,16 +597,13 @@ class SuperMimicLearner:
                 critic_frames = torch.cat(
                     (start["f"].unsqueeze(0), torch.stack(all_frames)), 0
                 ).flatten()
-                critic_goals = torch.cat(
-                    (initial_goal.unsqueeze(0), torch.stack(goals)), 0
-                ).flatten(0, 1)
                 critic_context = (
                     normalized_context.unsqueeze(0)
                     .expand(self.cfg.horizon + 1, -1, -1)
                     .flatten(0, 1)
                 )
                 critic_input = self._batched_critic_input(
-                    critic_states, critic_frames, critic_context, critic_goals
+                    critic_states, critic_frames, critic_context
                 ).view(self.cfg.horizon + 1, batch_size, -1)
             self.critic.norm.update(critic_input)
             with torch.no_grad():
@@ -753,7 +741,6 @@ class SuperMimicLearner:
             env_name=type(self.env).__name__,
             backend=self.backend,
             max_iterations=self.cfg.iterations,
-            wm_only_iters=self.cfg.wm_only_iters,
             start_iteration=start_iteration,
             num_envs=self.env.num_envs,
             log_dir=str(self.log_dir),
@@ -761,11 +748,9 @@ class SuperMimicLearner:
         )
         logger.start(status="Warming up...")
         try:
-            if start_iteration == 0:
-                self.collect(self.cfg.warmup_steps)
+            # Match upstream: start training as soon as the buffer holds one
+            # full window; no extra collection warmup or WM-only phase.
             required_steps = max(self.cfg.hist, self.cfg.wm_window)
-            if start_iteration > 0:
-                required_steps = max(required_steps, self.cfg.warmup_steps)
             if self.buffer.size < required_steps:
                 self.collect(required_steps - self.buffer.size)
             logger.log_buffer_fill(self.buffer.size, self.cfg.buffer_steps)
@@ -785,8 +770,6 @@ class SuperMimicLearner:
                 for iteration in range(start_iteration, self.cfg.iterations):
                     if self.cfg.compile and iteration == start_iteration:
                         logger.log_status("Compiling world model (one-off, slow on first run)")
-                    if self.cfg.compile and iteration == self.cfg.wm_only_iters:
-                        logger.log_status("Compiling policy update (one-off, slow on first run)")
                     iteration_start = time.time()
                     learning_rate = self.lr_at(iteration)
                     for optimizer in (self.opt_wm, self.opt_pi, self.opt_v):
@@ -814,33 +797,32 @@ class SuperMimicLearner:
                     imag_rew: float | None = None
                     pi_gradnorm: float | None = None
                     imag_survival: float | None = None
-                    if iteration >= self.cfg.wm_only_iters:
-                        policy_loss, value_loss, imagined_reward, grad_norm, survival = (
-                            self.policy_update()
-                        )
-                        # Fail fast on divergence instead of checkpointing a diverged model.
-                        # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
-                        # handles a non-finite gradient by zeroing it and stepping, so a non-finite
-                        # gradient is not a divergence signal on its own.
-                        for name, metric in (
-                            ("pi_loss", policy_loss),
-                            ("v_loss", value_loss),
-                            ("imag_rew", imagined_reward),
-                        ):
-                            if not torch.isfinite(metric).all():
-                                raise FloatingPointError(
-                                    f"non-finite {name} at iteration {iteration + 1}"
-                                )
-                        aggregate["pi"].append(policy_loss)
-                        aggregate["v"].append(value_loss)
-                        aggregate["ir"].append(imagined_reward)
-                        aggregate["gn"].append(grad_norm)
-                        aggregate["surv"].append(survival)
-                        pi_loss = float(policy_loss)
-                        v_loss = float(value_loss)
-                        imag_rew = float(imagined_reward)
-                        pi_gradnorm = float(grad_norm)
-                        imag_survival = float(survival)
+                    policy_loss, value_loss, imagined_reward, grad_norm, survival = (
+                        self.policy_update()
+                    )
+                    # Fail fast on divergence instead of checkpointing a diverged model.
+                    # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
+                    # handles a non-finite gradient by zeroing it and stepping, so a non-finite
+                    # gradient is not a divergence signal on its own.
+                    for name, metric in (
+                        ("pi_loss", policy_loss),
+                        ("v_loss", value_loss),
+                        ("imag_rew", imagined_reward),
+                    ):
+                        if not torch.isfinite(metric).all():
+                            raise FloatingPointError(
+                                f"non-finite {name} at iteration {iteration + 1}"
+                            )
+                    aggregate["pi"].append(policy_loss)
+                    aggregate["v"].append(value_loss)
+                    aggregate["ir"].append(imagined_reward)
+                    aggregate["gn"].append(grad_norm)
+                    aggregate["surv"].append(survival)
+                    pi_loss = float(policy_loss)
+                    v_loss = float(value_loss)
+                    imag_rew = float(imagined_reward)
+                    pi_gradnorm = float(grad_norm)
+                    imag_survival = float(survival)
                     train_time = time.time() - train_phase_start
                     self.iteration = iteration + 1
                     self.wall_time = time.time() - train_start

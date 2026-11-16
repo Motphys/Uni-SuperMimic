@@ -36,8 +36,6 @@ algo:
   critic_epochs: 5
   critic_minibatches: 4
   no_critic: false
-  warmup_steps: 64
-  wm_only_iters: 500
   lr_decay_iters: 250000
   ckpt_every: 2000
   log_every: 50

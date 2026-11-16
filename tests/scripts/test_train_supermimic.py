@@ -158,6 +158,13 @@ def test_training_rejects_mismatched_mdp_discount() -> None:
         main(cfg)
 
 
+def test_training_rejects_mismatched_goal_window() -> None:
+    cfg = _compose()
+    OmegaConf.update(cfg, "algo.goal_frames", 5)
+    with pytest.raises(ValueError, match="algo.goal_frames == env.commands.motion.goal_frames"):
+        main(cfg)
+
+
 def test_checkpoint_resolver_supports_resume_and_numbered_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
