@@ -1,0 +1,27 @@
+{
+ "layout": "int32 n_cases; per case: int32 clip_idx, int32 frame, q[29] dq[29] gyro[3] quat_wxyz[4] prev_action[29] obs[99] goal[730] action[29] target[29] (little-endian f32)",
+ "clips": [
+  "cellphone_record_stand_idle_R_001__A423",
+  "drinking_standing_mug_R_001__A282",
+  "bow_R_001__A428",
+  "clap_enthusiastic_001__A029",
+  "pels_air_punch_001__A492",
+  "fancy_spin_R_001__A428",
+  "dance_basic_chaines_180_R_001__A306",
+  "dance_basic_chaines_180_R_001__A307",
+  "Loop_Forward_Walk_001__A019",
+  "Relaxed_walk_forward_001__A057",
+  "Neutral_kick_trash_001__A057",
+  "skipping_R_001__A359"
+ ],
+ "clip_idx_-1": "generated static stand clip (STANDBY)",
+ "history": "10 repeats of the same obs row (reset semantics)",
+ "tolerances": {
+  "obs": 0.0001,
+  "goal": 0.0001,
+  "action": 0.001,
+  "target_formula": 1e-05,
+  "target_e2e": 0.001
+ },
+ "n_cases": 97
+}

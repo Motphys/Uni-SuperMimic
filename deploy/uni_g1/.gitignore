@@ -1,0 +1,9 @@
+# generated / local-only artifacts
+assets/models/
+reports/
+cpp/build/
+cpp/.deps/
+__pycache__/
+*.pyc
+assets/clips_bin/
+manifest.json

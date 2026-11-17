@@ -46,9 +46,11 @@ unisupermimic/
 │   ├── scripts/train_supermimic.py # 训练、续训和 eval 入口
 │   ├── conf/supermimic/            # Hydra 配置
 │   ├── data/boneseed.py            # BONES-SEED 下载/转换/过滤/打包命令行入口
+│   ├── deploy/export.py            # checkpoint -> ONNX/deploy_config/goal 表/MJCF
 │   ├── assets/robots/g1/           # G1 MJCF；mesh/URDF 下载后不纳入 git
 │   ├── assets/motions/             # LAFAN1 CSV，下载后不纳入 git
 │   └── sim2sim.py                  # 策略 I/O、网络形状和资产身份校验
+├── deploy/uni_g1/                  # sim2real 参考部署（C++ 控制器、数值门、演示动作）
 ├── docs/assets/                    # 结果曲线、MP4 和 GIF
 ├── tools/prepare_supermimic_assets.py
 ├── tests/
@@ -198,6 +200,12 @@ Muon 使用 `match_rms_adamw` 缩放，因此沿用现有 `algo.lr` 和余弦学
 ## 评估
 
 评估从每段动作的首帧开始，关闭观测/动作噪声，并跑完整个 clip。已结束的环境会被回收给待评估动作；调度器优先启动较长 clip，避免固定 batch 出现长空闲尾巴。独立评估器默认最多使用 16,384 个并行环境，可用 `unisupermimic-eval --num_envs N` 适配较小 GPU。严格 sim2sim 校验会在环境构造前检查策略 I/O、网络形状、运动库和 MJCF 身份。
+
+## Sim2Real 部署
+
+**[deploy/uni_g1](deploy/uni_g1/README_zh.md)（[English](deploy/uni_g1/README.md)）是 Uni-SuperMimic 策略在 Unitree G1（29-DoF）机载 PC2 上的 sim2real 参考部署。**
+
+内含 BONES-SEED 训练的权重（`policy.onnx`）与 12 条演示动作、C++ 控制器（500 Hz lowcmd + 50 Hz ONNX 策略，任意时刻 L2+B 下阻尼的 FSM）、离线数值门（golden 向量对照训练 MDP，上真机前必须 NUMERIC PASS），以及部署等价 sim2sim（Python 参考实现）。指引覆盖从克隆到上机的完整链路：PC2 构建 → 数值门 → 手柄操作（含动作切换与复位）。
 
 独立评估和视频导出入口支持 `--backend mjwarp`、`--backend mujoco`、`--backend motrix`，默认为 mjwarp：
 
