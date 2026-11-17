@@ -2,6 +2,10 @@
 
 [中文](README_zh.md) | English
 
+> ⚠️ **Safety notice / 安全声明**
+> This deployment was developed and validated **only on the author's own Unitree G1 (29-DoF)**. We make **no guarantee** that it reproduces identically on other robots, firmware versions, or hardware variants. Real-robot use is entirely **at your own risk**: always use a gantry and a spotter on first runs, verify `L2+B` damping before anything else, and review every safety monitor in this document before operating.
+> 本部署**仅在作者自己的 Unitree G1（29-DoF）上开发与验证**，**不保证**在其他机器人、固件版本或硬件变体上完全复刻一致。实机使用的一切后果由使用者自行承担：首次使用务必吊挂并有人看护，先验证 `L2+B` 阻尼，操作前完整阅读本文档的安全监视部分。
+
 Reference sim2real deployment of a Uni-SuperMimic BONES-SEED policy on the
 Unitree G1 (29-DoF). Inference chain: IMU/motor state → 99-D observation ×
 10-frame history (frame-major, 990) + clip goal table (730) → ONNX policy
@@ -13,11 +17,11 @@ state; `R1+A` resets to the initial PASSIVE state without restarting.**
 
 ## Supported assets
 
-- **Weight**: `assets/policy.onnx` — Uni-SuperMimic trained on **BONES-SEED**
+- **Weight** (downloaded from [🤗 LeeLeno/uni-supermimic-g1-deploy](https://huggingface.co/datasets/LeeLeno/uni-supermimic-g1-deploy) via `tools/fetch_assets.sh`): `assets/policy.onnx` — Uni-SuperMimic trained on **BONES-SEED**
   (~129k retargeted G1 clips, 12,000 iterations), inputs obs[1,990] +
   goal[1,730], output action[1,29], IR9/opset18 (compatible with the PC2's
   onnxruntime 1.16).
-- **Demo dataset** (`assets/clips/`, 12 BONES-SEED clips, goal tables
+- **Demo dataset** (same HF repo, `assets/clips/`, 12 BONES-SEED clips, goal tables
   bit-identical to the training `MotionLib.goal`):
 
   | # | Clip | Content |
@@ -44,6 +48,7 @@ state; `R1+A` resets to the initial PASSIVE state without restarting.**
 git clone https://github.com/Motphys/Uni-SuperMimic.git
 cd Uni-SuperMimic/deploy/uni_g1
 
+bash tools/fetch_assets.sh              # download policy.onnx + demo clips from Hugging Face
 python3 tools/npz_to_bin.py            # build clips_bin from the demo npz (numpy only)
 cd cpp
 bash scripts/setup_ort.sh              # download ONNX Runtime C++ 1.16.3 (aarch64, online once)

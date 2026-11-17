@@ -2,14 +2,18 @@
 
 [English](README.md) | 中文
 
+> ⚠️ **安全声明 / Safety notice**
+> 本部署**仅在作者自己的 Unitree G1（29-DoF）上开发与验证**，**不保证**在其他机器人、固件版本或硬件变体上完全复刻一致。实机使用的一切后果由使用者自行承担：首次使用务必吊挂并有人看护，先验证 `L2+B` 阻尼，操作前完整阅读本文档的安全监视部分。
+> This deployment was developed and validated **only on the author's own Unitree G1 (29-DoF)**. We make **no guarantee** that it reproduces identically on other robots, firmware versions, or hardware variants. Real-robot use is entirely **at your own risk**: always use a gantry and a spotter on first runs, verify `L2+B` damping before anything else, and review every safety monitor in this document before operating.
+
 Uni-SuperMimic BONES-SEED 策略在 Unitree G1（29-DoF）上的 sim2real 参考部署。推理链路：IMU/电机状态 → 99 维观测 ×10 帧历史（frame-major, 990）+ clip goal 表（730）→ ONNX 策略（ORT C++）→ 29 维关节位置目标 → 低层 PD（500 Hz lowcmd）。与训练端契约 `unisupermimic_v1` 逐项一致。
 
 **任何时候都可以下阻尼：任意状态下按 `L2+B` 立即进入 DAMP（kp=0, kd=3.0）；`R1+A` 复位回初始 PASSIVE，无需重启进程。**
 
 ## 支持的资产
 
-- **权重**：`assets/policy.onnx` — Uni-SuperMimic 在 **BONES-SEED**（约 12.9 万条 G1 重定向 clip，12,000 次迭代）上训练；输入 obs[1,990] + goal[1,730]，输出 action[1,29]，IR9/opset18（兼容 PC2 的 onnxruntime 1.16）。
-- **演示数据集**（`assets/clips/`，12 条 BONES-SEED clip，goal 表与训练 `MotionLib.goal` 逐位一致）：
+- **权重**（由 `tools/fetch_assets.sh` 从 [🤗 LeeLeno/uni-supermimic-g1-deploy](https://huggingface.co/datasets/LeeLeno/uni-supermimic-g1-deploy) 下载）：`assets/policy.onnx` — Uni-SuperMimic 在 **BONES-SEED**（约 12.9 万条 G1 重定向 clip，12,000 次迭代）上训练；输入 obs[1,990] + goal[1,730]，输出 action[1,29]，IR9/opset18（兼容 PC2 的 onnxruntime 1.16）。
+- **演示数据集**（同一 HF 仓库，`assets/clips/`，12 条 BONES-SEED clip，goal 表与训练 `MotionLib.goal` 逐位一致）：
 
   | # | clip | 内容 |
   |---|---|---|
@@ -34,6 +38,7 @@ Uni-SuperMimic BONES-SEED 策略在 Unitree G1（29-DoF）上的 sim2real 参考
 git clone https://github.com/Motphys/Uni-SuperMimic.git
 cd Uni-SuperMimic/deploy/uni_g1
 
+bash tools/fetch_assets.sh              # 从 Hugging Face 下载 policy.onnx 与演示 clip
 python3 tools/npz_to_bin.py            # 由演示 npz 生成 clips_bin（仅需 numpy）
 cd cpp
 bash scripts/setup_ort.sh              # 下载 ONNX Runtime C++ 1.16.3（aarch64，仅首次需联网）
