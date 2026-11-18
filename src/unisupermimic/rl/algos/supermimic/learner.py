@@ -54,7 +54,6 @@ class SuperMimicConfig:
     pi_ema: float = 0.0
     gamma: float = 0.99
     lam: float = 0.95
-    action_noise: float = 0.1
     critic_epochs: int = 5
     critic_minibatches: int = 4
     no_critic: bool = False
@@ -418,7 +417,7 @@ class SuperMimicLearner:
             self.pi.obs_norm.update(obs)
             self.pi.goal_norm.update(goal)
             action = self.pi(self.obs_hist, goal)
-            action = torch.clamp(action + self.cfg.action_noise * torch.randn_like(action), -20, 20)
+            action = torch.clamp(action, -20, 20)
             if self._bridged:
                 step_state = self.env.step(action.to(self.env_device))
             else:
