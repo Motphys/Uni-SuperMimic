@@ -63,6 +63,12 @@ def build_env_override(
     commands["motion"] = motion
     override["commands"] = commands
     override["auto_reset"] = True
+    # Deterministic evaluation keeps the selected-row reset lifecycle: the
+    # fixed-shape autoreset draws RNG every step (steps without a done row
+    # included), which changes the eval reproducibility contract.
+    override["masked_autoreset"] = False
+    override["persistent_step_buffers"] = False
+    override["autoreset_cuda_graph"] = False
     return override
 
 

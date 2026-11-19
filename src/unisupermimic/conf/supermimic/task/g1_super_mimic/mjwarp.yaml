@@ -10,3 +10,12 @@ training:
 env:
   mjwarp_nconmax: 128
   mjwarp_njmax: 500
+  # Fixed-shape, host-sync-free autoreset (unilab 1.5.11 #2605). RNG note:
+  # the reset lifecycle runs every step, so full-width samplers draw RNG on
+  # steps without a done row and same-seed trajectories differ from the
+  # selected-row lifecycle; deterministic evaluation keeps these flags off.
+  # The reset-segment CUDA graph also removes the backend's eager-path
+  # stream sync around DR payload application.
+  masked_autoreset: true
+  persistent_step_buffers: true
+  autoreset_cuda_graph: true

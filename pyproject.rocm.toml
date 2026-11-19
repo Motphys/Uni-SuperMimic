@@ -21,10 +21,13 @@ license-files = ["LICENSE", "NOTICE", "LICENSES/*"]
 authors = [{ name = "UniSuperMimic Authors" }]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "unilab[mujoco,motrix]>=1.5.1",
+    "unilab[mujoco,motrix]>=1.5.11",
     "imageio[ffmpeg]>=2.37",
     "mujoco~=3.11.0",
     "pillow>=10",
+    # Own logger writes TensorBoard events directly; unilab gated its
+    # tensorboard dependency behind the unirl extra in 1.5.11.
+    "tensorboard>=2.21.0",
     # torch and its ROCm triton are direct requirements here (not only via
     # unilab) because uv applies tool.uv.sources to direct dependencies only.
     # triton-rocm supplies the AMD backend; triton supplies the Python core.

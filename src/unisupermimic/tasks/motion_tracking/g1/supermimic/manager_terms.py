@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
+import numpy as np
 import torch
+from unilab.base.reset_selection import ResetSelection, fill_rows_, is_reset_selection
 from unilab.base.reset_selectors import resolve_reset_env_ids
 from unilab.managers import (
     ActionTerm,
@@ -18,6 +20,7 @@ from unilab.managers import (
     ManagerTermBase,
     SceneEntityCfg,
 )
+from unisim.dr.types import RESET_TERM_BODY_IPOS, RESET_TERM_GEOM_FRICTION
 
 from unisupermimic.rl.algos.supermimic.geometry import (
     flatten_state,
@@ -45,10 +48,20 @@ def start_bin_probabilities(
     bin_G: torch.Tensor,
     bin_w_avg: torch.Tensor,
     gamma: float,
+    update: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Update the past-performance EMA and return the exact bin mixture."""
+    """Update the past-performance EMA and return the exact bin mixture.
+
+    ``update`` is a device-side gate for the EMA step: a zero scalar skips the
+    mixture update without any host read of the reset mask, so the fixed-shape
+    reset (which samples every step) keeps per-reset EMA semantics.
+    """
     soft = torch.softmax(-25.0 * bin_G / (MAX_STEP_REWARD / (1.0 - gamma)), dim=0)
-    bin_w_avg.mul_(0.999).add_(0.001 * soft)
+    if update is None:
+        delta = torch.full((), 0.001, device=bin_G.device)
+    else:
+        delta = 0.001 * update.reshape(())
+    bin_w_avg.mul_(1.0 - delta).add_(delta * soft)
     return 0.5 / bin_G.numel() + 0.4 * soft + 0.1 * bin_w_avg / bin_w_avg.sum()
 
 
@@ -59,10 +72,23 @@ def sample_start_frames(
     gamma: float,
     num_samples: int,
     rng: ManagerRng,
+    update: torch.Tensor | None = None,
+    cdf_sampling: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample one-second bins and uniformly sample a frame inside each bin."""
-    probabilities = start_bin_probabilities(bin_G, bin_w_avg, gamma)
-    bins = rng.choice(motion.num_bins, (num_samples,), p=probabilities)
+    """Sample one-second bins and uniformly sample a frame inside each bin.
+
+    ``cdf_sampling`` draws the categorical bin choice through inverse-CDF
+    ``searchsorted`` instead of ``rng.choice``: the choice wrapper validates
+    its probability table with host reads, which the fixed-shape reset
+    (sampling every step) must avoid.
+    """
+    probabilities = start_bin_probabilities(bin_G, bin_w_avg, gamma, update=update)
+    if cdf_sampling:
+        cdf = torch.cumsum(probabilities, dim=0)
+        bins = torch.searchsorted(cdf, rng.random((num_samples,)) * cdf[-1])
+        bins = bins.clamp(max=motion.num_bins - 1)
+    else:
+        bins = rng.choice(motion.num_bins, (num_samples,), p=probabilities)
     start = motion.bin_start[bins]
     end = torch.minimum(start + BIN_FRAMES, motion.clip_end[motion.bin_clip[bins]])
     frames = start + (rng.random((num_samples,)) * (end - start).float()).long()
@@ -79,29 +105,33 @@ def update_start_bin_returns(
     done: torch.Tensor,
     gamma: float,
 ) -> dict[str, torch.Tensor]:
-    """Update completed-episode returns and return done-row logging statistics."""
-    if not bool(done.any()):
-        return {}
-    lengths = ep_step[done].float()
+    """Update completed-episode returns; return full-width masked statistics.
+
+    Sync-free: every reduction is masked and full-width, so the per-step
+    command update never reads the device on the host. Non-done rows carry
+    zero in the returned statistics; consumers aggregate with the done mask.
+    """
+    lengths = ep_step.float().clamp(min=1.0)
     bootstrap = torch.where(
-        hard[done],
+        hard,
         0.0,
-        gamma**lengths * ep_ret[done] / lengths / (1.0 - gamma),
+        gamma**lengths * ep_ret / lengths / (1.0 - gamma),
     )
-    returns = ep_disc_ret[done] + bootstrap
-    bins = start_bin[done]
+    returns = (ep_disc_ret + bootstrap) * done
     # ``index_put_`` without accumulate is order-dependent when several episodes
     # end in the same bin (last write wins), so average each bin's returns first
     # and apply a single EMA update per bin.
-    unique_bins, inverse, counts = torch.unique(bins, return_inverse=True, return_counts=True)
-    summed_returns = torch.zeros_like(unique_bins, dtype=returns.dtype).scatter_add_(
-        0, inverse, returns
-    )
-    mean_returns = summed_returns / counts
-    bin_G[unique_bins] = 0.8 * bin_G[unique_bins] + 0.2 * mean_returns
+    num_bins = bin_G.numel()
+    summed_returns = torch.zeros(num_bins, dtype=returns.dtype, device=returns.device)
+    summed_returns.scatter_add_(0, start_bin, returns)
+    counts = torch.zeros(num_bins, dtype=returns.dtype, device=returns.device)
+    counts.scatter_add_(0, start_bin, done.float())
+    touched = counts > 0
+    mean_returns = summed_returns / counts.clamp(min=1.0)
+    bin_G.copy_(torch.where(touched, 0.8 * bin_G + 0.2 * mean_returns, bin_G))
     return {
-        "ep_len": lengths,
-        "ep_ret_norm": ep_ret[done] / (lengths * MAX_STEP_REWARD),
+        "ep_len": ep_step.float() * done,
+        "ep_ret_norm": ep_ret / (lengths * MAX_STEP_REWARD) * done,
     }
 
 
@@ -182,6 +212,11 @@ class SuperMimicCommandCfg(CommandTermCfg):
     motion_files: list[str]
     mjcf_path: str
     eval_mode: bool = False
+    # torch.compile the hot step-path MDP functions (obs/goal/reward/
+    # termination/state/transition materialization). The collection step is
+    # launch-bound, so fusing these elementwise chains removes many tiny
+    # kernels per step.
+    compile: bool = False
     gamma: float = 0.99
     src_fps: float = 30.0
     reset_noise: bool = True
@@ -262,6 +297,41 @@ class SuperMimicCommand(CommandTerm):
         self._requested_frames: torch.Tensor | None = None
         self._requested_env_ids: torch.Tensor | None = None
         self._read_phase_bound = False
+        # Reset-noise bound tensors, built once: constructing them from Python
+        # lists inside reset() would stage a host-to-device copy per call.
+        self._noise_bounds = tuple(
+            (
+                torch.tensor(lower, dtype=torch.float32, device=device),
+                torch.tensor(upper, dtype=torch.float32, device=device),
+            )
+            for lower, upper in (
+                ((-0.05, -0.05, -0.01), (0.05, 0.05, 0.01)),
+                ((-0.1, -0.1, -0.2), (0.1, 0.1, 0.2)),
+                ((-0.5, -0.5, -0.2), (0.5, 0.5, 0.2)),
+                ((-0.52, -0.52, -0.78), (0.52, 0.52, 0.78)),
+            )
+        )
+        if cfg.compile:
+            self._compile_step_path()
+
+    def _compile_step_path(self) -> None:
+        """Compile the per-step pure-tensor functions on this term and MDP.
+
+        These run inside the Manager compute/read phases (outside the
+        reset-segment CUDA graph body), where fusion removes the most tiny
+        eager kernels per step. Only step-path methods are compiled: the
+        reset path stays eager so the reset-segment capture never meets an
+        inductor recompile.
+        """
+        for owner, names in (
+            (
+                self.mdp,
+                ("obs", "goal", "reward", "termination", "add_noise", "normalize_context"),
+            ),
+            (self, ("state",)),
+        ):
+            for name in names:
+                setattr(owner, name, torch.compile(getattr(owner, name)))
 
     @staticmethod
     def _validate_cfg(cfg: SuperMimicCommandCfg) -> None:
@@ -277,6 +347,8 @@ class SuperMimicCommand(CommandTerm):
             raise ValueError("SuperMimicCommandCfg mjcf_path must be non-empty")
         if not isinstance(cfg.eval_mode, bool) or not isinstance(cfg.reset_noise, bool):
             raise TypeError("SuperMimicCommandCfg eval_mode and reset_noise must be bool")
+        if not isinstance(cfg.compile, bool):
+            raise TypeError("SuperMimicCommandCfg compile must be bool")
         if isinstance(cfg.gamma, bool) or not isinstance(cfg.gamma, (int, float)):
             raise TypeError("SuperMimicCommandCfg gamma must be a real number")
         if not math.isfinite(cfg.gamma) or not 0.0 < cfg.gamma < 1.0:
@@ -356,8 +428,13 @@ class SuperMimicCommand(CommandTerm):
         self._requested_frames = requested
         self._requested_env_ids = env_ids
 
+    supports_reset_selection: ClassVar[bool] = True
+
     def reset(
-        self, env_ids: torch.Tensor | slice | None = None, *, publish_metrics: bool = True
+        self,
+        env_ids: torch.Tensor | slice | ResetSelection | None = None,
+        *,
+        publish_metrics: bool = True,
     ) -> dict[str, float]:
         del publish_metrics
         ids = resolve_reset_env_ids(
@@ -366,19 +443,41 @@ class SuperMimicCommand(CommandTerm):
             device=self._device,
             owner="SuperMimicCommand.reset",
         )
+        fixed_shape = is_reset_selection(ids)
         reset_mask = self._reset_mask_buffer.resolve(ids, owner="SuperMimicCommand.reset")
-        if ids.numel() == 0:
+        if isinstance(ids, torch.Tensor) and ids.numel() == 0:
             return {}
         if self._requested_frames is None:
-            frames, bins = sample_start_frames(
-                self.motion,
-                self.bin_G,
-                self.bin_w_avg,
-                self.gamma,
-                ids.numel(),
-                self._rng,
-            )
+            if fixed_shape:
+                # Fixed-shape dispatch: sample full-width every step (an
+                # all-false mask is a no-op through the masked writes) and gate
+                # the past-performance EMA device-side, so the mixture keeps
+                # per-reset semantics without any host read of the mask.
+                frames, bins = sample_start_frames(
+                    self.motion,
+                    self.bin_G,
+                    self.bin_w_avg,
+                    self.gamma,
+                    self.num_envs,
+                    self._rng,
+                    update=reset_mask.any(),
+                    cdf_sampling=True,
+                )
+                full_frames = frames
+            else:
+                frames, bins = sample_start_frames(
+                    self.motion,
+                    self.bin_G,
+                    self.bin_w_avg,
+                    self.gamma,
+                    ids.numel(),
+                    self._rng,
+                )
+                full_frames = self.f.clone()
+                full_frames[ids] = frames
         else:
+            if fixed_shape:
+                raise RuntimeError("SuperMimic requested-frame resets require explicit env_ids")
             assert self._requested_env_ids is not None
             if not torch.equal(ids, self._requested_env_ids):
                 raise ValueError(
@@ -388,44 +487,39 @@ class SuperMimicCommand(CommandTerm):
             self._requested_frames = None
             self._requested_env_ids = None
             bins = self.motion.frame_bin[frames]
+            full_frames = self.f.clone()
+            full_frames[ids] = frames
 
-        full_frames = self.f.clone()
-        full_frames[ids] = frames
         p, rotation, v, w, q, qd = (value.clone() for value in self.motion.ref_state(full_frames))
         if self.reset_noise:
-            selected_p, selected_R, selected_v, selected_w, selected_q, _ = (
-                value[ids].clone() for value in (p, rotation, v, w, q, qd)
-            )
-            count = ids.numel()
-            selected_p += self._rng.uniform(
-                torch.tensor([-0.05, -0.05, -0.01], device=self._device),
-                torch.tensor([0.05, 0.05, 0.01], device=self._device),
-                (count, 3),
-            )
-            rotation_noise = self._rng.uniform(
-                torch.tensor([-0.1, -0.1, -0.2], device=self._device),
-                torch.tensor([0.1, 0.1, 0.2], device=self._device),
-                (count, 3),
-            )
-            selected_R = so3_exp(rotation_noise) @ selected_R
-            selected_v += self._rng.uniform(
-                torch.tensor([-0.5, -0.5, -0.2], device=self._device),
-                torch.tensor([0.5, 0.5, 0.2], device=self._device),
-                (count, 3),
-            )
-            selected_w += self._rng.uniform(
-                torch.tensor([-0.52, -0.52, -0.78], device=self._device),
-                torch.tensor([0.52, 0.52, 0.78], device=self._device),
-                (count, 3),
-            )
-            selected_q += self._rng.uniform(-0.1, 0.1, (count, NUM_J))
-            p[ids], rotation[ids], v[ids], w[ids], q[ids] = (
-                selected_p,
-                selected_R,
-                selected_v,
-                selected_w,
-                selected_q,
-            )
+            if fixed_shape:
+                # Full-width noise: unselected rows are discarded by the
+                # masked sim write and the masked memory updates below.
+                bounds = self._noise_bounds
+                p += self._rng.uniform(*bounds[0], (self.num_envs, 3))
+                rotation = so3_exp(self._rng.uniform(*bounds[1], (self.num_envs, 3))) @ rotation
+                v += self._rng.uniform(*bounds[2], (self.num_envs, 3))
+                w += self._rng.uniform(*bounds[3], (self.num_envs, 3))
+                q += self._rng.uniform(-0.1, 0.1, (self.num_envs, NUM_J))
+            else:
+                selected_p, selected_R, selected_v, selected_w, selected_q, _ = (
+                    value[ids].clone() for value in (p, rotation, v, w, q, qd)
+                )
+                count = ids.numel()
+                bounds = self._noise_bounds
+                selected_p += self._rng.uniform(*bounds[0], (count, 3))
+                rotation_noise = self._rng.uniform(*bounds[1], (count, 3))
+                selected_R = so3_exp(rotation_noise) @ selected_R
+                selected_v += self._rng.uniform(*bounds[2], (count, 3))
+                selected_w += self._rng.uniform(*bounds[3], (count, 3))
+                selected_q += self._rng.uniform(-0.1, 0.1, (count, NUM_J))
+                p[ids], rotation[ids], v[ids], w[ids], q[ids] = (
+                    selected_p,
+                    selected_R,
+                    selected_v,
+                    selected_w,
+                    selected_q,
+                )
         q = torch.clamp(q, self.kin.q_lo, self.kin.q_hi)
         root_state = torch.cat((p + self._env_origins, mat_to_quat(rotation), v, w), dim=-1)
         self.robot.write_motion_state_tensor_to_sim(
@@ -434,22 +528,32 @@ class SuperMimicCommand(CommandTerm):
             velocity=qd,
             reset_mask=reset_mask,
         )
-        self.f[ids] = frames
-        self.ep_step[ids] = 0
-        self.a_prev[ids] = 0.0
-        self.start_bin[ids] = bins
-        self.ep_disc_ret[ids] = 0.0
-        self.ep_ret[ids] = 0.0
-        self.time_left[ids] = self._resampling_time_range[0]
-        self.command_counter[ids] += 1
+        if fixed_shape:
+            self.f.copy_(torch.where(reset_mask, full_frames, self.f))
+            self.start_bin.copy_(torch.where(reset_mask, bins, self.start_bin))
+            self.command_counter += reset_mask.to(self.command_counter.dtype)
+        else:
+            self.f[ids] = frames
+            self.start_bin[ids] = bins
+            self.command_counter[ids] += 1
+        fill_rows_(self.ep_step, ids, 0)
+        fill_rows_(self.a_prev, ids, 0.0)
+        fill_rows_(self.ep_disc_ret, ids, 0.0)
+        fill_rows_(self.ep_ret, ids, 0.0)
+        fill_rows_(self.time_left, ids, self._resampling_time_range[0])
         return {}
 
     def _update_metrics(self) -> None:
         return
 
     def _resample_command(self, reset_mask: torch.Tensor) -> None:
-        if bool(reset_mask.any()):
-            raise RuntimeError("SuperMimic commands resample only through the reset lifecycle")
+        # Fail closed without a host read: the verdict is latched on the device
+        # and surfaces at the finite-validation poll boundary.
+        self._env.require(
+            ~reset_mask.any(),
+            "supermimic.command_resample",
+            "SuperMimic commands resample only through the reset lifecycle",
+        )
 
     def _update_command(self) -> None:
         reward = cast("RuntimeEnv", self._env).reward_buf
@@ -536,14 +640,10 @@ class SuperMimicAction(ActionTerm):
         )
         cast("Entity", self._entity).set_full_width_joint_position_target(self._target)
 
-    def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        ids = resolve_reset_env_ids(
-            env_ids,
-            num_envs=self.num_envs,
-            device=self._env.device,
-            owner="SuperMimicAction.reset",
-        )
-        self._raw_actions[ids] = 0.0
+    supports_reset_selection: ClassVar[bool] = True
+
+    def reset(self, env_ids: torch.Tensor | ResetSelection | None = None) -> None:
+        fill_rows_(self._raw_actions, env_ids, 0.0)
 
 
 def supermimic_obs(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
@@ -586,6 +686,14 @@ class SuperMimicContextEvent(ManagerTermBase):
     """Sample startup friction/CoM or replay those values on later resets."""
 
     uses_startup_rows = True
+
+    # The backend reset restores default model fields on reset rows, so the
+    # replay is required. Under a ResetSelection the row-index write facades
+    # cannot be used (they need host row indices), so the fixed-shape path
+    # stages full-width final tables through the packed transaction's public
+    # mask-based writer instead. Unilab 1.5.11 exposes that writer only on the
+    # transaction object, so backend column IDs are captured here once.
+    supports_reset_selection: ClassVar[bool] = True
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
         super().__init__(env)
@@ -631,6 +739,26 @@ class SuperMimicContextEvent(ManagerTermBase):
                     term_name="supermimic_ground_context",
                 )
             )
+        self._ground_backend_geom_ids: np.ndarray | None = None
+        # Backend column IDs for the fixed-shape (mask-based) staging path,
+        # captured lazily: the public bind facades return only entity-local
+        # ids (unilab 1.5.11), and the index path never needs them. The DR
+        # default tables are moved to the env device here so the hot path
+        # never stages a host-to-device copy.
+        self._backend_geom_ids: np.ndarray | None = None
+        self._backend_geom_ids_ready = False
+        self._backend_torso_ids: np.ndarray | None = None
+        self._device_friction_defaults = (
+            None
+            if self._friction_defaults is None
+            else self._friction_defaults.to(device=env.device, dtype=torch.float32)
+        )
+        self._device_ipos_defaults = self._ipos_defaults.to(device=env.device, dtype=torch.float32)
+        self._device_ground_friction_defaults = (
+            None
+            if self._ground_friction_defaults is None
+            else self._ground_friction_defaults.to(device=env.device, dtype=torch.float32)
+        )
 
     def __call__(
         self,
@@ -642,6 +770,9 @@ class SuperMimicContextEvent(ManagerTermBase):
         randomize_friction: bool = True,
     ) -> None:
         del command_name, asset_cfg, ground_asset_cfg, randomize_friction
+        if is_reset_selection(env_ids):
+            self._replay_fixed_shape(env, env_ids)
+            return
         ids = resolve_reset_env_ids(
             env_ids,
             num_envs=env.num_envs,
@@ -702,9 +833,75 @@ class SuperMimicContextEvent(ManagerTermBase):
                 term_name="supermimic_ground_context",
             )
 
+    def _replay_fixed_shape(self, env: ManagerBasedRlEnv, selection: ResetSelection) -> None:
+        """Replay the startup friction/CoM through full-width masked staging."""
+        reset_state = getattr(env, "_reset_state", None)
+        packed = (
+            None
+            if reset_state is None
+            else getattr(reset_state, "_require_packed_transaction", None)
+        )
+        if packed is None:
+            raise RuntimeError(
+                "SuperMimic fixed-shape reset requires the env-owned packed reset "
+                "transaction (unilab >= 1.5.11); update unilab or disable "
+                "env.masked_autoreset"
+            )
+        # Stage through the packed composer's cached-baseline mask writer; the
+        # transaction-level wrapper rebuilds its numpy default table (a host
+        # copy) on every call, which is not step-hot-safe.
+        packed = packed()
+        if not self._backend_geom_ids_ready:
+            self._backend_geom_ids = (
+                None
+                if self._geom_ids is None
+                else np.asarray(self._robot._geom_ids)[np.asarray(self._geom_ids)]
+            )
+            _, _, self._backend_torso_ids = self._robot._bind_body_randomization(
+                self._torso_ids,
+                capability="reset body-ipos write",
+            )
+            if self._ground is not None and self._ground_geom_ids is not None:
+                self._ground_backend_geom_ids = np.asarray(self._ground._geom_ids)[
+                    np.asarray(self._ground_geom_ids)
+                ]
+            self._backend_geom_ids_ready = True
+        command = _command(env, self._command_name)
+        reset_mask = env.event_term_mask_buffer.scatter(selection)
+
+        def full_width(defaults: torch.Tensor) -> torch.Tensor:
+            if defaults.ndim == 2:
+                return defaults.unsqueeze(0).expand(env.num_envs, *defaults.shape).clone()
+            return defaults[: env.num_envs].clone()
+
+        if self._randomize_friction:
+            assert self._backend_geom_ids is not None
+            friction = full_width(self._device_friction_defaults)
+            friction[..., 0] = command.xi[:, :1]
+            packed.write_model_field_mask(
+                RESET_TERM_GEOM_FRICTION, reset_mask, friction, columns=self._backend_geom_ids
+            )
+        ipos = full_width(self._device_ipos_defaults)
+        ipos += command.xi[:, 30:33].unsqueeze(1)
+        packed.write_model_field_mask(
+            RESET_TERM_BODY_IPOS, reset_mask, ipos, columns=self._backend_torso_ids
+        )
+        if self._ground is not None:
+            assert self._ground_backend_geom_ids is not None
+            ground_friction = full_width(self._device_ground_friction_defaults)
+            ground_friction[..., 0] = 0.3 if not command.eval_mode else 1.0
+            packed.write_model_field_mask(
+                RESET_TERM_GEOM_FRICTION,
+                reset_mask,
+                ground_friction,
+                columns=self._ground_backend_geom_ids,
+            )
+
 
 class SuperMimicJointOffsetEvent(ManagerTermBase):
     """Sample reset joint offsets into the command's only simulation context."""
+
+    supports_reset_selection: ClassVar[bool] = True
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
         super().__init__(env)
@@ -715,17 +912,27 @@ class SuperMimicJointOffsetEvent(ManagerTermBase):
     def __call__(
         self,
         env: ManagerBasedRlEnv,
-        env_ids: torch.Tensor | None,
+        env_ids: torch.Tensor | ResetSelection | None,
         command_name: str = "motion",
     ) -> None:
         del command_name
+        command = _command(env, self._command_name)
+        if is_reset_selection(env_ids):
+            # Fixed-shape dispatch: sample full-width every step and merge
+            # through the env-owned mask; unselected rows keep their offsets.
+            reset_mask = env.event_term_mask_buffer.scatter(env_ids)
+            if command.eval_mode:
+                command.xi[:, 1:30] = torch.where(reset_mask[:, None], 0.0, command.xi[:, 1:30])
+            else:
+                sampled = env.rng.uniform(-0.01, 0.01, (env.num_envs, NUM_J))
+                command.xi[:, 1:30] = torch.where(reset_mask[:, None], sampled, command.xi[:, 1:30])
+            return
         ids = resolve_reset_env_ids(
             env_ids,
             num_envs=env.num_envs,
             device=env.device,
             owner="SuperMimicJointOffsetEvent",
         )
-        command = _command(env, self._command_name)
         if command.eval_mode:
             command.xi[ids, 1:30] = 0.0
         else:

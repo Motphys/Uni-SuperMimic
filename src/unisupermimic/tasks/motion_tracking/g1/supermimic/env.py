@@ -10,6 +10,7 @@ import torch
 from unilab.base.backend_factory import create_backend, env_backend_kwargs
 from unilab.base.cpu_runtime import apply_cpu_confinement
 from unilab.base.entity import EntityCfg
+from unilab.base.reset_selection import ResetSelection
 from unilab.base.reset_selectors import resolve_reset_env_ids
 from unilab.base.torch_env import TorchEnvState
 from unilab.envs.manager_based_rl_env import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -52,6 +53,13 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             raise ValueError("SuperMimic requires exactly one SuperMimicCommand term")
         self._supermimic_command = commands[0]
         self._pre_action: dict[str, Any] | None = None
+        # The pre-reset transition materialization is step-hot and pure-tensor;
+        # compile it with the command's MDP when the task opts in. The reset
+        # path (current-info snapshots) stays eager: it runs inside the
+        # reset-segment CUDA graph body.
+        self._make_transition_info = (
+            torch.compile(make_transition_info) if commands[0].cfg.compile else make_transition_info
+        )
 
     @property
     def supermimic_mdp(self) -> SuperMimicMdpProtocol:
@@ -81,7 +89,7 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         if self._pre_action is None:
             raise RuntimeError("SuperMimic update_state requires a preceding apply_action snapshot")
         command = self._supermimic_command
-        transition = make_transition_info(
+        transition = self._make_transition_info(
             self._pre_action["state"],
             command.state(),
             self._pre_action["action"],
@@ -111,12 +119,15 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
 
     def reset(
         self,
-        env_ids: torch.Tensor | None = None,
+        env_ids: torch.Tensor | ResetSelection | None = None,
         *,
         seed: int | None = None,
-        options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        if env_ids is None:
+        if isinstance(env_ids, ResetSelection):
+            # Fixed-shape autoreset: the env-owned selection mask aliases the
+            # persistent buffer, so no allocation and no host read happen here.
+            reset_mask = env_ids.mask
+        elif env_ids is None:
             reset_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         else:
             ids = resolve_reset_env_ids(
@@ -127,7 +138,7 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             )
             reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             reset_mask[ids] = True
-        obs, info = super().reset(env_ids, seed=seed, options=options)
+        obs, info = super().reset(env_ids, seed=seed)
         assert self._state is not None
         current = self._current_info()
         previous = self._state.info.get(SUPERMIMIC_STATE_KEY)

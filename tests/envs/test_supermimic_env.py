@@ -82,6 +82,7 @@ def _runtime_cfg(
     eval_mode: bool = False,
     backend: str = "mjwarp",
     rotating_clip: bool = False,
+    masked: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
@@ -108,6 +109,13 @@ def _runtime_cfg(
     assert isinstance(command_cfg, SuperMimicCommandCfg)
     command_cfg.motion_files = [str(clip_path)]
     command_cfg.eval_mode = eval_mode
+    # Tests construct envs repeatedly; skip step-path compilation warmup.
+    command_cfg.compile = False
+    # Runtime tests default to the selected-row lifecycle; the fixed-shape
+    # path has its own dedicated tests (it changes RNG draw order).
+    cfg.masked_autoreset = masked
+    cfg.persistent_step_buffers = masked
+    cfg.autoreset_cuda_graph = masked
     cfg.validate()
     return cfg
 
@@ -338,8 +346,14 @@ def test_episode_return_update_bootstraps_only_truncation() -> None:
     expected_G = torch.tensor([1.0, 2.0, 3.0]) * 0.8 + 0.2 * expected_returns
     torch.testing.assert_close(bin_G[:3], expected_G)
     assert bin_G[3] == 4.0
-    torch.testing.assert_close(stats["ep_len"], ep_step[:3].float())
-    torch.testing.assert_close(stats["ep_ret_norm"], ep_ret[:3] / (ep_step[:3] * MAX_STEP_REWARD))
+    # Full-width masked statistics: done rows carry the episode values, the
+    # non-done row carries zero, and the done mask reconstructs the means.
+    expected_len = ep_step.float() * done.float()
+    expected_ret_norm = ep_ret / (ep_step.float() * MAX_STEP_REWARD) * done.float()
+    torch.testing.assert_close(stats["ep_len"], expected_len)
+    torch.testing.assert_close(stats["ep_ret_norm"], expected_ret_norm)
+    done_count = done.sum()
+    torch.testing.assert_close(stats["ep_len"].sum() / done_count, ep_step[:3].float().mean())
     assert set(stats) == {"ep_len", "ep_ret_norm"}
 
 
@@ -355,8 +369,11 @@ def test_episode_return_update_without_done_rows_is_a_no_op() -> None:
         torch.zeros(2, dtype=torch.bool),
         0.99,
     )
-    assert stats == {}
+    # No done rows: the EMA is untouched and the masked statistics are zero.
     torch.testing.assert_close(bin_G, torch.tensor([1.0, 2.0]))
+    assert set(stats) == {"ep_len", "ep_ret_norm"}
+    assert bool((stats["ep_len"] == 0).all())
+    assert bool((stats["ep_ret_norm"] == 0).all())
 
 
 def test_eval_command_update_does_not_change_start_bin_statistics() -> None:
@@ -700,7 +717,7 @@ def test_training_reset_step_and_pre_reset_transition(tmp_path: Path, backend_na
     try:
         frames = torch.tensor([0, 1], dtype=torch.int64, device=env.device)
         obs, info = env.reset_to_frames(frames)
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
         assert obs["critic"].shape == (2, 730)
         assert all(torch.isfinite(values).all() for values in obs.values())
         current = info[SUPERMIMIC_STATE_KEY]
@@ -778,7 +795,7 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         assert info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [0, 0]
         assert command.xi[:, 0].tolist() == [1.0, 1.0]
         assert torch.count_nonzero(command.xi[:, 1:]) == 0
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
         assert obs["critic"].shape == (2, 730)
         for actual, expected in zip(command.state(), command.motion.ref_state(command.f)):
             torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
@@ -792,7 +809,7 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         )
         assert command.f.tolist() == [1, 51]
         assert info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [1, 0]
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
     finally:
         env.close()
         env.backend.close()
@@ -853,3 +870,88 @@ def test_mujoco_poststep_public_root_matches_native_qpos_qvel(tmp_path: Path) ->
     finally:
         env.close()
         backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_masked_autoreset_steps_without_host_sync(tmp_path: Path) -> None:
+    """The fixed-shape autoreset exercises every reset participant sync-free."""
+    _require_backend_runtime("mjwarp")
+    cfg = _runtime_cfg(tmp_path, masked=True)
+    # Poll explicitly far away so every step in the checked window is verified
+    # to be sync-free (the poll itself is an intentional host read).
+    cfg.finite_validation_interval = 10**6
+    env = make_supermimic_env(cfg, num_envs=64, backend_type="mjwarp")
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(1)
+        obs, _ = env.reset_to_frames(torch.zeros(64, dtype=torch.int64, device=env.device))
+        assert obs["obs"].shape == (64, 93)
+        generator = torch.Generator(device=env.device).manual_seed(0)
+
+        def action() -> torch.Tensor:
+            return torch.randn((64, 29), generator=generator, device=env.device) * 0.3
+
+        for _ in range(4):  # warm up every reset participant
+            env.step(action())
+        done_rows = torch.zeros((), dtype=torch.int64, device=env.device)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for _ in range(40):
+                state = env.step(action())
+                done_rows += (state.terminated | state.truncated).sum()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert int(done_rows) > 0, "the masked autoreset was not exercised"
+        assert env.poll_finite_validation(force=True)
+        for value in state.obs.values():
+            assert bool(torch.isfinite(value).all())
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        assert bool((command.ep_step >= 0).all())
+        assert bool(command.f.max() < command.motion.num_frames)
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_masked_autoreset_restores_context_dr(tmp_path: Path) -> None:
+    """Fixed-shape resets re-stage the startup friction/CoM context.
+
+    The backend reset restores default model fields on reset rows, so the
+    masked path must replay xi-derived friction/CoM through full-width
+    masked staging; otherwise the privileged-context observation would lie
+    about the simulated robot. This is the canary for that staging path.
+    """
+    _require_backend_runtime("mjwarp")
+    import warp
+
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, masked=True), num_envs=8, backend_type="mjwarp"
+    )
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(5)
+        env.reset_to_frames(torch.arange(8, dtype=torch.int64, device=env.device))
+        generator = torch.Generator(device=env.device).manual_seed(2)
+        done = 0
+        for _ in range(80):
+            action = torch.randn((8, 29), generator=generator, device=env.device) * 0.3
+            step = env.step(action)
+            done += int(step.info[SUPERMIMIC_TRANSITION_KEY]["done"].sum())
+        assert done > 0, "no autoreset happened; the replay path was not exercised"
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        model = env.backend._device_model
+        friction = warp.to_torch(model.geom_friction)  # (num_envs, ngeom, 3)
+        robot_ids = np.asarray(env.scene["robot"]._geom_ids)
+        torch.testing.assert_close(
+            friction[:, robot_ids, 0],
+            command.xi[:, :1].expand(-1, robot_ids.size),
+            rtol=0,
+            atol=1e-6,
+        )
+    finally:
+        env.close()
+        env.backend.close()

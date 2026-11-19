@@ -13,7 +13,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from unilab.rl.contracts.env import EnvProtocol
+from unilab.base.contracts.env import EnvProtocol
 
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
@@ -444,8 +444,12 @@ class SuperMimicLearner:
             self.sim_steps += self.env.num_envs
             self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
             if "ep_len" in transition:
-                self.stats["ep_len"].append(transition["ep_len"].mean())
-                self.stats["ep_ret"].append(transition["ep_ret_norm"].mean())
+                # Episode statistics are full-width and masked (non-done rows
+                # carry zero), so aggregate with the done count.
+                done_count = float(transition["done"].sum())
+                if done_count > 0.0:
+                    self.stats["ep_len"].append(float(transition["ep_len"].sum()) / done_count)
+                    self.stats["ep_ret"].append(float(transition["ep_ret_norm"].sum()) / done_count)
                 self.stats["term"].append(transition["term"].float().sum())
                 self.stats["done"].append(transition["done"].float().sum())
 
