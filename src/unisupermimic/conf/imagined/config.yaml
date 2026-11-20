@@ -1,0 +1,48 @@
+defaults:
+  - _self_
+  - task/g1_super_mimic/default
+
+task_name: G1SuperMimicImagined
+
+algo:
+  wm_checkpoint: null
+  iterations: 12000
+  batch: 4096
+  horizon: 32
+  goal_frames: 10
+  hist: 10
+  z_dim: 32
+  policy_hidden: [2048, 1024, 512, 256]
+  critic_hidden: [256, 128]
+  lr: 4.0e-4
+  pi_opt: muon
+  no_sync: true
+  pi_ema: 0.995
+  gamma: 0.99
+  lam: 0.95
+  max_episode_steps: 500
+  critic_epochs: 5
+  critic_minibatches: 4
+  no_critic: false
+  reset_noise: true
+  lr_decay_iters: 250000
+  ckpt_every: 2000
+  log_every: 50
+  log_backend: tensorboard
+  seed: 0
+  amp: bf16
+  compile: true
+  test_hidden_dims: null
+
+training:
+  task_name: G1SuperMimicImagined
+  log_root: null
+  log_dir: null
+  seed: null
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
