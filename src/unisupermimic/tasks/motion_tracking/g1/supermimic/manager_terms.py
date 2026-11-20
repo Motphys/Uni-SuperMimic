@@ -285,6 +285,20 @@ class SuperMimicCommand(CommandTerm):
         self.f = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.xi = torch.zeros((self.num_envs, XI_DIM), dtype=torch.float32, device=device)
         self.a_prev = torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device)
+        # Fixed-address carrier holding the state each row was last reset to,
+        # in the exact State layout command.state() returns. Under the
+        # reset-segment CUDA graph the scene read plan does not refresh during
+        # replay, so reading physics right after the masked write would return
+        # the pre-reset state on done rows; the written reference is the
+        # authoritative post-reset state and is staged here instead.
+        self._reset_state_carrier = (
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
+        )
         self.ep_step = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.start_bin = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.ep_disc_ret = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
@@ -394,6 +408,11 @@ class SuperMimicCommand(CommandTerm):
             joint.joint_pos,
             joint.joint_vel,
         )
+
+    @property
+    def reset_state_carrier(self) -> tuple[torch.Tensor, ...]:
+        """Fixed-address per-row state each reset last wrote, in State layout."""
+        return self._reset_state_carrier
 
     def observation(self) -> torch.Tensor:
         return self.mdp.obs(self.state(), self.a_prev, self.xi, self.f)
@@ -521,6 +540,17 @@ class SuperMimicCommand(CommandTerm):
                     selected_q,
                 )
         q = torch.clamp(q, self.kin.q_lo, self.kin.q_hi)
+        # Stage the exact written state into the fixed-address carrier (in the
+        # command.state() layout: world position without env origins). The
+        # reset-segment graph replays this alongside the sim write, so the
+        # post-reset state publication never depends on a read-plan refresh.
+        carrier = self._reset_state_carrier
+        carrier[0].copy_(torch.where(reset_mask[:, None], p, carrier[0]))
+        carrier[1].copy_(torch.where(reset_mask[:, None, None], rotation, carrier[1]))
+        carrier[2].copy_(torch.where(reset_mask[:, None], v, carrier[2]))
+        carrier[3].copy_(torch.where(reset_mask[:, None], w, carrier[3]))
+        carrier[4].copy_(torch.where(reset_mask[:, None], q, carrier[4]))
+        carrier[5].copy_(torch.where(reset_mask[:, None], qd, carrier[5]))
         root_state = torch.cat((p + self._env_origins, mat_to_quat(rotation), v, w), dim=-1)
         self.robot.write_motion_state_tensor_to_sim(
             root_state=root_state,

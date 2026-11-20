@@ -116,11 +116,29 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         return updated
 
     def _current_info_into(
-        self, target: dict[str, torch.Tensor] | None
+        self,
+        target: dict[str, torch.Tensor] | None,
+        reset_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         command = self._supermimic_command
+        if reset_mask is None:
+            state: tuple[torch.Tensor, ...] = command.state()
+        else:
+            # Post-reset publication: the read plan does not refresh inside the
+            # replayed reset segment, so done rows must take their state from
+            # the fixed-address carrier holding exactly what the reset wrote.
+            live = command.state()
+            carrier = command.reset_state_carrier
+            state = tuple(
+                torch.where(
+                    reset_mask.reshape((reset_mask.shape[0],) + (1,) * (written.ndim - 1)),
+                    written,
+                    read,
+                )
+                for written, read in zip(carrier, live, strict=True)
+            )
         fresh = make_current_info(
-            command.state(),
+            state,
             command.f,
             command.xi,
             command.a_prev,
@@ -163,7 +181,7 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         # update_state this step, and the masked copy merges them — exactly the
         # eager-path merge_current_info semantics, expressed as pure device
         # work on stable tensors.
-        current = self._current_info_into(self._sm_reset_scratch)
+        current = self._current_info_into(self._sm_reset_scratch, reset_mask=reset_mask)
         if self._sm_state is None:
             self._sm_state = {name: value.clone() for name, value in current.items()}
         else:
