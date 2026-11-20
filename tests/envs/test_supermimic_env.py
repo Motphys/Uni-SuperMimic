@@ -723,6 +723,10 @@ def test_training_reset_step_and_pre_reset_transition(tmp_path: Path, backend_na
         current = info[SUPERMIMIC_STATE_KEY]
         assert current["s"].shape == (2, 71)
         assert current["f"].shape == (2,)
+        # The state key is a live fixed-address carrier (the CUDA-graph-safe
+        # reset refreshes it in place), so snapshot compared values before
+        # stepping rather than holding the dict across the step.
+        bootstrap_f = current["f"].clone()
         command = env.command_manager.get_term("motion")
         assert isinstance(command, SuperMimicCommand)
         _assert_runtime_context(env, command, backend_name)
@@ -751,7 +755,7 @@ def test_training_reset_step_and_pre_reset_transition(tmp_path: Path, backend_na
         assert transition["a"].shape == transition["a_prev"].shape == (2, 29)
         assert transition["xi"].shape == (2, 33)
         assert transition["r"].shape == transition["done"].shape == (2,)
-        assert torch.equal(transition["f"], current["f"])
+        assert torch.equal(transition["f"], bootstrap_f)
         assert transition["ep_step"].tolist() == [0, 0]
         assert not bool(transition["done"].any())
         assert state.info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [1, 1]
