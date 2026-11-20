@@ -39,6 +39,16 @@ algo:
   # BlinkMimic2-style actor-only imagined failure penalty (0 disables; 3.0 is
   # the BlinkMimic2 value). The critic keeps learning the plain reward.
   fail_penalty: 0.0
+  # BlinkMimic2-style exams, off by default: exam_frac 0 keeps the pre-exam
+  # behavior exactly. To enable, set exam_frac (e.g. 0.5): from exam_start_iter
+  # on, the last exam_frac*num_envs worlds run full-clip exam episodes with the
+  # EMA policy (requires pi_ema > 0), and the share of imagination starts drawn
+  # from their transitions ramps linearly from exam_frac to exam_share_ramp
+  # (0.9 matches BlinkMimic2's 10% practice fraction) over exam_ramp_iters.
+  exam_start_iter: 4000
+  exam_frac: 0.0
+  exam_share_ramp: 0.9
+  exam_ramp_iters: 2500
   ckpt_every: 2000
   log_every: 50
   log_backend: tensorboard

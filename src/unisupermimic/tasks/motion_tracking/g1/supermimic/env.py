@@ -72,6 +72,33 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
     def supermimic_mdp(self) -> SuperMimicMdpProtocol:
         return self._supermimic_command.mdp
 
+    @property
+    def supermimic_exam_mask(self) -> torch.Tensor:
+        """Full-width bool mask of the exam worlds (all false until activated)."""
+        return self._supermimic_command.exam_mask
+
+    def enable_supermimic_exams(self, num_rows: int) -> None:
+        """Activate BlinkMimic2-style exam worlds on the last ``num_rows`` rows.
+
+        The assignment happens once (no later reshuffling): those rows run exam
+        episodes from here on — clip-first-frame starts, no early termination,
+        EMA-policy actions from the learner — and their resets continue through
+        the ordinary (captured) masked autoreset, which the command's exam
+        override routes to the next clip's first frame. Runs eagerly at an
+        iteration boundary, outside any captured segment.
+        """
+        if isinstance(num_rows, bool) or not isinstance(num_rows, int):
+            raise TypeError(f"SuperMimic exam row count must be an int, got {num_rows!r}")
+        if not 0 < num_rows < self.num_envs:
+            raise ValueError(
+                f"SuperMimic exam row count must be in (0, {self.num_envs}), got {num_rows}"
+            )
+        frames = self._supermimic_command.activate_exam_worlds(num_rows)
+        env_ids = torch.arange(
+            self.num_envs - num_rows, self.num_envs, dtype=torch.int64, device=self.device
+        )
+        self.reset_to_frames(frames[env_ids], env_ids=env_ids)
+
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> torch.Tensor:
         command = self._supermimic_command
         self._pre_action = {

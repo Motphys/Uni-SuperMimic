@@ -208,6 +208,36 @@ def _config() -> SuperMimicConfig:
     )
 
 
+class ExamFakeEnv(FakeEnv):
+    """FakeEnv with the exam activation hook the learner drives."""
+
+    def __init__(self, num_envs: int = 8):
+        super().__init__(num_envs)
+        self.exam_activations: list[int] = []
+
+    def enable_supermimic_exams(self, num_rows: int) -> None:
+        assert self.state is not None
+        self.exam_activations.append(num_rows)
+        # Value-only activation: the last rows restart on a clip first frame
+        # (frame 0 here) with a fresh episode.
+        current = self.state.info[SUPERMIMIC_STATE_KEY]
+        current["f"][self.num_envs - num_rows :] = 0
+        current["ep_step"][self.num_envs - num_rows :] = 0
+
+
+def _exam_config(**overrides) -> SuperMimicConfig:
+    values = dict(
+        iterations=3,
+        pi_ema=0.995,
+        exam_start_iter=1,
+        exam_frac=0.5,
+        exam_share_ramp=0.9,
+        exam_ramp_iters=4,
+    )
+    values.update(overrides)
+    return replace(_config(), **values)
+
+
 def test_tf32_only_enabled_for_fp32_training(tmp_path) -> None:
     previous = torch.backends.cuda.matmul.allow_tf32
     try:
@@ -631,3 +661,117 @@ def test_early_nonfinite_world_model_batch_cannot_be_masked_by_later_batches(tmp
     assert calls == 1
     assert not (tmp_path / "ckpt_000001.pt").exists()
     assert not (tmp_path / "last.pt").exists()
+
+
+def test_exam_default_config_keeps_exams_fully_off(tmp_path) -> None:
+    env = FakeEnv()
+    learner = SuperMimicLearner(env, _config(), tmp_path)
+
+    assert learner._exam_rows_planned == 0
+    assert learner._exam_rows == 0
+    assert learner._exam_share == 0.0
+    learner._advance_exam_schedule(10**6)
+    assert learner._exam_rows == 0  # a plain env without the hook is never touched
+
+    learner.collect(3)
+    learner.wm_update()
+    learner.policy_update()
+    starts, histories = learner._sample_valid_starts(4)
+    for value in list(starts.values()) + list(histories.values()):
+        assert value.shape[0] == 4
+    assert learner.stats["exam_surv"] == []
+
+
+def test_exam_config_requires_ema_policy_and_exam_capable_env(tmp_path) -> None:
+    with pytest.raises(ValueError, match="pi_ema > 0"):
+        SuperMimicLearner(ExamFakeEnv(), _exam_config(pi_ema=0.0), tmp_path)
+    with pytest.raises(TypeError, match="enable_supermimic_exams"):
+        SuperMimicLearner(FakeEnv(), _exam_config(), tmp_path)
+    with pytest.raises(ValueError, match="exam_frac"):
+        SuperMimicLearner(ExamFakeEnv(), _exam_config(exam_frac=2.0), tmp_path)
+
+
+def test_exam_schedule_activates_once_and_ramps_imagination_share(tmp_path) -> None:
+    env = ExamFakeEnv()
+    learner = SuperMimicLearner(env, _exam_config(), tmp_path)
+
+    learner._advance_exam_schedule(0)
+    assert env.exam_activations == []
+    learner._advance_exam_schedule(1)
+    assert env.exam_activations == [4]  # exam_frac 0.5 of 8 envs, assigned once
+    assert learner._exam_rows == 4
+    assert learner._exam_share == pytest.approx(0.5)
+    learner._advance_exam_schedule(3)
+    assert env.exam_activations == [4]
+    assert learner._exam_share == pytest.approx(0.5 + 0.5 * (0.9 - 0.5))
+    learner._advance_exam_schedule(100)
+    assert learner._exam_share == pytest.approx(0.9)
+
+
+def test_exam_rows_act_with_the_ema_policy_and_record_survival(tmp_path) -> None:
+    learner = SuperMimicLearner(ExamFakeEnv(), _exam_config(), tmp_path)
+    learner._advance_exam_schedule(1)
+
+    def constant_policy(obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        del goal
+        return torch.full((obs_hist.shape[0], learner.mdp.num_joints), 5.0)
+
+    learner.pi_avg.module.forward = constant_policy
+    learner.collect(1)
+
+    row = (learner.buffer.ptr - 1) % learner.buffer.T
+    actions = learner.buffer.data["a"][row]
+    torch.testing.assert_close(actions[-4:], torch.full((4, learner.mdp.num_joints), 5.0))
+    # Practice rows keep the live policy (not the constant EMA output).
+    assert not torch.allclose(actions[:-4], torch.full_like(actions[:-4], 5.0))
+    # FakeMdp reports zero danger, so every exam row survives.
+    assert len(learner.stats["exam_surv"]) == 1
+    assert learner.stats["exam_surv"][0] == pytest.approx(1.0)
+
+
+def test_exam_done_statistics_count_practice_rows_only(tmp_path) -> None:
+    learner = SuperMimicLearner(ExamFakeEnv(), _exam_config(), tmp_path)
+    learner._advance_exam_schedule(1)
+
+    learner.collect(4)  # FakeEnv episodes end at episode step 3
+
+    # All 8 rows of the fake env finish together on the third step; only the
+    # 4 practice rows enter the done statistic.
+    assert len(learner.stats["done"]) == 1
+    assert float(learner.stats["done"][0]) == pytest.approx(4.0)
+
+
+def test_exam_starts_flow_into_valid_start_sampling(tmp_path) -> None:
+    learner = SuperMimicLearner(ExamFakeEnv(), _exam_config(), tmp_path)
+    learner.collect(3)
+    learner._advance_exam_schedule(1)
+    calls: list[tuple[int, float]] = []
+    original = learner.buffer.sample_starts
+
+    def spy(batch: int, hist: int, exam_rows: int = 0, exam_prob: float = 0.0):
+        calls.append((exam_rows, exam_prob))
+        return original(batch, hist, exam_rows=exam_rows, exam_prob=exam_prob)
+
+    learner.buffer.sample_starts = spy
+    starts, histories = learner._sample_valid_starts(4)
+
+    assert starts["s"].shape[0] == 4
+    assert histories["s"].shape[0] == 4
+    assert calls == [(4, pytest.approx(0.5))]
+
+
+def test_exam_survival_is_logged_to_tensorboard(tmp_path) -> None:
+    learner = SuperMimicLearner(
+        ExamFakeEnv(), _exam_config(log_backend="tensorboard"), tmp_path
+    )
+    learner.train()
+
+    event_files = list(tmp_path.glob("events.out.tfevents.*"))
+    assert len(event_files) == 1
+    accumulator = EventAccumulator(str(tmp_path))
+    accumulator.Reload()
+    tags = set(accumulator.Tags()["scalars"])
+    assert "Exam/survival" in tags
+    events = accumulator.Scalars("Exam/survival")
+    # Iteration 0 runs without exams; iterations 1 and 2 log survival.
+    assert [event.step for event in events] == [2, 3]

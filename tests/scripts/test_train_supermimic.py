@@ -57,8 +57,10 @@ def test_owner_materializes_complete_task(backend: str) -> None:
     assert env_cfg.commands["motion"].goal_frames == 10
     assert env_cfg.rewards["tracking"].weight == pytest.approx(1.0)
     for event_name in ("startup_context", "reset_context"):
+        # Since unilab 1.6.0 every backend (motrix included) inherits the
+        # default friction randomization from the base task.
         randomize_friction = env_cfg.events[event_name].params.get("randomize_friction", True)
-        assert randomize_friction is (backend != "motrix")
+        assert randomize_friction is True
 
 
 def test_backend_owners_have_identical_sim2sim_contracts() -> None:

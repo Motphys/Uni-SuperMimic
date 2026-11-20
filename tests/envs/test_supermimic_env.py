@@ -40,6 +40,7 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.manager_terms import (
     sample_start_frames,
     start_bin_probabilities,
     supermimic_clip_end,
+    supermimic_termination,
     supermimic_timeout,
     update_start_bin_returns,
 )
@@ -538,6 +539,7 @@ def test_timeout_and_clip_end_are_independent_truncation_terms() -> None:
     command.ep_step = torch.tensor([498, 499, 500])
     command.max_episode_steps = 500
     command.f = torch.tensor([99, 100, 105])
+    command.exam_mask = torch.zeros(3, dtype=torch.bool)
     command.motion = SimpleNamespace(
         clip_end=torch.tensor([101, 108]),
         clip_id=torch.cat((torch.zeros(102, dtype=torch.int64), torch.ones(7, dtype=torch.int64))),
@@ -545,6 +547,62 @@ def test_timeout_and_clip_end_are_independent_truncation_terms() -> None:
     env = SimpleNamespace(command_manager=_CommandManager(command))
     assert supermimic_timeout(env).tolist() == [False, True, True]
     assert supermimic_clip_end(env).tolist() == [False, True, False]
+
+
+def test_exam_rows_terminate_but_ignore_the_episode_cap() -> None:
+    command = object.__new__(SuperMimicCommand)
+    command.ep_step = torch.tensor([600, 600])
+    command.max_episode_steps = 500
+    command.f = torch.tensor([10, 10])
+    command.exam_mask = torch.tensor([False, True])
+
+    def state() -> None:
+        return None
+
+    def termination(state_value: Any, frames: torch.Tensor) -> torch.Tensor:
+        del state_value
+        return frames >= 10
+
+    command.state = state
+    command.mdp = SimpleNamespace(termination=termination)
+    env = SimpleNamespace(command_manager=_CommandManager(command))
+    # Row 0 fails both the hard criterion and the episode cap; row 1 is an
+    # exam world: the hard termination still applies (a fallen exam robot
+    # ends that clip, matching BlinkMimic2) but the wall-clock cap does not.
+    assert supermimic_termination(env).tolist() == [True, True]
+    assert supermimic_timeout(env).tolist() == [True, False]
+    # Without exam worlds the terms are the plain criteria again.
+    command.exam_mask = torch.zeros(2, dtype=torch.bool)
+    assert supermimic_termination(env).tolist() == [True, True]
+    assert supermimic_timeout(env).tolist() == [True, True]
+
+
+def test_exam_worlds_activate_and_round_robin_clip_starts() -> None:
+    command = object.__new__(SuperMimicCommand)
+    command._env = SimpleNamespace(num_envs=4)
+    command._device = torch.device("cpu")
+    command._num_clips = 2
+    command.exam_mask = torch.zeros(4, dtype=torch.bool)
+    command._exam_clip_cursor = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    command.motion = SimpleNamespace(clip_start=torch.tensor([0, 60]))
+
+    frames = command.activate_exam_worlds(2)
+
+    # The last two rows become exam worlds; their cursors advance one clip.
+    assert command.exam_mask.tolist() == [False, False, True, True]
+    assert command._exam_clip_cursor.tolist() == [0, 1, 1, 0]
+    assert frames.tolist() == [0, 60, 60, 0]
+
+    # A masked restart advances only resetting exam rows (row 2 here) and
+    # hands every row the first frame of its cursor clip.
+    exam_frames = command._exam_start_frames(torch.tensor([False, True, True, False]))
+    assert command._exam_clip_cursor.tolist() == [0, 1, 0, 0]
+    assert exam_frames.tolist() == [0, 60, 0, 0]
+
+    with pytest.raises(ValueError, match="exam row count must be in"):
+        command.activate_exam_worlds(4)
+    with pytest.raises(TypeError, match="exam row count must be an int"):
+        command.activate_exam_worlds(True)  # type: ignore[arg-type]
 
 
 def test_context_events_share_command_xi_and_replay_startup_values() -> None:
@@ -995,6 +1053,76 @@ def test_mjwarp_graph_autoreset_publishes_post_reset_state(tmp_path: Path) -> No
                 )
                 checked += done_count
         assert checked > 0, "no autoreset happened; the graph path was not exercised"
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_exam_worlds_run_full_clips_in_masked_autoreset(tmp_path: Path) -> None:
+    """Exam worlds complete whole clips through the captured autoreset.
+
+    Exam activation flips the persistent mask in place after the reset-segment
+    graph may already be captured, and every later replay must honor it without
+    any host synchronization: exam rows restart on the clip's first frame, the
+    episode cap and hard termination never end their episodes, and only the
+    clip end does. Practice rows keep recycling through the cap.
+    """
+    _require_backend_runtime("mjwarp")
+    cfg = _runtime_cfg(tmp_path, masked=True)
+    cfg.finite_validation_interval = 10**6
+    env = make_supermimic_env(cfg, num_envs=8, backend_type="mjwarp")
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(11)
+        env.reset_to_frames(torch.zeros(8, dtype=torch.int64, device=env.device))
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        command.max_episode_steps = 3  # practice rows recycle every three steps
+        clip_end = int(command.motion.clip_end[0].item())
+        generator = torch.Generator(device=env.device).manual_seed(4)
+
+        def action() -> torch.Tensor:
+            return torch.randn((8, 29), generator=generator, device=env.device) * 0.1
+
+        for _ in range(4):  # warm up eager paths and capture the autoreset graph
+            env.step(action())
+        assert env.autoreset_graph is not None and env.autoreset_graph.captured
+
+        # Activate exams AFTER the reset-segment graph is captured: the mask
+        # flips in place and the replayed segment must pick it up.
+        env.enable_supermimic_exams(4)
+
+        assert command.exam_mask.tolist() == [False, False, False, False, True, True, True, True]
+        assert bool((command.f[4:] == 0).all()), "exam rows must start on the clip's first frame"
+        assert command.ep_step[4:].tolist() == [0, 0, 0, 0]
+        dones: list[torch.Tensor] = []
+        frames: list[torch.Tensor] = []
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for _ in range(clip_end + 12):
+                state = env.step(action())
+                dones.append((state.terminated | state.truncated).clone())
+                frames.append(state.info[SUPERMIMIC_STATE_KEY]["f"].clone())
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert env.poll_finite_validation(force=True)
+
+        done = torch.stack(dones)
+        published = torch.stack(frames)
+        exam_done, practice_done = done[:, 4:], done[:, :4]
+        exam_frames = published[:, 4:]
+        # The cap (3) and hard termination never end exam episodes: they run
+        # the whole clip and finish only at its end, restarting at frame 0.
+        assert int(exam_done.sum()) >= 4, "no exam episode reached the clip end"
+        assert int(exam_frames.max()) >= clip_end - 2
+        assert bool((exam_frames[exam_done] == 0).all())
+        # Practice rows keep recycling through the short episode cap.
+        assert int(practice_done.sum()) > int(exam_done.sum())
+        # Their statistics stay out of the start-bin return EMA: bin_G only
+        # advances through practice episodes (untouched at zero returns here).
+        assert bool((command.f[4:] < command.motion.num_frames).all())
     finally:
         env.close()
         env.backend.close()

@@ -316,6 +316,19 @@ class SuperMimicCommand(CommandTerm):
         self.start_bin = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.ep_disc_ret = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self.ep_ret = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        # BlinkMimic2-style exam worlds (learner-activated, see
+        # ``activate_exam_worlds``): rows running full-clip exam episodes. The
+        # mask and the round-robin clip cursor live at fixed addresses from
+        # construction and only their values change at activation, so the
+        # captured reset segment keeps reading them after every replay. With
+        # no exams active the mask is all false and every exam-dependent op is
+        # a value no-op.
+        self.exam_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        self._num_clips = int(self.motion.clip_start.numel())
+        self._exam_clip_cursor = (
+            torch.arange(self.num_envs, dtype=torch.int64, device=device)
+            % max(self._num_clips, 1)
+        )
         self.bin_G = torch.zeros(self.motion.num_bins, dtype=torch.float32, device=device)
         self.bin_w_avg = torch.full(
             (self.motion.num_bins,), 1.0 / self.motion.num_bins, device=device
@@ -472,6 +485,48 @@ class SuperMimicCommand(CommandTerm):
 
     supports_reset_selection: ClassVar[bool] = True
 
+    def activate_exam_worlds(self, num_rows: int) -> torch.Tensor:
+        """Mark the last ``num_rows`` rows as exam worlds; return their frames.
+
+        Exam worlds run BlinkMimic2-style exam episodes: every episode starts
+        on a clip's first frame and runs to the clip end (hard termination and
+        the episode cap do not apply), the learner collects them with the EMA
+        policy, and their episodes stay outside the start-bin statistics. The
+        returned frames are the first frames of the clips the round-robin
+        cursor hands the newly activated rows; the caller resets them
+        explicitly. Only tensor values are written (the mask keeps its
+        address), so a captured reset segment replays with the updated mask.
+        """
+        if isinstance(num_rows, bool) or not isinstance(num_rows, int):
+            raise TypeError(f"SuperMimic exam row count must be an int, got {num_rows!r}")
+        if not 0 < num_rows < self.num_envs:
+            raise ValueError(
+                f"SuperMimic exam row count must be in (0, {self.num_envs}), got {num_rows}"
+            )
+        rows = torch.arange(self.num_envs, device=self._device) >= self.num_envs - num_rows
+        self._exam_clip_cursor.copy_(
+            torch.where(
+                rows, (self._exam_clip_cursor + 1) % self._num_clips, self._exam_clip_cursor
+            )
+        )
+        self.exam_mask.copy_(rows)
+        return self.motion.clip_start[self._exam_clip_cursor].clone()
+
+    def _exam_start_frames(self, reset_mask: torch.Tensor) -> torch.Tensor:
+        """Per-row clip first frames for exam worlds (fixed-shape, graph-safe).
+
+        Advances the round-robin clip cursor only on rows that are both
+        resetting and exam, then gathers every row's cursor clip start frame;
+        rows that are not resetting exam worlds produce values the callers
+        discard. The deterministic cursor advance keeps the shared training
+        RNG stream untouched, so exam activation never perturbs the captured
+        reset segment's RNG layout.
+        """
+        advance = reset_mask & self.exam_mask
+        cursor = (self._exam_clip_cursor + 1) % self._num_clips
+        self._exam_clip_cursor.copy_(torch.where(advance, cursor, self._exam_clip_cursor))
+        return self.motion.clip_start[self._exam_clip_cursor]
+
     def reset(
         self,
         env_ids: torch.Tensor | slice | ResetSelection | None = None,
@@ -505,6 +560,13 @@ class SuperMimicCommand(CommandTerm):
                     update=reset_mask.any(),
                     cdf_sampling=True,
                 )
+                # Exam worlds restart on a clip's first frame instead of the
+                # sampled start bin. Value-only override on fixed-address
+                # tensors: with no exam rows the mask is all false and the
+                # sampled values pass through unchanged.
+                exam_frames = self._exam_start_frames(reset_mask)
+                frames = torch.where(self.exam_mask, exam_frames, frames)
+                bins = torch.where(self.exam_mask, self.motion.frame_bin[exam_frames], bins)
                 full_frames = frames
             else:
                 frames, bins = sample_start_frames(
@@ -515,6 +577,10 @@ class SuperMimicCommand(CommandTerm):
                     ids.numel(),
                     self._rng,
                 )
+                exam_frames = self._exam_start_frames(reset_mask)
+                selected = self.exam_mask[ids]
+                frames = torch.where(selected, exam_frames[ids], frames)
+                bins = torch.where(selected, self.motion.frame_bin[exam_frames[ids]], bins)
                 full_frames = self.f.clone()
                 full_frames[ids] = frames
         else:
@@ -618,6 +684,10 @@ class SuperMimicCommand(CommandTerm):
         if self.eval_mode:
             self.last_episode_stats = {}
             return
+        # Exam episodes stay outside the start-bin statistics (BlinkMimic2
+        # keeps them out of ``bin_G``): their clip-end resets are masked out of
+        # the done feed, and with no exam rows the mask term is a value no-op.
+        done = self._env.reset_buf & ~self.exam_mask
         self.last_episode_stats = update_start_bin_returns(
             self.bin_G,
             self.start_bin,
@@ -625,7 +695,7 @@ class SuperMimicCommand(CommandTerm):
             self.ep_ret,
             self.ep_disc_ret,
             self._env.termination_manager.terminated,
-            self._env.reset_buf,
+            done,
             self.gamma,
         )
 
@@ -721,12 +791,16 @@ def supermimic_reward(env: ManagerBasedRlEnv, command_name: str = "motion") -> t
 
 def supermimic_termination(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
     command = _command(env, command_name)
+    # Exam worlds keep the hard termination (a fallen exam robot ends that
+    # clip's rollout, matching BlinkMimic2); only the wall-clock timeout is
+    # lifted for them so long clips run to their end.
     return command.mdp.termination(command.state(), command.f + 1)
 
 
 def supermimic_timeout(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
     command = _command(env, command_name)
-    return command.ep_step + 1 >= command.max_episode_steps
+    # The episode cap does not apply to exam worlds (their length is the clip).
+    return (command.ep_step + 1 >= command.max_episode_steps) & ~command.exam_mask
 
 
 def supermimic_clip_end(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
