@@ -299,6 +299,19 @@ class SuperMimicCommand(CommandTerm):
             torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
             torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
         )
+        # Fixed-address carrier mirroring the live (pre-reset) state for the
+        # captured reset segment. The read plan reallocates its derived body
+        # packet tensors on every refresh, so a captured command.state() reads
+        # whichever allocation now owns the capture-time address; the reset
+        # publication must never read the packet, only these stable tensors.
+        self._live_state_carrier = (
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
+            torch.zeros((self.num_envs, NUM_J), dtype=torch.float32, device=device),
+        )
         self.ep_step = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.start_bin = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
         self.ep_disc_ret = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
@@ -413,6 +426,16 @@ class SuperMimicCommand(CommandTerm):
     def reset_state_carrier(self) -> tuple[torch.Tensor, ...]:
         """Fixed-address per-row state each reset last wrote, in State layout."""
         return self._reset_state_carrier
+
+    def refresh_live_state(self) -> None:
+        """Mirror the live (pre-reset) state into the fixed-address carrier.
+
+        Runs outside the captured reset segment every step, where the read
+        plan packet is fresh; the captured segment then publishes through the
+        carrier and never reads the (reallocated) packet.
+        """
+        for carrier, value in zip(self._live_state_carrier, self.state(), strict=True):
+            carrier.copy_(value)
 
     def observation(self) -> torch.Tensor:
         return self.mdp.obs(self.state(), self.a_prev, self.xi, self.f)

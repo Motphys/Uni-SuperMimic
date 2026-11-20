@@ -96,6 +96,11 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         if self._pre_action is None:
             raise RuntimeError("SuperMimic update_state requires a preceding apply_action snapshot")
         command = self._supermimic_command
+        # Refresh the fixed-address live-state mirror while the read-plan packet
+        # is fresh: the captured reset segment publishes through it and must
+        # never read the packet tensors, which the read plan reallocates on
+        # every refresh.
+        command.refresh_live_state()
         transition = self._make_transition_info(
             self._pre_action["state"],
             command.state(),
@@ -124,18 +129,21 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         if reset_mask is None:
             state: tuple[torch.Tensor, ...] = command.state()
         else:
-            # Post-reset publication: the read plan does not refresh inside the
-            # replayed reset segment, so done rows must take their state from
-            # the fixed-address carrier holding exactly what the reset wrote.
-            live = command.state()
-            carrier = command.reset_state_carrier
+            # Post-reset publication inside the captured segment: done rows take
+            # the state the reset wrote and every other row takes the fixed-
+            # address live mirror refreshed by update_state this step. Neither
+            # may read the read-plan packet: its derived body tensors are
+            # reallocated on every refresh, so a captured read would fetch
+            # whichever allocation now owns the capture-time address.
+            written_state = command.reset_state_carrier
+            live_state = command._live_state_carrier
             state = tuple(
                 torch.where(
                     reset_mask.reshape((reset_mask.shape[0],) + (1,) * (written.ndim - 1)),
                     written,
                     read,
                 )
-                for written, read in zip(carrier, live, strict=True)
+                for written, read in zip(written_state, live_state, strict=True)
             )
         fresh = make_current_info(
             state,
