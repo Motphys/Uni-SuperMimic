@@ -46,7 +46,7 @@ def build_env_override(
     cfg: DictConfig, *, eval_mode: bool = False, learner_device: str | None = None
 ) -> dict[str, Any]:
     override: dict[str, Any] = EnvConfigAdapter(
-        cfg, root_dir=Path.cwd(), algo_name="supermimic"
+        cfg, root_dir=Path.cwd()
     ).build_task_env_cfg_override()
     override = apply_collector_tensor_device_override(
         override,

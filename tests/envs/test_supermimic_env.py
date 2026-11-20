@@ -100,7 +100,7 @@ def _runtime_cfg(
     ):
         owner = compose("config", overrides=[f"task=g1_super_mimic/{backend}"])
     override = EnvConfigAdapter(
-        owner, root_dir=root, algo_name="supermimic"
+        owner, root_dir=root
     ).build_task_env_cfg_override()
     cfg = registry.materialize_env_config("G1SuperMimic")
     assert isinstance(cfg, ManagerBasedRlEnvCfg)

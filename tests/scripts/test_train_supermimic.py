@@ -38,7 +38,7 @@ def _compose(backend: str = "mjwarp") -> Any:
 def test_owner_materializes_complete_task(backend: str) -> None:
     cfg = _compose(backend)
     override = EnvConfigAdapter(
-        cfg, root_dir=Path.cwd(), algo_name="supermimic"
+        cfg, root_dir=Path.cwd()
     ).build_task_env_cfg_override()
     registry.ensure_registries()
     env_cfg = registry.materialize_env_config("G1SuperMimic")

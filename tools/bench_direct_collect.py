@@ -153,7 +153,7 @@ def compose_override():
     from unilab.base.config_adapter import EnvConfigAdapter
 
     return EnvConfigAdapter(
-        owner, root_dir=ROOT, algo_name="supermimic"
+        owner, root_dir=ROOT
     ).build_task_env_cfg_override()
 
 
