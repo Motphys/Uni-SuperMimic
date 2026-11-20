@@ -56,15 +56,16 @@ def main() -> None:
             shutil.copy(source, out_dir / snapshot_name)
     out = dict(last, pi=averaged, averaged_from=its, averaged_run=str(run_dir))
     torch.save(out, out_dir / f"ckpt_{its[-1]:06d}.pt")
-    json.dump(
-        {
-            "run_dir": str(run_dir),
-            "ckpts": its,
-            "kept_from_last": [k for k in averaged if keep(k)],
-        },
-        out_dir / "avg_info.json",
-        indent=1,
-    )
+    with (out_dir / "avg_info.json").open("w", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "run_dir": str(run_dir),
+                "ckpts": its,
+                "kept_from_last": [k for k in averaged if keep(k)],
+            },
+            stream,
+            indent=1,
+        )
     print(f"averaged {len(its)} checkpoints -> {out_dir}/ckpt_{its[-1]:06d}.pt")
 
 
