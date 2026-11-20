@@ -58,6 +58,7 @@ class SuperMimicConfig:
     critic_minibatches: int = 4
     no_critic: bool = False
     lr_decay_iters: int = 250_000
+    fail_penalty: float = 0.0
     ckpt_every: int = 2000
     log_every: int = 50
     log_backend: str = "tensorboard"
@@ -551,7 +552,15 @@ class SuperMimicLearner:
             discount = self.cfg.gamma ** torch.arange(
                 self.cfg.horizon, device=self.device, dtype=torch.float32
             ).unsqueeze(-1)
-            objective = (discount * continuation * rewards).sum(0)
+            # BlinkMimic2-style actor-only failure penalty: the imagined reward
+            # used by the policy objective is shaped by the soft-termination
+            # probability, while the critic below keeps learning the plain
+            # tracking reward (``detached_rewards``).
+            if self.cfg.fail_penalty:
+                actor_rewards = rewards - self.cfg.fail_penalty * dones
+            else:
+                actor_rewards = rewards
+            objective = (discount * continuation * actor_rewards).sum(0)
             survival = alive[-1]
             reward_sum = (continuation * rewards).detach().sum(0)
             detached_rewards, detached_dones = rewards.detach(), dones.detach()

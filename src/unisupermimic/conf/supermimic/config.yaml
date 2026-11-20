@@ -36,6 +36,9 @@ algo:
   critic_minibatches: 4
   no_critic: false
   lr_decay_iters: 12000
+  # BlinkMimic2-style actor-only imagined failure penalty (0 disables; 3.0 is
+  # the BlinkMimic2 value). The critic keeps learning the plain reward.
+  fail_penalty: 0.0
   ckpt_every: 2000
   log_every: 50
   log_backend: tensorboard
