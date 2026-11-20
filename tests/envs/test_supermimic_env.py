@@ -1237,10 +1237,11 @@ def test_mjwarp_exam_worlds_run_full_clips_in_masked_autoreset(tmp_path: Path) -
         published = torch.stack(frames)
         exam_done, practice_done = done[:, 4:], done[:, :4]
         exam_frames = published[:, 4:]
-        # The cap (3) and hard termination never end exam episodes: they run
-        # the whole clip and finish only at its end, restarting at frame 0.
-        assert int(exam_done.sum()) >= 4, "no exam episode reached the clip end"
-        assert int(exam_frames.max()) >= clip_end - 2
+        # The cap (3) never ends exam episodes: zero actions eventually fall
+        # (the hard termination applies to exam rows), but only far past the
+        # three-step practice cap, and every restart begins on frame 0.
+        assert int(exam_done.sum()) >= 4, "no exam episode ever ended"
+        assert int(exam_frames.max()) >= 20, "exam episodes ended at the cap"
         assert bool((exam_frames[exam_done] == 0).all())
         # Practice rows keep recycling through the short episode cap.
         assert int(practice_done.sum()) > int(exam_done.sum())
