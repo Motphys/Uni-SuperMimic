@@ -37,11 +37,13 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.manager_terms import (
     make_current_info,
     make_transition_info,
     merge_current_info,
+    sample_frontier_frames,
     sample_start_frames,
     start_bin_probabilities,
     supermimic_clip_end,
     supermimic_termination,
     supermimic_timeout,
+    update_clip_fail_stats,
     update_start_bin_returns,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import MAX_STEP_REWARD
@@ -584,6 +586,7 @@ def test_exam_worlds_activate_and_round_robin_clip_starts() -> None:
     command._num_clips = 2
     command.exam_mask = torch.zeros(4, dtype=torch.bool)
     command._exam_clip_cursor = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    command._exam_margin = False
     command.motion = SimpleNamespace(clip_start=torch.tensor([0, 60]))
 
     frames = command.activate_exam_worlds(2)
@@ -603,6 +606,124 @@ def test_exam_worlds_activate_and_round_robin_clip_starts() -> None:
         command.activate_exam_worlds(4)
     with pytest.raises(TypeError, match="exam row count must be an int"):
         command.activate_exam_worlds(True)  # type: ignore[arg-type]
+
+
+def _margin_command(num_envs: int = 6) -> SuperMimicCommand:
+    command = object.__new__(SuperMimicCommand)
+    command._env = SimpleNamespace(num_envs=num_envs)
+    command._device = torch.device("cpu")
+    command._num_clips = 4
+    command.exam_mask = torch.zeros(num_envs, dtype=torch.bool)
+    command._exam_clip_cursor = torch.arange(num_envs, dtype=torch.int64) % 4
+    command._exam_clip_table = torch.arange(num_envs, dtype=torch.int64) % 4
+    command._exam_margin = True
+    command._clip_fail_ema = torch.zeros(4, dtype=torch.float32)
+    command._clip_fail_frame = torch.full((4,), -1, dtype=torch.int64)
+    command.motion = SimpleNamespace(clip_start=torch.tensor([0, 60, 120, 180]))
+    return command
+
+
+def test_margin_exam_clips_select_by_failure_boundary_and_gather_first_frames() -> None:
+    command = _margin_command()
+    command._clip_fail_ema.copy_(torch.tensor([0.0, 0.9, 0.99, 0.2]))
+
+    mean_fail_ema = command.refresh_exam_clips(2)
+
+    # Margins |EMA - 1| are [1.0, 0.1, 0.01, 0.8]: the exam rows take the two
+    # clips closest to the failure boundary, at most one exam per clip, and
+    # the mean failure EMA of the examined clips is reported for logging.
+    assert command._exam_clip_table.tolist() == [0, 1, 2, 3, 2, 1]
+    torch.testing.assert_close(mean_fail_ema, torch.tensor((0.99 + 0.9) / 2))
+    # The captured reset segment gathers the table's clip first frames; the
+    # round-robin cursor never advances in margin mode.
+    exam_frames = command._exam_start_frames(torch.ones(6, dtype=torch.bool))
+    assert exam_frames.tolist() == [0, 60, 120, 180, 120, 60]
+    assert command._exam_clip_cursor.tolist() == [0, 1, 2, 3, 0, 1]
+
+    # Activation goes through the same margin selection: the newly assigned
+    # rows start on the selected clips' first frames.
+    command = _margin_command()
+    command._clip_fail_ema.copy_(torch.tensor([0.0, 0.9, 0.99, 0.2]))
+    frames = command.activate_exam_worlds(2)
+    assert command.exam_mask.tolist() == [False, False, False, False, True, True]
+    assert frames.tolist() == [0, 60, 120, 180, 120, 60]
+
+    with pytest.raises(ValueError, match="exam row count must be in"):
+        command.refresh_exam_clips(6)
+    with pytest.raises(ValueError, match="exceeds the clip count"):
+        _margin_command(num_envs=8).refresh_exam_clips(6)
+
+
+def test_frontier_frames_sample_failed_clip_windows_with_equal_mass() -> None:
+    generator = torch.Generator().manual_seed(11)
+    clip_fail_frame = torch.tensor([95, 140, -1, 355], dtype=torch.int64)
+    clip_start = torch.tensor([0, 100, 200, 300], dtype=torch.int64)
+    clip_end = torch.tensor([99, 199, 299, 399], dtype=torch.int64)
+    draws = 8192
+
+    frames = sample_frontier_frames(
+        clip_fail_frame,
+        clip_start,
+        clip_end,
+        50,
+        torch.rand(draws, generator=generator),
+        torch.rand(draws, generator=generator),
+    )
+
+    assert frames.shape == (draws,)
+    # Only the failed clips (0, 1, 3) carry mass, each uniformly over its
+    # frontier window [failure frame - 50, clip end) clipped into the clip:
+    # [45, 99), [100, 199) (the failure predates the window), [305, 399).
+    windows = {0: (45, 99), 1: (100, 199), 3: (305, 399)}
+    counts = {}
+    for clip, (low, high) in windows.items():
+        selected = (frames >= low) & (frames < high)
+        counts[clip] = int(selected.sum())
+        assert frames[selected].min() >= low
+        assert frames[selected].max() < high
+    assert sum(counts.values()) == draws, "the never-failed clip 2 drew mass"
+    # Equal mass per failed clip: a third of the draws each (binomial sigma
+    # ~47 at 8192 draws; the bound keeps the test deterministic enough).
+    assert all(abs(count - draws / 3) < 300 for count in counts.values())
+    # The window interior is actually covered, not just its endpoints.
+    clip0 = frames[(frames >= 45) & (frames < 99)]
+    assert int(clip0.min()) <= 47
+    assert int(clip0.max()) >= 96
+
+
+def test_update_clip_fail_stats_ema_and_last_failure_frame() -> None:
+    clip_fail_ema = torch.tensor([0.5, 0.5, 0.5])
+    clip_fail_frame = torch.tensor([-1, 20, -1], dtype=torch.int64)
+
+    update_clip_fail_stats(
+        clip_fail_ema,
+        clip_fail_frame,
+        clip_id=torch.tensor([0, 0, 1, 2]),
+        frames=torch.tensor([10, 20, 55, 7]),
+        term=torch.tensor([True, False, True, False]),
+        done=torch.tensor([True, True, True, True]),
+        decay=0.7,
+    )
+
+    # Per-clip mean of the ended episodes' hard-termination verdicts, one EMA
+    # step per touched clip: clip 0 fails half, clip 1 fails, clip 2 passes.
+    torch.testing.assert_close(clip_fail_ema, torch.tensor([0.5, 0.7 * 0.5 + 0.3, 0.7 * 0.5]))
+    # Terminating rows scatter their frame (amax keeps the furthest failure);
+    # passing rows write -1 and never lower an existing entry.
+    assert clip_fail_frame.tolist() == [10, 55, -1]
+
+    # Without episode ends the statistics are untouched.
+    update_clip_fail_stats(
+        clip_fail_ema,
+        clip_fail_frame,
+        clip_id=torch.tensor([0, 1, 2]),
+        frames=torch.tensor([11, 21, 3]),
+        term=torch.tensor([True, True, True]),
+        done=torch.tensor([False, False, False]),
+        decay=0.7,
+    )
+    torch.testing.assert_close(clip_fail_ema, torch.tensor([0.5, 0.7 * 0.5 + 0.3, 0.7 * 0.5]))
+    assert clip_fail_frame.tolist() == [10, 55, -1]
 
 
 def test_context_events_share_command_xi_and_replay_startup_values() -> None:
@@ -1064,9 +1185,11 @@ def test_mjwarp_exam_worlds_run_full_clips_in_masked_autoreset(tmp_path: Path) -
 
     Exam activation flips the persistent mask in place after the reset-segment
     graph may already be captured, and every later replay must honor it without
-    any host synchronization: exam rows restart on the clip's first frame, the
-    episode cap and hard termination never end their episodes, and only the
-    clip end does. Practice rows keep recycling through the cap.
+    any host synchronization: exam rows restart on the clip's first frame and
+    the episode cap never ends their episodes (only the clip end, or a fall,
+    does — the hard termination still applies to exam rows, matching
+    BlinkMimic2). Zero actions keep the standing keyframe so the rollouts here
+    run to the clip ends. Practice rows keep recycling through the cap.
     """
     _require_backend_runtime("mjwarp")
     cfg = _runtime_cfg(tmp_path, masked=True)
@@ -1080,10 +1203,11 @@ def test_mjwarp_exam_worlds_run_full_clips_in_masked_autoreset(tmp_path: Path) -
         assert isinstance(command, SuperMimicCommand)
         command.max_episode_steps = 3  # practice rows recycle every three steps
         clip_end = int(command.motion.clip_end[0].item())
-        generator = torch.Generator(device=env.device).manual_seed(4)
 
         def action() -> torch.Tensor:
-            return torch.randn((8, 29), generator=generator, device=env.device) * 0.1
+            # Zero actions hold the standing keyframe so exam rows survive to
+            # their clip ends (random actions fall and hard-terminate).
+            return torch.zeros((8, 29), device=env.device)
 
         for _ in range(4):  # warm up eager paths and capture the autoreset graph
             env.step(action())

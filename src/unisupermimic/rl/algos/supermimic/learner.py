@@ -72,6 +72,19 @@ class SuperMimicConfig:
     exam_frac: float = 0.0
     exam_share_ramp: float = 0.0
     exam_ramp_iters: int = 2500
+    # exams-v2 margin mode, off by default (requires exam_frac > 0). When on,
+    # the command keeps per-clip EMA failure statistics (``fail_ema`` decay,
+    # BlinkMimic2 uses 0.7) and re-selects the exam clips every
+    # ``exam_clip_window`` iterations by margin priority: the per-clip EMA
+    # failure rate closest to 1 is examined first, one exam row per clip
+    # (device-side topk, deterministic). ``frontier_frac`` of the practice
+    # resets (fixed per-row Bernoulli ratio) start inside the frontier window
+    # of a failed clip — [failure frame - 50, clip end) — instead of the
+    # bin-EMA mixture; the rest keep the existing sampling.
+    exam_margin: bool = False
+    exam_clip_window: int = 250
+    frontier_frac: float = 0.5
+    fail_ema: float = 0.7
     ckpt_every: int = 2000
     log_every: int = 50
     log_backend: str = "tensorboard"
@@ -164,6 +177,29 @@ class SuperMimicLearner:
                     f"exam_frac {cfg.exam_frac} resolves to {exam_rows} exam rows of "
                     f"{env.num_envs} environments"
                 )
+        if cfg.exam_margin:
+            if exam_rows == 0:
+                raise ValueError(
+                    "SuperMimic exam_margin requires exam_frac > 0: margin mode "
+                    "selects the exam worlds' clips"
+                )
+            if not 0.0 <= cfg.frontier_frac <= 1.0:
+                raise ValueError(f"frontier_frac must be in [0, 1], got {cfg.frontier_frac}")
+            if not 0.0 <= cfg.fail_ema < 1.0:
+                raise ValueError(f"fail_ema must be in [0, 1), got {cfg.fail_ema}")
+            if isinstance(cfg.exam_clip_window, bool) or cfg.exam_clip_window <= 0:
+                raise ValueError(f"exam_clip_window must be positive, got {cfg.exam_clip_window}")
+            if not callable(getattr(env, "configure_supermimic_exam_margin", None)):
+                raise TypeError(
+                    f"{type(env).__name__} does not support SuperMimic margin exams "
+                    "(missing configure_supermimic_exam_margin)"
+                )
+            # Configure before any stepping (and any reset-segment capture):
+            # the command bakes these Python-level switches into the captured
+            # segment's branch layout once, here.
+            env.configure_supermimic_exam_margin(
+                frontier_frac=cfg.frontier_frac, fail_ema=cfg.fail_ema
+            )
         self._exam_rows_planned = exam_rows
 
         self.env = env
@@ -261,9 +297,11 @@ class SuperMimicLearner:
         # Exam schedule (all zeros while exams are off or not yet started):
         # ``_exam_rows`` counts the active exam worlds (the last rows), and
         # ``_exam_share`` is the probability each imagination start is drawn
-        # from those rows' transitions.
+        # from those rows' transitions. ``_exam_fail_ema`` carries the mean
+        # failure EMA of the currently examined clips (margin mode only).
         self._exam_rows = 0
         self._exam_share = 0.0
+        self._exam_fail_ema: float | None = None
         self.stats = _empty_stats()
         self._wm_rollout_fn = self._compile(self._wm_rollout)
         self._wm_err_fn = self._compile(self._wm_err)
@@ -546,9 +584,12 @@ class SuperMimicLearner:
 
         Activation is a one-time, eager, iteration-boundary event: the env
         flips its persistent exam mask in place and resets the newly assigned
-        rows onto clip first frames. Afterwards only the device-side sampling
+        rows onto clip first frames (margin mode selects those clips by
+        failure-EMA priority). Afterwards only the device-side sampling
         probability changes, linearly from ``exam_frac`` to
-        ``exam_share_ramp``.
+        ``exam_share_ramp``, and — in margin mode — the exam clip table is
+        re-selected every ``exam_clip_window`` iterations (eagerly, outside
+        every captured segment; the activation iteration already selected).
         """
         if self._exam_rows_planned == 0:
             return
@@ -564,6 +605,15 @@ class SuperMimicLearner:
             self._exam_share = self.cfg.exam_frac + progress * (
                 self.cfg.exam_share_ramp - self.cfg.exam_frac
             )
+        if (
+            self.cfg.exam_margin
+            and iteration % self.cfg.exam_clip_window == 0
+            and iteration != self.cfg.exam_start_iter
+        ):
+            mean_fail_ema = self.env.refresh_supermimic_exam_clips(self._exam_rows)
+            # One host read per refresh window (never inside a captured
+            # segment) so TensorBoard can watch the margin converge.
+            self._exam_fail_ema = float(mean_fail_ema)
 
     def _sample_valid_starts(
         self, batch_size: int
@@ -981,6 +1031,7 @@ class SuperMimicLearner:
                         ep_ret_norm=ep_ret_norm,
                         term_frac=term_frac,
                         exam_survival=exam_survival,
+                        exam_fail_ema=self._exam_fail_ema,
                         iter_sim_steps=collect_steps * self.env.num_envs,
                         collect_time=train_phase_start - iteration_start,
                         learn_time=train_time,

@@ -49,6 +49,16 @@ algo:
   exam_frac: 0.0
   exam_share_ramp: 0.9
   exam_ramp_iters: 2500
+  # exams-v2 margin mode, off by default (requires exam_frac > 0): exam clips
+  # are re-selected every exam_clip_window iterations by margin priority (the
+  # per-clip EMA failure rate closest to 1 first, one exam row per clip), and
+  # frontier_frac of the practice resets start inside a failed clip's frontier
+  # window (failure frame - 50 .. clip end, equal mass per failed clip).
+  # fail_ema is the failure-EMA decay (BlinkMimic2: 0.7).
+  exam_margin: false
+  exam_clip_window: 250
+  frontier_frac: 0.5
+  fail_ema: 0.7
   ckpt_every: 2000
   log_every: 50
   log_backend: tensorboard

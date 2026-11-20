@@ -43,6 +43,11 @@ if TYPE_CHECKING:
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
+# exams-v2 frontier practice: practice resets near a failed clip's failure
+# frame start inside the window [failure frame - FRONTIER_FRAMES, clip end),
+# matching BlinkMimic2's ``--front_win`` default.
+FRONTIER_FRAMES = 50
+
 
 def start_bin_probabilities(
     bin_G: torch.Tensor,
@@ -93,6 +98,66 @@ def sample_start_frames(
     end = torch.minimum(start + BIN_FRAMES, motion.clip_end[motion.bin_clip[bins]])
     frames = start + (rng.random((num_samples,)) * (end - start).float()).long()
     return frames, bins
+
+
+def sample_frontier_frames(
+    clip_fail_frame: torch.Tensor,
+    clip_start: torch.Tensor,
+    clip_end: torch.Tensor,
+    window: int,
+    u_clip: torch.Tensor,
+    u_position: torch.Tensor,
+) -> torch.Tensor:
+    """Sample frontier practice starts: equal mass per failed clip.
+
+    Each draw picks a failed clip uniformly (inverse-CDF ``searchsorted``
+    over the failed-clip indicator — ``right=True`` so unfailed clips carry
+    no mass), then a frame uniform in ``[failure frame - window, clip end)``
+    clipped into the clip. With no failed clip anywhere the draws return
+    clipped clip-0 frames; callers gate those rows off through the
+    failed-clip availability flag so only the (fixed-count) RNG draws leak.
+    Pure elementwise/searchsorted device work: safe inside the captured
+    reset segment.
+    """
+    failed = (clip_fail_frame >= 0).to(torch.float32)
+    cdf = torch.cumsum(failed, dim=0)
+    clips = torch.searchsorted(cdf, u_clip * cdf[-1], right=True).clamp(max=failed.numel() - 1)
+    fail = torch.minimum(torch.maximum(clip_fail_frame[clips], clip_start[clips]), clip_end[clips])
+    low = torch.minimum(torch.maximum(fail - window, clip_start[clips]), clip_end[clips] - 1)
+    span = (clip_end[clips] - low).float()
+    return low + (u_position * span).long()
+
+
+def update_clip_fail_stats(
+    clip_fail_ema: torch.Tensor,
+    clip_fail_frame: torch.Tensor,
+    clip_id: torch.Tensor,
+    frames: torch.Tensor,
+    term: torch.Tensor,
+    done: torch.Tensor,
+    decay: float,
+) -> None:
+    """Update per-clip EMA failure rate and last failure frame in place.
+
+    Sync-free like :func:`update_start_bin_returns`: episodes ending this
+    step (practice and exam rows alike) scatter their hard-termination
+    verdict into per-clip means for one EMA step (``decay`` keeps the old
+    value), and failed endings scatter their frame into the last-failure-
+    frame table (``amax`` reduction: deterministic under index clashes and
+    never lowered by non-failing rows writing ``-1``).
+    """
+    ended = done.to(clip_fail_ema.dtype)
+    failed = term & done
+    sums = torch.zeros_like(clip_fail_ema).scatter_add_(0, clip_id, failed.to(ended.dtype))
+    counts = torch.zeros_like(clip_fail_ema).scatter_add_(0, clip_id, ended)
+    touched = counts > 0
+    mean_fail = sums / counts.clamp(min=1.0)
+    clip_fail_ema.copy_(
+        torch.where(touched, decay * clip_fail_ema + (1.0 - decay) * mean_fail, clip_fail_ema)
+    )
+    clip_fail_frame.scatter_reduce_(
+        0, clip_id, torch.where(failed, frames, -1), reduce="amax", include_self=True
+    )
 
 
 def update_start_bin_returns(
@@ -329,6 +394,21 @@ class SuperMimicCommand(CommandTerm):
             torch.arange(self.num_envs, dtype=torch.int64, device=device)
             % max(self._num_clips, 1)
         )
+        # exams-v2 margin mode (learner-configured through
+        # ``configure_exam_margin``; default off keeps the round-robin exam
+        # behavior above bit-identical). The failure statistics and the exam
+        # clip table live at fixed addresses from construction so a captured
+        # reset segment keeps reading them after every replay; the switches
+        # are Python-level and must be set once, eagerly, before any
+        # reset-segment capture so the captured branch layout never changes.
+        self._exam_margin = False
+        self._frontier_frac = 0.0
+        self._fail_ema = 0.7
+        self._clip_fail_ema = torch.zeros(self._num_clips, dtype=torch.float32, device=device)
+        self._clip_fail_frame = torch.full((self._num_clips,), -1, dtype=torch.int64, device=device)
+        self._exam_clip_table = torch.arange(self.num_envs, dtype=torch.int64, device=device) % max(
+            self._num_clips, 1
+        )
         self.bin_G = torch.zeros(self.motion.num_bins, dtype=torch.float32, device=device)
         self.bin_w_avg = torch.full(
             (self.motion.num_bins,), 1.0 / self.motion.num_bins, device=device
@@ -485,6 +565,97 @@ class SuperMimicCommand(CommandTerm):
 
     supports_reset_selection: ClassVar[bool] = True
 
+    def configure_exam_margin(self, *, frontier_frac: float, fail_ema: float) -> None:
+        """Enable exams-v2 margin mode: failure statistics + frontier practice.
+
+        Eager, one-time, and required to run before any reset-segment capture:
+        the captured segment bakes these Python-level switches, and the
+        per-clip statistics and exam clip table already live at fixed
+        addresses from construction. ``frontier_frac`` 0 keeps the bin-EMA
+        start sampling and only margin-selects the exam clips.
+        """
+        if isinstance(frontier_frac, bool) or not isinstance(frontier_frac, (int, float)):
+            raise TypeError(
+                f"SuperMimic frontier_frac must be a real number, got {frontier_frac!r}"
+            )
+        if not 0.0 <= float(frontier_frac) <= 1.0:
+            raise ValueError(f"SuperMimic frontier_frac must be in [0, 1], got {frontier_frac}")
+        if isinstance(fail_ema, bool) or not isinstance(fail_ema, (int, float)):
+            raise TypeError(f"SuperMimic fail_ema must be a real number, got {fail_ema!r}")
+        if not 0.0 <= float(fail_ema) < 1.0:
+            raise ValueError(f"SuperMimic fail_ema must be in [0, 1), got {fail_ema}")
+        self._frontier_frac = float(frontier_frac)
+        self._fail_ema = float(fail_ema)
+        self._exam_margin = True
+
+    def _write_exam_clip_table(self, num_rows: int) -> torch.Tensor:
+        """Select exam clips by margin priority into the fixed-address table.
+
+        Simplified BlinkMimic2 margin: the per-clip EMA failure rate closest
+        to 1 (failure danger boundary) is examined first. A deterministic
+        device-side ``topk`` (ties broken by clip id) hands the ``num_rows``
+        exam rows distinct clips — at most one exam instance per clip — and
+        writes them into the last ``num_rows`` entries of the persistent
+        table; the captured reset segment gathers clip first frames from it
+        on every replay. Returns the selected clips' mean failure EMA (a
+        device scalar for the caller to log).
+        """
+        if num_rows > self._num_clips:
+            raise ValueError(
+                f"SuperMimic exam row count {num_rows} exceeds the clip count {self._num_clips}"
+            )
+        margin = (self._clip_fail_ema - 1.0).abs()
+        clips = torch.topk(margin, k=num_rows, largest=False, sorted=True).indices
+        self._exam_clip_table[self.num_envs - num_rows :].copy_(clips)
+        return self._clip_fail_ema[clips].mean()
+
+    def refresh_exam_clips(self, num_rows: int) -> torch.Tensor:
+        """Re-select the exam clips by margin priority (graph-out, eager).
+
+        Runs at iteration boundaries outside any captured segment; only the
+        values of the fixed-address table change, so later replays pick the
+        new clips up without recapture.
+        """
+        if isinstance(num_rows, bool) or not isinstance(num_rows, int):
+            raise TypeError(f"SuperMimic exam row count must be an int, got {num_rows!r}")
+        if not 0 < num_rows < self.num_envs:
+            raise ValueError(
+                f"SuperMimic exam row count must be in (0, {self.num_envs}), got {num_rows}"
+            )
+        return self._write_exam_clip_table(num_rows)
+
+    def _frontier_override(
+        self, frames: torch.Tensor, bins: torch.Tensor, exam_selected: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Merge BlinkMimic2 frontier starts into sampled practice starts.
+
+        RNG layout stays deterministic: every call consumes exactly three
+        further ``(n,)`` draws in a fixed order — the per-row Bernoulli mask
+        (fixed ratio ``frontier_frac`` on every step, never a per-step mode
+        switch), the failed-clip choice, and the window position — whether
+        or not any row ends up taking a frontier start. Exam rows and the
+        no-failed-clip case are gated off device-side (value no-ops), so the
+        captured reset segment's RNG consumption never depends on data.
+        """
+        count = frames.shape[0]
+        draw_mask = self._rng.random((count,))
+        draw_clip = self._rng.random((count,))
+        draw_position = self._rng.random((count,))
+        frontier_frames = sample_frontier_frames(
+            self._clip_fail_frame,
+            self.motion.clip_start,
+            self.motion.clip_end,
+            FRONTIER_FRAMES,
+            draw_clip,
+            draw_position,
+        )
+        available = (self._clip_fail_frame >= 0).any()
+        use_frontier = (draw_mask < self._frontier_frac) & ~exam_selected & available
+        return (
+            torch.where(use_frontier, frontier_frames, frames),
+            torch.where(use_frontier, self.motion.frame_bin[frontier_frames], bins),
+        )
+
     def activate_exam_worlds(self, num_rows: int) -> torch.Tensor:
         """Mark the last ``num_rows`` rows as exam worlds; return their frames.
 
@@ -492,10 +663,12 @@ class SuperMimicCommand(CommandTerm):
         on a clip's first frame and runs to the clip end (hard termination and
         the episode cap do not apply), the learner collects them with the EMA
         policy, and their episodes stay outside the start-bin statistics. The
-        returned frames are the first frames of the clips the round-robin
-        cursor hands the newly activated rows; the caller resets them
-        explicitly. Only tensor values are written (the mask keeps its
-        address), so a captured reset segment replays with the updated mask.
+        returned frames are the first frames of the clips the newly activated
+        rows run: margin mode selects them by failure-EMA priority (writing
+        the fixed-address exam clip table), otherwise the round-robin cursor
+        hands them out. The caller resets them explicitly. Only tensor values
+        are written (the mask keeps its address), so a captured reset segment
+        replays with the updated mask.
         """
         if isinstance(num_rows, bool) or not isinstance(num_rows, int):
             raise TypeError(f"SuperMimic exam row count must be an int, got {num_rows!r}")
@@ -504,6 +677,10 @@ class SuperMimicCommand(CommandTerm):
                 f"SuperMimic exam row count must be in (0, {self.num_envs}), got {num_rows}"
             )
         rows = torch.arange(self.num_envs, device=self._device) >= self.num_envs - num_rows
+        if self._exam_margin:
+            self._write_exam_clip_table(num_rows)
+            self.exam_mask.copy_(rows)
+            return self.motion.clip_start[self._exam_clip_table].clone()
         self._exam_clip_cursor.copy_(
             torch.where(
                 rows, (self._exam_clip_cursor + 1) % self._num_clips, self._exam_clip_cursor
@@ -515,13 +692,18 @@ class SuperMimicCommand(CommandTerm):
     def _exam_start_frames(self, reset_mask: torch.Tensor) -> torch.Tensor:
         """Per-row clip first frames for exam worlds (fixed-shape, graph-safe).
 
-        Advances the round-robin clip cursor only on rows that are both
-        resetting and exam, then gathers every row's cursor clip start frame;
-        rows that are not resetting exam worlds produce values the callers
-        discard. The deterministic cursor advance keeps the shared training
-        RNG stream untouched, so exam activation never perturbs the captured
+        Margin mode gathers the fixed-address exam clip table (refreshed
+        eagerly at iteration boundaries): restarting exam rows relaunch the
+        table's clip, so at most one exam instance per selected clip runs.
+        The default round-robin path advances the clip cursor only on rows
+        that are both resetting and exam, then gathers every row's cursor
+        clip start frame; rows that are not resetting exam worlds produce
+        values the callers discard. Both paths keep the shared training RNG
+        stream untouched, so exam activation never perturbs the captured
         reset segment's RNG layout.
         """
+        if self._exam_margin:
+            return self.motion.clip_start[self._exam_clip_table]
         advance = reset_mask & self.exam_mask
         cursor = (self._exam_clip_cursor + 1) % self._num_clips
         self._exam_clip_cursor.copy_(torch.where(advance, cursor, self._exam_clip_cursor))
@@ -560,6 +742,13 @@ class SuperMimicCommand(CommandTerm):
                     update=reset_mask.any(),
                     cdf_sampling=True,
                 )
+                # Frontier practice: a fixed-ratio Bernoulli share of the
+                # practice rows restarts in a failed clip's frontier window
+                # instead of its sampled bin (value-only merge; a no-op while
+                # no clip has failed). Skipped entirely when margin mode is
+                # off, keeping the default RNG stream bit-identical.
+                if self._exam_margin and self._frontier_frac > 0.0:
+                    frames, bins = self._frontier_override(frames, bins, self.exam_mask)
                 # Exam worlds restart on a clip's first frame instead of the
                 # sampled start bin. Value-only override on fixed-address
                 # tensors: with no exam rows the mask is all false and the
@@ -577,6 +766,8 @@ class SuperMimicCommand(CommandTerm):
                     ids.numel(),
                     self._rng,
                 )
+                if self._exam_margin and self._frontier_frac > 0.0:
+                    frames, bins = self._frontier_override(frames, bins, self.exam_mask[ids])
                 exam_frames = self._exam_start_frames(reset_mask)
                 selected = self.exam_mask[ids]
                 frames = torch.where(selected, exam_frames[ids], frames)
@@ -698,6 +889,23 @@ class SuperMimicCommand(CommandTerm):
             done,
             self.gamma,
         )
+        # exams-v2 margin statistics: per-clip EMA failure rate and last
+        # failure frame from every episode end — practice and exam rows alike
+        # (an exam clip ends either failed at its hard termination or passed
+        # at its clip end). Runs after ``f`` advanced to the ended episode's
+        # frame (always within the clip, at its end at most), so the clip
+        # lookup stays inside the library. Sync-free and skipped entirely
+        # while margin mode is off.
+        if self._exam_margin:
+            update_clip_fail_stats(
+                self._clip_fail_ema,
+                self._clip_fail_frame,
+                self.motion.clip_id[self.f],
+                self.f,
+                self._env.termination_manager.terminated,
+                self._env.reset_buf,
+                self._fail_ema,
+            )
 
     def refresh_reset(self, reset_mask: torch.Tensor) -> None:
         del reset_mask
@@ -1096,6 +1304,7 @@ def _command(env: ManagerBasedRlEnv, command_name: str) -> SuperMimicCommand:
 
 
 __all__ = [
+    "FRONTIER_FRAMES",
     "SuperMimicAction",
     "SuperMimicActionCfg",
     "SuperMimicCommand",
@@ -1106,6 +1315,7 @@ __all__ = [
     "make_current_info",
     "make_transition_info",
     "merge_current_info",
+    "sample_frontier_frames",
     "sample_start_frames",
     "start_bin_probabilities",
     "supermimic_clip_end",
@@ -1114,5 +1324,6 @@ __all__ = [
     "supermimic_reward",
     "supermimic_termination",
     "supermimic_timeout",
+    "update_clip_fail_stats",
     "update_start_bin_returns",
 ]

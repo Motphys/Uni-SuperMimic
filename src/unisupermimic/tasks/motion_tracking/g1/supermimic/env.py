@@ -99,6 +99,29 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         )
         self.reset_to_frames(frames[env_ids], env_ids=env_ids)
 
+    def configure_supermimic_exam_margin(self, *, frontier_frac: float, fail_ema: float) -> None:
+        """Turn on exams-v2 margin mode on the command (eager, pre-capture).
+
+        Per-clip failure statistics start accumulating from the next step and
+        practice resets may draw frontier starts; exam clip selection switches
+        from the round-robin cursor to the margin-priority table. Runs once at
+        learner construction, before any reset-segment graph capture, so the
+        captured segment bakes the same Python-level branches.
+        """
+        self._supermimic_command.configure_exam_margin(
+            frontier_frac=frontier_frac, fail_ema=fail_ema
+        )
+
+    def refresh_supermimic_exam_clips(self, num_rows: int) -> torch.Tensor:
+        """Re-select the exam clips by margin priority (iteration boundary).
+
+        Runs eagerly outside any captured segment: the fixed-address exam clip
+        table takes the top-K margin-priority clips (one exam row per clip)
+        and every later captured-reset replay gathers their first frames.
+        Returns the selected clips' mean failure EMA for logging.
+        """
+        return self._supermimic_command.refresh_exam_clips(num_rows)
+
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> torch.Tensor:
         command = self._supermimic_command
         self._pre_action = {

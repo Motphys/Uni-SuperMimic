@@ -225,6 +225,22 @@ class ExamFakeEnv(FakeEnv):
         current["ep_step"][self.num_envs - num_rows :] = 0
 
 
+class MarginFakeEnv(ExamFakeEnv):
+    """ExamFakeEnv with the exams-v2 margin hooks the learner drives."""
+
+    def __init__(self, num_envs: int = 8):
+        super().__init__(num_envs)
+        self.margin_config: tuple[float, float] | None = None
+        self.exam_refreshes: list[int] = []
+
+    def configure_supermimic_exam_margin(self, *, frontier_frac: float, fail_ema: float) -> None:
+        self.margin_config = (frontier_frac, fail_ema)
+
+    def refresh_supermimic_exam_clips(self, num_rows: int) -> torch.Tensor:
+        self.exam_refreshes.append(num_rows)
+        return torch.tensor(0.42)
+
+
 def _exam_config(**overrides) -> SuperMimicConfig:
     values = dict(
         iterations=3,
@@ -775,3 +791,64 @@ def test_exam_survival_is_logged_to_tensorboard(tmp_path) -> None:
     events = accumulator.Scalars("Exam/survival")
     # Iteration 0 runs without exams; iterations 1 and 2 log survival.
     assert [event.step for event in events] == [2, 3]
+
+
+def test_margin_mode_requires_exams_and_a_margin_capable_env(tmp_path) -> None:
+    with pytest.raises(ValueError, match="exam_margin requires exam_frac"):
+        SuperMimicLearner(MarginFakeEnv(), _exam_config(exam_frac=0.0, exam_margin=True), tmp_path)
+    with pytest.raises(TypeError, match="configure_supermimic_exam_margin"):
+        SuperMimicLearner(ExamFakeEnv(), _exam_config(exam_margin=True), tmp_path)
+    with pytest.raises(ValueError, match="frontier_frac"):
+        SuperMimicLearner(
+            MarginFakeEnv(), _exam_config(exam_margin=True, frontier_frac=1.5), tmp_path
+        )
+    with pytest.raises(ValueError, match="fail_ema"):
+        SuperMimicLearner(MarginFakeEnv(), _exam_config(exam_margin=True, fail_ema=1.0), tmp_path)
+    with pytest.raises(ValueError, match="exam_clip_window"):
+        SuperMimicLearner(
+            MarginFakeEnv(), _exam_config(exam_margin=True, exam_clip_window=0), tmp_path
+        )
+
+
+def test_margin_mode_configures_the_env_and_refreshes_exam_clips_per_window(tmp_path) -> None:
+    env = MarginFakeEnv()
+    learner = SuperMimicLearner(env, _exam_config(exam_margin=True), tmp_path)
+
+    # Configured once at construction (before any capture): the command bakes
+    # the frontier ratio and failure-EMA decay into its reset layout.
+    assert env.margin_config == (0.5, 0.7)
+    learner._advance_exam_schedule(0)  # before exam_start_iter (1): nothing
+    assert env.exam_activations == []
+    assert env.exam_refreshes == []
+    learner._advance_exam_schedule(1)  # activation already selects the clips
+    assert env.exam_activations == [4]
+    assert env.exam_refreshes == []
+    learner._advance_exam_schedule(249)
+    assert env.exam_refreshes == []
+    learner._advance_exam_schedule(250)
+    assert env.exam_refreshes == [4]
+    assert learner._exam_fail_ema == pytest.approx(0.42)
+    learner._advance_exam_schedule(499)
+    assert env.exam_refreshes == [4]
+    learner._advance_exam_schedule(500)
+    assert env.exam_refreshes == [4, 4]
+
+
+def test_margin_fail_ema_is_logged_to_tensorboard(tmp_path) -> None:
+    learner = SuperMimicLearner(
+        MarginFakeEnv(),
+        _exam_config(
+            log_backend="tensorboard", exam_start_iter=0, exam_clip_window=1, exam_margin=True
+        ),
+        tmp_path,
+    )
+    learner.train()
+
+    accumulator = EventAccumulator(str(tmp_path))
+    accumulator.Reload()
+    assert "Exam/margin_fail_ema" in set(accumulator.Tags()["scalars"])
+    events = accumulator.Scalars("Exam/margin_fail_ema")
+    # Exams activate at iteration 0 (that activation iteration logs no
+    # refresh yet); every later window-1 iteration carries the refreshed mean.
+    assert [event.step for event in events] == [2, 3]
+    assert all(event.value == pytest.approx(0.42) for event in events)
