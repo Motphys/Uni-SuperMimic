@@ -137,7 +137,7 @@ mesh、URDF、动作文件、日志、checkpoint 和生成的数据集目录均�
 LAFAN1 是默认数据集，无需覆盖运动文件：
 
 ```bash
-# mjwarp、4096 个并行环境、12000 iterations
+# mjwarp、4096 个并行环境、8000 iterations
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_mjwarp_001
 
@@ -296,13 +296,13 @@ BONES-SEED 逐段分布：中位数 0.9528，P10 0.8337，P90 0.9841。BONES-SEE
 
 Muon 优化器只作用于 policy encoder/decoder 和世界模型 MLP 的隐藏 `Linear.weight` 矩阵；输入/输出层、向量参数、normalizer 以及 critic 仍使用 Adam。Muon 使用 `match_rms_adamw` 缩放，因此沿用原有学习率和余弦调度。当前两个优化器默认均为 Muon（`pi_opt: muon`、`wm_opt: muon`），Adam 仍可显式选择。
 
-可选结构化世界模型（`algo.wm_structured=true`）默认关闭，默认行为仍是直接预测状态增量。打开后，模型参考 InstantTrack 的 semi-implicit 形式，预测速度增量和位置残差修正；该选项不改变 policy 输入/输出契约。
+结构化世界模型（`algo.wm_structured`）参考 InstantTrack 的 semi-implicit 形式，预测速度增量和位置残差修正；该选项不改变 policy 输入/输出契约。
 
 以下三个 seed-0 run 均使用 mjwarp、4096 个环境、完整 129,487 段 BONES-SEED 库和相同调度。
 
 Muon 在 4000 轮达到 Adam 8000 轮的宏平均 return（0.939500 vs 0.939490），但其 423 段失败不能视为与 Adam 8000 轮的 193 段严格等价。到 8000 轮时，Muon 将宏平均 return 提高 0.0108，失败段从 193 降至 166。
 
-结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。其补充的 3000 轮 checkpoint 达到宏平均 return 0.929833、帧加权 return 0.932974、297 段失败。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。由于这是 seed-0 工程对照，`wm_structured` 仍保持可选。
+结构化 WM 在每个 checkpoint 都提高宏平均与帧加权 return，并明显改善早期成功率：2000 轮失败段从 1126 降至 722，4000 轮从 423 降至 242。其补充的 3000 轮 checkpoint 达到宏平均 return 0.929833、帧加权 return 0.932974、297 段失败。6000/8000 轮则以略多失败段（195 vs 186、176 vs 166）换取更高平均 return。8000 轮时其世界模型 8 步误差为 0.05635，低于 Muon 的 0.06252（-9.9%），实测吞吐仅低 0.54%。下方默认配方在 `wm_structured=true` 基础上重新调优了 8k 预算。
 
 ![Adam、Muon 与 Muon + 结构化 WM：2000/3000/4000/6000/8000 轮全库评估与训练墙钟](docs/assets/muon_vs_adam_evaluation.png)
 
@@ -325,6 +325,38 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --backend mjwarp \
   --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
+  --num_envs 16384
+```
+
+### BONES-SEED 默认配方（8000 轮）
+
+默认训练配置现在面向 8000 轮 BONES-SEED 预算。相对旧默认值改动为：`iterations` 12000 -> 8000、`lr_decay_iters` 250000 -> 12000、`wm_structured` false -> true、`wm_hidden` [2048, 2048, 2048] -> [1024, 1024, 1024]、`pi_batch` 4096 -> 2048 且 `wm_batches` 10 -> 5、基座角速度观测噪声半宽 0.05 -> 0.2（与上游 proprio 规范注释一致；gravity 0.05、joint_pos 0.01、joint_vel 0.5 与零动作噪声不变）。
+
+在单张 RTX 6000D 上的 seed-0 对照（mjwarp、4096 环境、完整 129,487 段库、16384 环境确定性全库评估）：
+
+| 策略（8000 轮） | norm return | 帧加权 | 失败段 | 训练墙钟 |
+|---|---:|---:|---:|---:|
+| 旧默认 + Adam override（`pi_opt=adam wm_opt=adam`） | 0.9073 | 0.9088 | 340 | 0.80 h |
+| 新默认 [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt) | 0.9320 | 0.9279 | 202 | 0.54 h |
+
+新默认在 4000 轮即超过旧配置 8000 轮的 return（0.9122，391 段失败）。基于既有 run 与日志、未新增训练的归因：Muon + 结构化世界模型在 8000 轮复现出相对 Adam + 非结构化模型 +0.044 的训练回报；1024 宽结构化世界模型在该轮数下与 2048 宽持平（训练回报 0.891 vs 0.890），并与减半的更新 batch 一起把吞吐从 2.85 提高到 4.09 it/s；对齐预算的调度在 8000 轮完成退火（lr 1.09e-4，未退火为 3.99e-4）——沿用旧 250k 衰减的两个 150k run 在约 60000 轮达到 0.91 附近峰值后退化到 0.25-0.64，因此更短的衰减同时消除了长跑不稳定。修复的失败段广泛分布在各类动作（jump 24、crawl 22、sit 15、dance 9、stand 9、push 8、kick 8）；空翻与翻滚仍是最顽固的残余失败。
+
+构建动作库后无需任何 override 即可复现：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  training.log_dir=runs/supermimic_boneseed_default8k_001
+```
+
+可直接评估本配方发布的 checkpoint：
+
+```bash
+curl -L -o boneseed_default8k_ckpt_008000.pt \
+  https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt boneseed_default8k_ckpt_008000.pt \
   --num_envs 16384
 ```
 

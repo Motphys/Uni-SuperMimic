@@ -73,7 +73,7 @@ def test_learner_config_uses_algorithm_dataclass_fields() -> None:
 
     learner_cfg = build_learner_config(cfg)
 
-    assert learner_cfg.iterations == 12000
+    assert learner_cfg.iterations == 8000
     assert learner_cfg.pi_opt == "muon"
     assert learner_cfg.wm_opt == "muon"
     assert learner_cfg.goal_frames == 10
