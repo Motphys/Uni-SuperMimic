@@ -39,7 +39,7 @@ INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 OBS_NOISE = torch.cat(
     (
         torch.full((3,), 0.05),
-        torch.full((3,), 0.05),
+        torch.full((3,), 0.2),
         torch.full((29,), 0.01),
         torch.full((29,), 0.5),
         torch.zeros(29),

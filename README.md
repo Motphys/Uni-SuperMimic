@@ -137,7 +137,7 @@ Run commands from the repository root and set `CUDA_VISIBLE_DEVICES` to an avail
 LAFAN1 is the default dataset, so no motion-file override is needed:
 
 ```bash
-# mjwarp, 4096 parallel environments, 12000 iterations.
+# mjwarp, 4096 parallel environments, 8000 iterations.
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   training.log_dir=runs/supermimic_mjwarp_001
 
@@ -296,13 +296,13 @@ At 8000 iterations this configuration already exceeds the 12000-iteration baseli
 
 The Muon optimizers update only the hidden `Linear.weight` matrices of the policy encoder/decoder and world-model MLP; input/output layers, vectors, normalizers, and the critic use Adam. Muon uses `match_rms_adamw` scaling, so the existing learning rate and cosine schedule are reused. Muon is now the default for both networks (`pi_opt: muon`, `wm_opt: muon`); Adam remains explicitly selectable.
 
-The optional structured world model (`algo.wm_structured=true`) keeps direct increment prediction as the default. When enabled, it predicts velocity increments plus residual position corrections on top of a trapezoidal velocity drift, following InstantTrack's semi-implicit formulation. It does not change the policy input/output contract.
+The structured world model (`algo.wm_structured`) predicts velocity increments plus residual position corrections on top of a trapezoidal velocity drift, following InstantTrack's semi-implicit formulation. It does not change the policy input/output contract.
 
 The three seed-0 runs use mjwarp, 4096 environments, the complete 129,487-clip BONES-SEED library, and the same schedule.
 
 Muon reaches the Adam 8000-iteration macro return in 4000 iterations (0.939500 versus 0.939490), although its 423 failed clips are not a strict success-rate match for Adam's 193 at 8000. At 8000 iterations, Muon improves macro return by 0.0108 and reduces failed clips from 193 to 166.
 
-Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. Its additional 3000-iteration checkpoint reaches 0.929833 macro return, 0.932974 frame-weighted return, and 297 failed clips. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. Since this is a seed-0 engineering comparison, `wm_structured` remains opt-in.
+Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. Its additional 3000-iteration checkpoint reaches 0.929833 macro return, 0.932974 frame-weighted return, and 297 failed clips. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. The default recipe below adopts `wm_structured=true` together with the retuned 8k budget.
 
 ![Adam, Muon, and Muon + structured WM: full-library evaluation and learner wall time at 2000, 3000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
 
@@ -326,6 +326,27 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --backend mjwarp \
   --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
   --num_envs 16384
+```
+
+### BONES-SEED default recipe (8000 iterations)
+
+The default training configuration now targets an 8000-iteration BONES-SEED budget. Relative to the previous defaults it changes `iterations` 12000 -> 8000, `lr_decay_iters` 250000 -> 12000, `wm_structured` false -> true, `wm_hidden` [2048, 2048, 2048] -> [1024, 1024, 1024], `pi_batch` 4096 -> 2048 with `wm_batches` 10 -> 5, and the base angular-velocity observation-noise half-width 0.05 -> 0.2 (now matching the upstream proprio spec comment; gravity 0.05, joint_pos 0.01, joint_vel 0.5, and zero action noise are unchanged).
+
+A seed-0 comparison on one RTX 6000D (mjwarp, 4096 environments, the complete 129,487-clip library, deterministic full-library evaluation with 16384 environments):
+
+| policy (8000 iterations) | norm return | frame-weighted | failed clips | learner wall |
+|---|---:|---:|---:|---:|
+| previous defaults with Adam override (`pi_opt=adam wm_opt=adam`) | 0.9073 | 0.9088 | 340 | 0.80 h |
+| new defaults | 0.9320 | 0.9279 | 202 | 0.54 h |
+
+The new defaults already pass the previous 8000-iteration return at iteration 4000 (0.9122, 391 failed clips). Attribution from existing runs and logs, without additional training: Muon plus the structured world model reproduce +0.044 training reward over Adam plus the unstructured model at 8000 iterations; the 1024-wide structured world model matches the 2048-wide one at that horizon (training reward 0.891 vs 0.890) and, together with the halved update batches, raises throughput from 2.85 to 4.09 it/s; the budget-aligned schedule anneals the policy by iteration 8000 (lr 1.09e-4 versus 3.99e-4 unannealed), and two 150k runs kept on the old 250k decay peaked near 0.91 around iteration 60000 before degrading to 0.25-0.64, so the shorter decay also removes a long-run instability. The recovered failures spread across motion families (jump 24, crawl 22, sit 15, dance 9, stand 9, push 8, kick 8); flips and rolls remain the hardest residual failures.
+
+Reproduce with no overrides after building the library:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
+  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
+  training.log_dir=runs/supermimic_boneseed_default8k_001
 ```
 
 ## Tests
