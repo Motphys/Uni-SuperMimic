@@ -337,7 +337,7 @@ A seed-0 comparison on one RTX 6000D (mjwarp, 4096 environments, the complete 12
 | policy (8000 iterations) | norm return | frame-weighted | failed clips | learner wall |
 |---|---:|---:|---:|---:|
 | previous defaults with Adam override (`pi_opt=adam wm_opt=adam`) | 0.9073 | 0.9088 | 340 | 0.80 h |
-| new defaults | 0.9320 | 0.9279 | 202 | 0.54 h |
+| new defaults [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt) | 0.9320 | 0.9279 | 202 | 0.54 h |
 
 The new defaults already pass the previous 8000-iteration return at iteration 4000 (0.9122, 391 failed clips). Attribution from existing runs and logs, without additional training: Muon plus the structured world model reproduce +0.044 training reward over Adam plus the unstructured model at 8000 iterations; the 1024-wide structured world model matches the 2048-wide one at that horizon (training reward 0.891 vs 0.890) and, together with the halved update batches, raises throughput from 2.85 to 4.09 it/s; the budget-aligned schedule anneals the policy by iteration 8000 (lr 1.09e-4 versus 3.99e-4 unannealed), and two 150k runs kept on the old 250k decay peaked near 0.91 around iteration 60000 before degrading to 0.25-0.64, so the shorter decay also removes a long-run instability. The recovered failures spread across motion families (jump 24, crawl 22, sit 15, dance 9, stand 9, push 8, kick 8); flips and rolls remain the hardest residual failures.
 
@@ -347,6 +347,17 @@ Reproduce with no overrides after building the library:
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
   training.log_dir=runs/supermimic_boneseed_default8k_001
+```
+
+Evaluate the released checkpoint of this recipe directly:
+
+```bash
+curl -L -o boneseed_default8k_ckpt_008000.pt \
+  https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt boneseed_default8k_ckpt_008000.pt \
+  --num_envs 16384
 ```
 
 ## Tests

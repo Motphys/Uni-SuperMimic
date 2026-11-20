@@ -337,7 +337,7 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
 | 策略（8000 轮） | norm return | 帧加权 | 失败段 | 训练墙钟 |
 |---|---:|---:|---:|---:|
 | 旧默认 + Adam override（`pi_opt=adam wm_opt=adam`） | 0.9073 | 0.9088 | 340 | 0.80 h |
-| 新默认 | 0.9320 | 0.9279 | 202 | 0.54 h |
+| 新默认 [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt) | 0.9320 | 0.9279 | 202 | 0.54 h |
 
 新默认在 4000 轮即超过旧配置 8000 轮的 return（0.9122，391 段失败）。基于既有 run 与日志、未新增训练的归因：Muon + 结构化世界模型在 8000 轮复现出相对 Adam + 非结构化模型 +0.044 的训练回报；1024 宽结构化世界模型在该轮数下与 2048 宽持平（训练回报 0.891 vs 0.890），并与减半的更新 batch 一起把吞吐从 2.85 提高到 4.09 it/s；对齐预算的调度在 8000 轮完成退火（lr 1.09e-4，未退火为 3.99e-4）——沿用旧 250k 衰减的两个 150k run 在约 60000 轮达到 0.91 附近峰值后退化到 0.25-0.64，因此更短的衰减同时消除了长跑不稳定。修复的失败段广泛分布在各类动作（jump 24、crawl 22、sit 15、dance 9、stand 9、push 8、kick 8）；空翻与翻滚仍是最顽固的残余失败。
 
@@ -347,6 +347,17 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
   training.log_dir=runs/supermimic_boneseed_default8k_001
+```
+
+可直接评估本配方发布的 checkpoint：
+
+```bash
+curl -L -o boneseed_default8k_ckpt_008000.pt \
+  https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt
+CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
+  --backend mjwarp \
+  --ckpt boneseed_default8k_ckpt_008000.pt \
+  --num_envs 16384
 ```
 
 ## 测试
