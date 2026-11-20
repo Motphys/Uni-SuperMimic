@@ -27,7 +27,6 @@ from .manager_terms import (
     SuperMimicCommand,
     make_current_info,
     make_transition_info,
-    merge_current_info,
 )
 from .motion import CONTROL_DT
 from .robot import COLLISION_GEOM_NAMES
@@ -53,6 +52,14 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             raise ValueError("SuperMimic requires exactly one SuperMimicCommand term")
         self._supermimic_command = commands[0]
         self._pre_action: dict[str, Any] | None = None
+        # Fixed-address carriers for SUPERMIMIC_STATE_KEY: the reset-segment
+        # CUDA graph replays recorded device work only, so host-side dict
+        # re-assignment inside the captured body (the eager merge) would run
+        # once at capture and never again. Publishing through persistent
+        # tensors that refresh in place keeps every replay semantically equal
+        # to eager execution.
+        self._sm_state: dict[str, torch.Tensor] | None = None
+        self._sm_reset_scratch: dict[str, torch.Tensor] | None = None
         # The pre-reset transition materialization is step-hot and pure-tensor;
         # compile it with the command's MDP when the task opts in. The reset
         # path (current-info snapshots) stays eager: it runs inside the
@@ -103,19 +110,27 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         )
         transition.update(command.last_episode_stats)
         updated.info[SUPERMIMIC_TRANSITION_KEY] = transition
-        updated.info[SUPERMIMIC_STATE_KEY] = self._current_info()
+        self._sm_state = self._current_info_into(self._sm_state)
+        updated.info[SUPERMIMIC_STATE_KEY] = self._sm_state
         self._pre_action = None
         return updated
 
-    def _current_info(self) -> dict[str, torch.Tensor]:
+    def _current_info_into(
+        self, target: dict[str, torch.Tensor] | None
+    ) -> dict[str, torch.Tensor]:
         command = self._supermimic_command
-        return make_current_info(
+        fresh = make_current_info(
             command.state(),
             command.f,
             command.xi,
             command.a_prev,
             command.ep_step,
         )
+        if target is None:
+            return fresh
+        for name, value in fresh.items():
+            target[name].copy_(value)
+        return target
 
     def reset(
         self,
@@ -140,12 +155,25 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             reset_mask[ids] = True
         obs, info = super().reset(env_ids, seed=seed)
         assert self._state is not None
-        current = self._current_info()
-        previous = self._state.info.get(SUPERMIMIC_STATE_KEY)
-        if previous is not None:
-            current = merge_current_info(previous, current, reset_mask)
-        self._state.info[SUPERMIMIC_STATE_KEY] = current
-        info[SUPERMIMIC_STATE_KEY] = current
+        # CUDA-graph contract: the autoreset body may execute inside the
+        # reset-segment graph, where recorded device work replays but host
+        # dict re-assignment does not. Publish the reset through fixed-address
+        # carriers instead: the scratch materializes the just-reset state, the
+        # persistent buffer still holds the pre-reset snapshot written by
+        # update_state this step, and the masked copy merges them — exactly the
+        # eager-path merge_current_info semantics, expressed as pure device
+        # work on stable tensors.
+        current = self._current_info_into(self._sm_reset_scratch)
+        if self._sm_state is None:
+            self._sm_state = {name: value.clone() for name, value in current.items()}
+        else:
+            for name, value in self._sm_state.items():
+                mask = reset_mask.reshape(
+                    (reset_mask.shape[0],) + (1,) * (value.ndim - 1)
+                )
+                value.copy_(torch.where(mask, current[name], value))
+        self._state.info[SUPERMIMIC_STATE_KEY] = self._sm_state
+        info[SUPERMIMIC_STATE_KEY] = self._sm_state
         return obs, info
 
     def reset_to_frames(

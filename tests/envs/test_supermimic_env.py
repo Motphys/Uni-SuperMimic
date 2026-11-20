@@ -955,3 +955,42 @@ def test_mjwarp_masked_autoreset_restores_context_dr(tmp_path: Path) -> None:
     finally:
         env.close()
         env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_graph_autoreset_publishes_post_reset_state(tmp_path: Path) -> None:
+    """Graph-replayed resets must refresh the published state key on done rows.
+
+    Host-side dict re-assignment inside the captured autoreset body executes
+    only at capture time, so the state key must flow through fixed-address
+    carriers. If it does not, every done row keeps its pre-reset snapshot
+    (``ep_step != 0`` after the reset), and the collector's episode
+    bookkeeping — the fresh-history gate keyed on ``ep_step == 0`` — silently
+    desynchronizes from the simulation. This is the canary for that carrier.
+    """
+    _require_backend_runtime("mjwarp")
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, masked=True), num_envs=64, backend_type="mjwarp"
+    )
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(3)
+        env.reset_to_frames(torch.zeros(64, dtype=torch.int64, device=env.device))
+        generator = torch.Generator(device=env.device).manual_seed(1)
+        checked = 0
+        for _ in range(80):
+            action = torch.randn((64, 29), generator=generator, device=env.device) * 0.5
+            step = env.step(action)
+            done = step.terminated | step.truncated
+            done_count = int(done.sum())
+            if done_count:
+                ep_step = step.info[SUPERMIMIC_STATE_KEY]["ep_step"][done]
+                assert bool((ep_step == 0).all()), (
+                    f"done rows kept their pre-reset snapshot "
+                    f"(ep_step={ep_step[:5].tolist()} at step {checked})"
+                )
+                checked += done_count
+        assert checked > 0, "no autoreset happened; the graph path was not exercised"
+    finally:
+        env.close()
+        env.backend.close()
