@@ -46,9 +46,11 @@ unisupermimic/
 │   ├── scripts/train_supermimic.py # Training, resume, and evaluation entry point
 │   ├── conf/supermimic/            # Hydra configuration
 │   ├── data/boneseed.py            # BONES-SEED download/convert/filter/pack CLI
+│   ├── deploy/export.py            # Checkpoint -> ONNX/deploy_config/goal tables/MJCF
 │   ├── assets/robots/g1/           # G1 MJCF; meshes/URDF are downloaded and untracked
 │   ├── assets/motions/             # LAFAN1 CSV files, downloaded and untracked
 │   └── sim2sim.py                  # Policy I/O, network shape, and asset identity checks
+├── deploy/uni_g1/                  # Reference sim2real deployment (C++ controller, numeric gate, demos)
 ├── docs/assets/                    # Result curves, MP4, and GIF
 ├── tools/prepare_supermimic_assets.py
 ├── tests/
@@ -198,6 +200,12 @@ Muon uses `match_rms_adamw` scaling, so the existing `algo.lr` and cosine schedu
 ## Evaluation
 
 Evaluation starts every motion from its first frame, disables observation and action noise, and runs the complete clip. Finished environments are recycled for pending clips, with longer clips scheduled first to avoid a long idle batch tail. The standalone evaluator uses at most 16,384 parallel environments by default; use `unisupermimic-eval --num_envs N` to fit a smaller GPU. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
+
+## Sim2Real Deployment
+
+**[deploy/uni_g1](deploy/uni_g1/README.md) ([中文](deploy/uni_g1/README_zh.md)) is the reference sim2real deployment of a Uni-SuperMimic policy on the Unitree G1 (29-DoF) onboard PC2.**
+
+It ships a BONES-SEED-trained weight (`policy.onnx`) and 12 demo clips, a C++ controller (500 Hz lowcmd + 50 Hz ONNX policy, FSM with always-available L2+B damping), an offline numeric gate (golden vectors vs the training MDP, NUMERIC PASS required before any real-robot run), and a deployment-equivalent sim2sim (Python reference runtime). The guide covers the full path from clone to robot: build on PC2 → numeric gate → operate with the gamepad, including clip switching and recovery.
 
 The standalone evaluator and video exporter accept `--backend mjwarp`, `--backend mujoco`, or `--backend motrix` and default to mjwarp:
 

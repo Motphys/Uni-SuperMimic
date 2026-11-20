@@ -19,3 +19,13 @@ outputs/
 *.pt
 src/unisupermimic/assets/robots/g1/assets/
 src/unisupermimic/assets/motions/
+
+# local training/eval artifacts
+deploy_runs/
+deploy_artifacts_uni/
+eval_runs/
+eval_videos/
+data/library/
+data/npz/
+data/raw/
+MUJOCO_LOG.TXT
