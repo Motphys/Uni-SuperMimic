@@ -112,9 +112,9 @@ def _runtime_cfg(
     # Tests construct envs repeatedly; skip step-path compilation warmup.
     command_cfg.compile = False
     # Runtime tests default to the selected-row lifecycle; the fixed-shape
-    # path has its own dedicated tests (it changes RNG draw order).
-    cfg.masked_autoreset = masked
-    cfg.persistent_step_buffers = masked
+    # path has its own dedicated tests (it changes RNG draw order). The single
+    # unilab 1.6.0 switch implies masked autoreset, persistent step buffers
+    # and reset-segment graph capture together.
     cfg.autoreset_cuda_graph = masked
     cfg.validate()
     return cfg

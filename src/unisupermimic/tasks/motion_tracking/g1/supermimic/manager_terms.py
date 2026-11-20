@@ -898,11 +898,12 @@ class SuperMimicContextEvent(ManagerTermBase):
             raise RuntimeError(
                 "SuperMimic fixed-shape reset requires the env-owned packed reset "
                 "transaction (unilab >= 1.5.11); update unilab or disable "
-                "env.masked_autoreset"
+                "env.autoreset_cuda_graph"
             )
-        # Stage through the packed composer's cached-baseline mask writer; the
-        # transaction-level wrapper rebuilds its numpy default table (a host
-        # copy) on every call, which is not step-hot-safe.
+        # Stage through the packed composer's cached-baseline mask writer.
+        # (The transaction-level wrapper also caches its default table since
+        # unilab 1.6.0rc1 #2623, but this full-width masked staging path is the
+        # one verified under reset-segment graph capture.)
         packed = packed()
         if not self._backend_geom_ids_ready:
             self._backend_geom_ids = (

@@ -65,9 +65,8 @@ def build_env_override(
     override["auto_reset"] = True
     # Deterministic evaluation keeps the selected-row reset lifecycle: the
     # fixed-shape autoreset draws RNG every step (steps without a done row
-    # included), which changes the eval reproducibility contract.
-    override["masked_autoreset"] = False
-    override["persistent_step_buffers"] = False
+    # included), which changes the eval reproducibility contract. Since
+    # unilab 1.6.0rc1 this single switch covers the whole fixed-shape chain.
     override["autoreset_cuda_graph"] = False
     return override
 

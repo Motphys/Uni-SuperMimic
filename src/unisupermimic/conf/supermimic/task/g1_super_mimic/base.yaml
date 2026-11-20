@@ -63,10 +63,10 @@ env:
   auto_reset: true
   scale_rewards_by_dt: false
   # Host-sync-free stepping (unilab 1.5.4+): finite verdicts stay on-device
-  # and are polled every 32 steps; MJWarp operand/bounds checks latch into
-  # device verdicts instead of blocking host reads (unilab 1.5.11+).
+  # and are polled every 32 steps. Deferred validation is the unilab 1.6.0
+  # default (env.finite_validation_mode="deferred"); MJWarp operand/bounds
+  # checks latch into device verdicts instead of blocking host reads.
   finite_validation_interval: 32
-  mjwarp_defer_tensor_validation: true
   observations:
     policy:
       enable_corruption: false

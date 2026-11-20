@@ -19,11 +19,13 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "LICENSES/*"]
 authors = [{ name = "UniSuperMimic Authors" }]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "unilab[mujoco,motrix]>=1.5.11",
+    "unilab[mujoco,motrix]==1.6.0rc1",
     "imageio[ffmpeg]>=2.37",
-    "mujoco~=3.11.0",
+    # Follows unilab 1.6.0rc1's MuJoCo 4.0.1 runtime line (mjwarp + mujoco
+    # extras); Newton/SuperDex backends stay on 3.11 but this repo uses neither.
+    "mujoco~=4.0.1",
     "pillow>=10",
     # Own logger writes TensorBoard events directly; unilab gated its
     # tensorboard dependency behind the unirl extra in 1.5.11.

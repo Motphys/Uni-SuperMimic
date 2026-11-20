@@ -10,19 +10,21 @@ training:
 env:
   mjwarp_nconmax: 128
   mjwarp_njmax: 500
-  # Fixed-shape, host-sync-free autoreset (unilab 1.5.11 #2605). RNG note:
-  # the reset lifecycle runs every step, so full-width samplers draw RNG on
-  # steps without a done row and same-seed trajectories differ from the
-  # selected-row lifecycle; deterministic evaluation keeps these flags off.
-  masked_autoreset: true
-  persistent_step_buffers: true
-  # Disabled by default: graph replay poisons learning at training scale
-  # (8k-iter BONES-SEED run crashed at 6061 with non-finite wm_loss; ep_len
-  # stuck at ~21 from iter ~150 vs 108 with the graph off). Bisected to this
-  # single flag over 300-iter ablations: compile off still fails, masked
-  # trio off recovers, only this flag off recovers. Env-only probes show
-  # reset sampling, RNG advance, done sets, and physics writeback all behave
-  # identically under replay, so the defect hides in the collector/learner
-  # interaction. The graph is worth only ~0.8% throughput here (3.373 vs
-  # 3.345 it/s), so it stays off until the upstream defect is fixed.
-  autoreset_cuda_graph: false
+  # Single public switch since unilab 1.6.0rc1 (#2617): enabling it implies
+  # the whole fixed-shape chain — masked autoreset, persistent step buffers,
+  # deferred finite validation, and reset-segment CUDA graph capture.
+  # RNG note: the reset lifecycle runs every step, so full-width samplers
+  # draw RNG on steps without a done row and same-seed trajectories differ
+  # from the selected-row lifecycle; deterministic evaluation overrides this
+  # back to false.
+  #
+  # History: graph replay poisoned learning at training scale on unilab
+  # 1.5.11 (8k-iter BONES-SEED run crashed at 6061 with non-finite wm_loss;
+  # ep_len stuck at ~21 from iter ~150 vs 108 with the graph off), because
+  # read-plan packet body tensors were reallocated on every refresh and
+  # captured reads fetched reclaimed storage. unilab 1.6.0rc1 fixes both
+  # halves upstream: body-state packets keep fixed tensor storage (#2642)
+  # and public step outputs are cloned caller-owned from the working
+  # carriers (#2640). Re-enabled on top of the task-side fixed-address
+  # publication carriers (env.py).
+  autoreset_cuda_graph: true
