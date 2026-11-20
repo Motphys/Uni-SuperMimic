@@ -14,8 +14,15 @@ env:
   # the reset lifecycle runs every step, so full-width samplers draw RNG on
   # steps without a done row and same-seed trajectories differ from the
   # selected-row lifecycle; deterministic evaluation keeps these flags off.
-  # The reset-segment CUDA graph also removes the backend's eager-path
-  # stream sync around DR payload application.
   masked_autoreset: true
   persistent_step_buffers: true
-  autoreset_cuda_graph: true
+  # Disabled by default: graph replay poisons learning at training scale
+  # (8k-iter BONES-SEED run crashed at 6061 with non-finite wm_loss; ep_len
+  # stuck at ~21 from iter ~150 vs 108 with the graph off). Bisected to this
+  # single flag over 300-iter ablations: compile off still fails, masked
+  # trio off recovers, only this flag off recovers. Env-only probes show
+  # reset sampling, RNG advance, done sets, and physics writeback all behave
+  # identically under replay, so the defect hides in the collector/learner
+  # interaction. The graph is worth only ~0.8% throughput here (3.373 vs
+  # 3.345 it/s), so it stays off until the upstream defect is fixed.
+  autoreset_cuda_graph: false
