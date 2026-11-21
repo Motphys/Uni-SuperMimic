@@ -8,7 +8,7 @@
   <a href="https://arxiv.org/abs/2610.28480"><img src="https://img.shields.io/badge/paper-arXiv--2610.28480-red" alt="Paper"></a>
   <a href="https://pypi.org/project/unilab/"><img src="https://img.shields.io/pypi/v/unilab" alt="UniLab PyPI"></a>
   <a href="#results"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED: 129,487 clips"></a>
-  <a href="#results"><img src="https://img.shields.io/badge/single%20GPU-%7E24%20min-green" alt="Single GPU: about 24 minutes"></a>
+  <a href="#results"><img src="https://img.shields.io/badge/single%20GPU-%7E22%20min-green" alt="Single GPU: about 22 minutes"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License"></a>
 </p>
 
@@ -17,7 +17,7 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
 ### Highlights
 
 - **BONES-SEED at scale**: download, convert, filter, pack, train on, and deterministically evaluate a 129,487-clip / 47.3M-frame motion library from one repository.
-- **Graph-captured fixed-shape autoreset**: unilab 1.6.0rc1 pins body-packet storage across resets and publishes caller-owned step outputs, so the reset segment runs as a replayed CUDA graph — the default 8,000-iteration BONES-SEED recipe trains in **about 24 minutes on one GPU** with evaluation parity (0.9310 vs 0.9320 full-library norm return).
+- **Graph-captured fixed-shape autoreset**: unilab 1.6.0 pins body-packet storage across resets and publishes caller-owned step outputs, so the reset segment runs as a replayed CUDA graph — the default 8,000-iteration BONES-SEED recipe trains in **about 22 minutes on one RTX 4090** (mean of 3 seeds: 0.9322 full-library norm return, 99.82% clip success rate).
 - **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow; learner throughput reaches ~6 it/s with the graph-captured autoreset chain.
 - **Three simulation backends**: switch between mjwarp, MuJoCo, and Motrix without changing the policy or dataset configuration.
 
@@ -265,20 +265,22 @@ Previous result tables and ablations (LAFAN1, the 12000-iteration BONES-SEED run
 
 ### BONES-SEED default recipe with graph-captured autoreset (8000 iterations)
 
-The default recipe trains with unilab 1.6.0rc1's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged.
+The default recipe trains with unilab 1.6.0's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged.
 
-Seed-0 runs with mjwarp, 4096 environments, and the complete 129,487-clip library; deterministic full-library evaluation with 16,384 environments from frame zero without noise:
+Three seeds (mjwarp, 4096 environments, one RTX 4090, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol:
 
-| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | learner wall |
+| seed | norm return | frame-weighted | failed clips | success rate | learner wall |
 |---|---:|---:|---:|---:|---:|
-| default recipe (main) | 0.9320 | 0.9279 | 202 | 99.84% | 0.54 h |
-| **default + CUDA graph (this branch)** | **0.9310** | 0.9263 | 218 | 99.83% | **0.39 h** |
+| 0 | 0.9325 | 0.9285 | 186 | 99.86% | 0.371 h |
+| 1 | 0.9320 | 0.9276 | 289 | 99.78% | 0.373 h |
+| 2 | 0.9321 | 0.9281 | 210 | 99.84% | 0.373 h |
+| **mean of 3 seeds** | **0.9322** | **0.9281** | **228** | **99.82%** | **0.372 h (22.3 min)** |
 
-![Evaluation bars: full-library norm return, failed clips, and learner wall time](docs/assets/graph8k_eval_bars.png)
+Steady-state learner throughput is ~6.2 it/s; the 8,000-iteration run fits in about 22 minutes on a single RTX 4090.
 
-Learning quality is unchanged — the return difference is 0.001 and the failed-clip difference is 16/129,487 (0.012%), both within seed noise; the masked lifecycle draws RNG on steps without a done row, so same-seed trajectories differ by construction. Training wall time drops **27%** on the same RTX 6000D (5.97 vs ~4.1 it/s steady-state throughput).
+![Evaluation bars: full-library norm return, failed clips, and learner wall time per seed](docs/assets/graph8k_eval_bars.png)
 
-![Training curves: + CUDA graph vs main](docs/assets/graph8k_curves.png)
+![Training curves for the three seeds](docs/assets/graph8k_curves.png)
 
 Reproduce with no overrides after building the library:
 
