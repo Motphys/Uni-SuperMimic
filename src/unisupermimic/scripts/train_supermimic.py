@@ -46,7 +46,7 @@ def build_env_override(
     cfg: DictConfig, *, eval_mode: bool = False, learner_device: str | None = None
 ) -> dict[str, Any]:
     override: dict[str, Any] = EnvConfigAdapter(
-        cfg, root_dir=Path.cwd(), algo_name="supermimic"
+        cfg, root_dir=Path.cwd()
     ).build_task_env_cfg_override()
     override = apply_collector_tensor_device_override(
         override,
@@ -63,6 +63,11 @@ def build_env_override(
     commands["motion"] = motion
     override["commands"] = commands
     override["auto_reset"] = True
+    # Deterministic evaluation keeps the selected-row reset lifecycle: the
+    # fixed-shape autoreset draws RNG every step (steps without a done row
+    # included), which changes the eval reproducibility contract. Since
+    # unilab 1.6.0rc1 this single switch covers the whole fixed-shape chain.
+    override["autoreset_cuda_graph"] = False
     return override
 
 

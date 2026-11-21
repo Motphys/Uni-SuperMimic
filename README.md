@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://arxiv.org/abs/2610.28480"><img src="https://img.shields.io/badge/paper-arXiv--2610.28480-red" alt="Paper"></a>
   <a href="https://pypi.org/project/unilab/"><img src="https://img.shields.io/pypi/v/unilab" alt="UniLab PyPI"></a>
-  <a href="#bones-seed-library-129487-clips"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED: 129,487 clips"></a>
-  <a href="#results"><img src="https://img.shields.io/badge/single%20GPU-%7E40%20min-green" alt="Single GPU: about 40 minutes"></a>
+  <a href="#results"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED: 129,487 clips"></a>
+  <a href="#results"><img src="https://img.shields.io/badge/single%20GPU-%7E22%20min-green" alt="Single GPU: about 22 minutes"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License"></a>
 </p>
 
@@ -17,7 +17,8 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
 ### Highlights
 
 - **BONES-SEED at scale**: download, convert, filter, pack, train on, and deterministically evaluate a 129,487-clip / 47.3M-frame motion library from one repository.
-- **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow, reaching a strong BONES-SEED checkpoint in about 40 minutes; the complete 12,000-iteration validation run is reported below.
+- **Graph-captured fixed-shape autoreset**: unilab 1.6.0 pins body-packet storage across resets and publishes caller-owned step outputs, so the reset segment runs as a replayed CUDA graph — the default 8,000-iteration BONES-SEED recipe trains in **about 22 minutes on one RTX 4090** (mean of 3 seeds: 0.9322 full-library norm return, 99.82% clip success rate).
+- **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow; learner throughput reaches ~6 it/s with the graph-captured autoreset chain.
 - **Three simulation backends**: switch between mjwarp, MuJoCo, and Motrix without changing the policy or dataset configuration.
 
 <p align="center">
@@ -25,6 +26,12 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
 </p>
 
 <p align="center"><em>Solid robot: SuperMimic policy. Blue ghost: reference motion. Click the image to view the MP4.</em></p>
+
+<p align="center">
+  <img src="docs/assets/time_comparison.png" alt="Training wall-clock time versus reported tracking score and failed clips across SuperMimic projects" width="95%">
+</p>
+
+<p align="center"><em>Training wall-clock time to the reported result, with each project's reported tracking score and failed clips (log-scale time axis). Historical runs and ablations are archived in <a href="docs/results_history.md">docs/results_history.md</a>.</em></p>
 
 Paper: [*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480), Qiayuan Liao et al. The implementation references `supermimic_vibed` and depends on PyPI `unilab`.
 
@@ -254,109 +261,38 @@ By default, the reference root XY is aligned with the policy to highlight whole-
 
 ## Results
 
-### LAFAN1 library (40 clips)
+Previous result tables and ablations (LAFAN1, the 12000-iteration BONES-SEED run, EMA/no-sync, Muon, and the pre-graph default recipe) are archived in [docs/results_history.md](docs/results_history.md).
 
-Configuration: PyPI `unilab 1.5.0`, mjwarp, and 4096 training environments. Evaluation covers 40 LAFAN1/G1 motions. `norm_return` is the macro average across clips; `frame-weighted` is weighted by clip length.
+### BONES-SEED default recipe with graph-captured autoreset (8000 iterations)
 
-| checkpoint | norm_return | frame-weighted | failed clips |
-|---|---:|---:|---:|
-| [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt) | 0.827227 | 0.829952 | 0 / 40 |
+The default recipe trains with unilab 1.6.0's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged.
 
-![Training and evaluation curves through iteration 12000](docs/assets/success_curve.png)
+Three seeds (mjwarp, 4096 environments, one RTX 4090, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol. Reported numbers are the mean of the three seeds:
 
-### BONES-SEED library (129,487 clips)
+| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | learner wall |
+|---|---:|---:|---:|---:|---:|
+| default recipe with `env.autoreset_cuda_graph` | **0.9322** | **0.9281** | **228** | **99.82%** | **0.372 h (22.3 min)** |
 
-Same configuration on the BONES-SEED G1 compact library (129,487 kept clips, 47.3M frames, 6.72 GB fp16): one RTX 4090 (48 GB), 12000 iterations, 1.69 h learner wall time. Evaluation covers the complete kept library with deterministic full-clip rollouts. The recorded result was produced by the original one-environment-per-clip evaluator; current evaluation recycles finished environments instead. The LAFAN1 row is a baseline run with identical settings.
+Steady-state learner throughput is ~6.2 it/s; the 8,000-iteration run fits in about 22 minutes on a single RTX 4090.
 
-| policy | eval set | norm_return | frame-weighted | failed clips |
-|---|---|---:|---:|---:|
-| BONES-SEED [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ckpt_012000.pt) | all 129,487 kept clips | 0.9243 | 0.9267 | 350 / 129,487 (0.27%) |
-| LAFAN1 [ckpt_012000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/lafan1_ckpt_012000.pt) (baseline) | all 40 clips | 0.8336 | 0.8366 | 0 / 40 |
+![Evaluation bars: full-library norm return, failed clips, and learner wall time (mean of 3 seeds)](docs/assets/graph8k_eval_bars.png)
 
-![BONES-SEED vs LAFAN1: full-library evaluation and training curves through iteration 12000](docs/assets/boneseed_curve.png)
-
-Per-clip distribution on BONES-SEED: median 0.9528, P10 0.8337, P90 0.9841. BONES-SEED converges much faster (early-termination 0.83% vs 29.4% at iteration 2000) and finishes higher on both training reward and evaluation return. An independent RTX 5090 run reproduces these numbers (0.9262 on a random 10,000-clip subset, within 0.002 of the full-library value).
-
-### BONES-SEED with EMA and no-sync training (8000 iterations)
-
-Building on the fused 3×3 rotations and fused Adam already in this repository, an EMA policy (`pi_ema: 0.995`), no host-device syncs (`no_sync: true`), and `lr: 4e-4` reach a higher return in two-thirds of the iterations on the same one RTX 4090 (48 GB). Every checkpoint is evaluated on the complete 129,487-clip library.
-
-| checkpoint | iterations | norm_return | frame-weighted | failed clips |
-|---|---|---:|---:|---:|
-| ckpt_002000.pt | 2000 | 0.8092 | 0.8187 | 1901 / 129,487 (1.47%) |
-| ckpt_004000.pt | 4000 | 0.9125 | 0.9165 | 660 / 129,487 (0.51%) |
-| ckpt_006000.pt | 6000 | 0.9306 | 0.9342 | 206 / 129,487 (0.16%) |
-| [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_ema_nosync_ckpt_008000.pt) | 8000 | 0.9395 | 0.9433 | 193 / 129,487 (0.15%) |
-
-![EMA + no-sync + lr: full-library evaluation and training reward through iteration 8000](docs/assets/boneseed_optimized_curve.png)
-
-At 8000 iterations this configuration already exceeds the 12000-iteration baseline on normalized return (0.9395 vs 0.9243) and halves the number of failed clips (193 vs 350).
-
-### BONES-SEED with Muon hidden-layer optimization (8000 iterations)
-
-The Muon optimizers update only the hidden `Linear.weight` matrices of the policy encoder/decoder and world-model MLP; input/output layers, vectors, normalizers, and the critic use Adam. Muon uses `match_rms_adamw` scaling, so the existing learning rate and cosine schedule are reused. Muon is now the default for both networks (`pi_opt: muon`, `wm_opt: muon`); Adam remains explicitly selectable.
-
-The structured world model (`algo.wm_structured`) predicts velocity increments plus residual position corrections on top of a trapezoidal velocity drift, following InstantTrack's semi-implicit formulation. It does not change the policy input/output contract.
-
-The three seed-0 runs use mjwarp, 4096 environments, the complete 129,487-clip BONES-SEED library, and the same schedule.
-
-Muon reaches the Adam 8000-iteration macro return in 4000 iterations (0.939500 versus 0.939490), although its 423 failed clips are not a strict success-rate match for Adam's 193 at 8000. At 8000 iterations, Muon improves macro return by 0.0108 and reduces failed clips from 193 to 166.
-
-Adding the structured world model improves macro and frame-weighted return at every checkpoint and greatly improves early success: failed clips drop from 1126 to 722 at 2000 iterations and from 423 to 242 at 4000. Its additional 3000-iteration checkpoint reaches 0.929833 macro return, 0.932974 frame-weighted return, and 297 failed clips. At 6000/8000 iterations it trades slightly more failures (195 versus 186, then 176 versus 166) for the higher mean return. Its 8000-iteration world-model 8-step error is 0.05635 versus 0.06252 for Muon (-9.9%), with only 0.54% lower measured throughput. The default recipe below adopts `wm_structured=true` together with the retuned 8k budget.
-
-![Adam, Muon, and Muon + structured WM: full-library evaluation and learner wall time at 2000, 3000, 4000, 6000, and 8000 iterations](docs/assets/muon_vs_adam_evaluation.png)
-
-Reproduce the Muon run after building `data/library/bones_seed_compact.pt`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
-  'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
-  algo.iterations=8000 \
-  algo.pi_opt=muon \
-  algo.wm_opt=muon \
-  training.log_dir=runs/supermimic_boneseed_muon_001
-```
-
-Add `algo.wm_structured=true` for the structured world-model ablation.
-
-Evaluate a checkpoint produced by either run:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
-  --backend mjwarp \
-  --ckpt runs/supermimic_boneseed_muon_001/ckpt_008000.pt \
-  --num_envs 16384
-```
-
-### BONES-SEED default recipe (8000 iterations)
-
-The default training configuration now targets an 8000-iteration BONES-SEED budget. Relative to the previous defaults it changes `iterations` 12000 -> 8000, `lr_decay_iters` 250000 -> 12000, `wm_structured` false -> true, `wm_hidden` [2048, 2048, 2048] -> [1024, 1024, 1024], `pi_batch` 4096 -> 2048 with `wm_batches` 10 -> 5, and the base angular-velocity observation-noise half-width 0.05 -> 0.2 (now matching the upstream proprio spec comment; gravity 0.05, joint_pos 0.01, joint_vel 0.5, and zero action noise are unchanged).
-
-A seed-0 comparison on one RTX 6000D (mjwarp, 4096 environments, the complete 129,487-clip library, deterministic full-library evaluation with 16384 environments):
-
-| policy (8000 iterations) | norm return | frame-weighted | failed clips | learner wall |
-|---|---:|---:|---:|---:|
-| previous defaults with Adam override (`pi_opt=adam wm_opt=adam`) | 0.9073 | 0.9088 | 340 | 0.80 h |
-| new defaults [ckpt_008000.pt](https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt) | 0.9320 | 0.9279 | 202 | 0.54 h |
-
-The new defaults already pass the previous 8000-iteration return at iteration 4000 (0.9122, 391 failed clips). Attribution from existing runs and logs, without additional training: Muon plus the structured world model reproduce +0.044 training reward over Adam plus the unstructured model at 8000 iterations; the 1024-wide structured world model matches the 2048-wide one at that horizon (training reward 0.891 vs 0.890) and, together with the halved update batches, raises throughput from 2.85 to 4.09 it/s; the budget-aligned schedule anneals the policy by iteration 8000 (lr 1.09e-4 versus 3.99e-4 unannealed), and two 150k runs kept on the old 250k decay peaked near 0.91 around iteration 60000 before degrading to 0.25-0.64, so the shorter decay also removes a long-run instability. The recovered failures spread across motion families (jump 24, crawl 22, sit 15, dance 9, stand 9, push 8, kick 8); flips and rolls remain the hardest residual failures.
+![Training curves for the three seeds](docs/assets/graph8k_curves.png)
 
 Reproduce with no overrides after building the library:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-train \
   'env.commands.motion.motion_files=[data/library/bones_seed_compact.pt]' \
-  training.log_dir=runs/supermimic_boneseed_default8k_001
+  training.log_dir=runs/supermimic_boneseed_graph8k_001
 ```
 
-Evaluate the released checkpoint of this recipe directly:
+Evaluate the final checkpoint:
 
 ```bash
-curl -L -o boneseed_default8k_ckpt_008000.pt \
-  https://github.com/Motphys/Uni-SuperMimic/releases/download/checkpoints-v1/boneseed_default8k_ckpt_008000.pt
 CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --backend mjwarp \
-  --ckpt boneseed_default8k_ckpt_008000.pt \
+  --ckpt runs/supermimic_boneseed_graph8k_001/ckpt_008000.pt \
   --num_envs 16384
 ```
 

@@ -13,7 +13,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from unilab.rl.contracts.env import EnvProtocol
+from unilab.base.contracts.env import EnvProtocol
 
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
@@ -58,6 +58,33 @@ class SuperMimicConfig:
     critic_minibatches: int = 4
     no_critic: bool = False
     lr_decay_iters: int = 250_000
+    fail_penalty: float = 0.0
+    # BlinkMimic2-style exams, all off by default: ``exam_frac`` 0 disables the
+    # whole mechanism and keeps the pre-exam behavior. When enabled, the last
+    # ``exam_frac * num_envs`` worlds become exam worlds at iteration
+    # ``exam_start_iter`` (one-time assignment, no reshuffling): their episodes
+    # start on a clip's first frame, run to the clip end without early
+    # termination, and are collected with the EMA policy. The share of policy-
+    # update imagination starts drawn from those rows' transitions ramps
+    # linearly from ``exam_frac`` to ``exam_share_ramp`` over
+    # ``exam_ramp_iters`` iterations (0 disables the ramp).
+    exam_start_iter: int = 0
+    exam_frac: float = 0.0
+    exam_share_ramp: float = 0.0
+    exam_ramp_iters: int = 2500
+    # exams-v2 margin mode, off by default (requires exam_frac > 0). When on,
+    # the command keeps per-clip EMA failure statistics (``fail_ema`` decay,
+    # BlinkMimic2 uses 0.7) and re-selects the exam clips every
+    # ``exam_clip_window`` iterations by margin priority: the per-clip EMA
+    # failure rate closest to 1 is examined first, one exam row per clip
+    # (device-side topk, deterministic). ``frontier_frac`` of the practice
+    # resets (fixed per-row Bernoulli ratio) start inside the frontier window
+    # of a failed clip — [failure frame - 50, clip end) — instead of the
+    # bin-EMA mixture; the rest keep the existing sampling.
+    exam_margin: bool = False
+    exam_clip_window: int = 250
+    frontier_frac: float = 0.5
+    fail_ema: float = 0.7
     ckpt_every: int = 2000
     log_every: int = 50
     log_backend: str = "tensorboard"
@@ -93,7 +120,7 @@ _SAFE_GEOMETRY_BATCH = 4096 if getattr(torch.version, "hip", None) is not None e
 
 
 def _empty_stats() -> dict[str, list[torch.Tensor]]:
-    return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
+    return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": [], "exam_surv": []}
 
 
 def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
@@ -120,6 +147,60 @@ class SuperMimicLearner:
             raise ValueError(f"wm_opt must be 'adam' or 'muon', got {cfg.wm_opt!r}")
         if cfg.test_hidden_dims is not None and not cfg.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
+        exam_rows = 0
+        if cfg.exam_frac > 0.0:
+            if cfg.pi_ema <= 0.0:
+                raise ValueError(
+                    "SuperMimic exams require pi_ema > 0: exam worlds act with the EMA policy"
+                )
+            if not 0.0 < cfg.exam_frac < 1.0:
+                raise ValueError(
+                    f"exam_frac must be in (0, 1) when exams are enabled, got {cfg.exam_frac}"
+                )
+            if not 0.0 <= cfg.exam_share_ramp < 1.0:
+                raise ValueError(f"exam_share_ramp must be in [0, 1), got {cfg.exam_share_ramp}")
+            if cfg.exam_start_iter < 0:
+                raise ValueError(f"exam_start_iter must be >= 0, got {cfg.exam_start_iter}")
+            if cfg.exam_share_ramp > 0.0 and cfg.exam_ramp_iters <= 0:
+                raise ValueError(
+                    f"exam_ramp_iters must be positive when exam_share_ramp is set, "
+                    f"got {cfg.exam_ramp_iters}"
+                )
+            if not callable(getattr(env, "enable_supermimic_exams", None)):
+                raise TypeError(
+                    f"{type(env).__name__} does not support SuperMimic exams "
+                    "(missing enable_supermimic_exams)"
+                )
+            exam_rows = int(round(cfg.exam_frac * env.num_envs))
+            if not 0 < exam_rows < env.num_envs:
+                raise ValueError(
+                    f"exam_frac {cfg.exam_frac} resolves to {exam_rows} exam rows of "
+                    f"{env.num_envs} environments"
+                )
+        if cfg.exam_margin:
+            if exam_rows == 0:
+                raise ValueError(
+                    "SuperMimic exam_margin requires exam_frac > 0: margin mode "
+                    "selects the exam worlds' clips"
+                )
+            if not 0.0 <= cfg.frontier_frac <= 1.0:
+                raise ValueError(f"frontier_frac must be in [0, 1], got {cfg.frontier_frac}")
+            if not 0.0 <= cfg.fail_ema < 1.0:
+                raise ValueError(f"fail_ema must be in [0, 1), got {cfg.fail_ema}")
+            if isinstance(cfg.exam_clip_window, bool) or cfg.exam_clip_window <= 0:
+                raise ValueError(f"exam_clip_window must be positive, got {cfg.exam_clip_window}")
+            if not callable(getattr(env, "configure_supermimic_exam_margin", None)):
+                raise TypeError(
+                    f"{type(env).__name__} does not support SuperMimic margin exams "
+                    "(missing configure_supermimic_exam_margin)"
+                )
+            # Configure before any stepping (and any reset-segment capture):
+            # the command bakes these Python-level switches into the captured
+            # segment's branch layout once, here.
+            env.configure_supermimic_exam_margin(
+                frontier_frac=cfg.frontier_frac, fail_ema=cfg.fail_ema
+            )
+        self._exam_rows_planned = exam_rows
 
         self.env = env
         self.cfg = cfg
@@ -213,6 +294,14 @@ class SuperMimicLearner:
         self.iteration = 0
         self.sim_steps = 0
         self.wall_time = 0.0
+        # Exam schedule (all zeros while exams are off or not yet started):
+        # ``_exam_rows`` counts the active exam worlds (the last rows), and
+        # ``_exam_share`` is the probability each imagination start is drawn
+        # from those rows' transitions. ``_exam_fail_ema`` carries the mean
+        # failure EMA of the currently examined clips (margin mode only).
+        self._exam_rows = 0
+        self._exam_share = 0.0
+        self._exam_fail_ema: float | None = None
         self.stats = _empty_stats()
         self._wm_rollout_fn = self._compile(self._wm_rollout)
         self._wm_err_fn = self._compile(self._wm_err)
@@ -418,6 +507,15 @@ class SuperMimicLearner:
             self.pi.goal_norm.update(goal)
             action = self.pi(self.obs_hist, goal)
             action = torch.clamp(action, -20, 20)
+            if self._exam_rows:
+                # Exam worlds act with the deployed (EMA) policy, as the
+                # evaluation would; their transitions still feed the replay
+                # buffer and the world-model normalizers below.
+                assert self.pi_avg is not None
+                exam_action = self.pi_avg.module(
+                    self.obs_hist[-self._exam_rows :], goal[-self._exam_rows :]
+                )
+                action[-self._exam_rows :] = torch.clamp(exam_action, -20, 20).to(action.dtype)
             if self._bridged:
                 step_state = self.env.step(action.to(self.env_device))
             else:
@@ -443,11 +541,31 @@ class SuperMimicLearner:
                 self.wm.inc_norm.update(target)
             self.sim_steps += self.env.num_envs
             self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+            if self._exam_rows:
+                # Per-step survival of the exam worlds: the share whose danger
+                # probability stays under the termination band. These episodes
+                # never hard-terminate, so this is the observable for whether
+                # the exams are improving.
+                rows = slice(self.env.num_envs - self._exam_rows, None)
+                danger = self.mdp.soft_termination(
+                    unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
+                )
+                self.stats["exam_surv"].append((danger < 0.5).float().mean())
             if "ep_len" in transition:
-                self.stats["ep_len"].append(transition["ep_len"].mean())
-                self.stats["ep_ret"].append(transition["ep_ret_norm"].mean())
-                self.stats["term"].append(transition["term"].float().sum())
-                self.stats["done"].append(transition["done"].float().sum())
+                # Episode statistics are full-width and masked (non-done rows
+                # carry zero), so aggregate with the done count. Exam episodes
+                # stay out of them: their only end is the clip end.
+                done = transition["done"]
+                term = transition["term"]
+                if self._exam_rows:
+                    done = done[: self.env.num_envs - self._exam_rows]
+                    term = term[: self.env.num_envs - self._exam_rows]
+                done_count = float(done.sum())
+                if done_count > 0.0:
+                    self.stats["ep_len"].append(float(transition["ep_len"].sum()) / done_count)
+                    self.stats["ep_ret"].append(float(transition["ep_ret_norm"].sum()) / done_count)
+                self.stats["term"].append(term.float().sum())
+                self.stats["done"].append(done.float().sum())
 
     def wm_update(self) -> tuple[torch.Tensor, torch.Tensor]:
         window = self.buffer.sample_windows(self.cfg.wm_batch, self.cfg.wm_window)
@@ -461,14 +579,55 @@ class SuperMimicLearner:
         mean_last_error = (last_error.detach() * mask).sum() / mask.sum().clamp(min=1)
         return loss.detach() / self.cfg.wm_window, mean_last_error
 
+    def _advance_exam_schedule(self, iteration: int) -> None:
+        """Activate exams at ``exam_start_iter`` and ramp the imagination share.
+
+        Activation is a one-time, eager, iteration-boundary event: the env
+        flips its persistent exam mask in place and resets the newly assigned
+        rows onto clip first frames (margin mode selects those clips by
+        failure-EMA priority). Afterwards only the device-side sampling
+        probability changes, linearly from ``exam_frac`` to
+        ``exam_share_ramp``, and — in margin mode — the exam clip table is
+        re-selected every ``exam_clip_window`` iterations (eagerly, outside
+        every captured segment; the activation iteration already selected).
+        """
+        if self._exam_rows_planned == 0:
+            return
+        if self._exam_rows == 0:
+            if iteration < self.cfg.exam_start_iter:
+                return
+            self.env.enable_supermimic_exams(self._exam_rows_planned)
+            self._exam_rows = self._exam_rows_planned
+            self._exam_share = self.cfg.exam_frac
+        if self.cfg.exam_share_ramp > 0.0:
+            progress = (iteration - self.cfg.exam_start_iter) / self.cfg.exam_ramp_iters
+            progress = min(max(progress, 0.0), 1.0)
+            self._exam_share = self.cfg.exam_frac + progress * (
+                self.cfg.exam_share_ramp - self.cfg.exam_frac
+            )
+        if (
+            self.cfg.exam_margin
+            and iteration % self.cfg.exam_clip_window == 0
+            and iteration != self.cfg.exam_start_iter
+        ):
+            mean_fail_ema = self.env.refresh_supermimic_exam_clips(self._exam_rows)
+            # One host read per refresh window (never inside a captured
+            # segment) so TensorBoard can watch the margin converge.
+            self._exam_fail_ema = float(mean_fail_ema)
+
     def _sample_valid_starts(
         self, batch_size: int
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        # While exams run, prefer exam-row transitions for imagination starts
+        # (BlinkMimic2's practice/exam start split).
+        exam_rows = self._exam_rows if self._exam_share > 0.0 else 0
         if self.cfg.no_sync:
             # Fixed-size selection without reading the valid count on the host: oversample by 2x,
             # stable-sort the valid starts first, and keep the leading ``batch_size``. Only starts
             # within ``horizon`` frames of a clip end are invalid (< 1 %), so 2x is enough.
-            start, history = self.buffer.sample_starts(2 * batch_size, self.cfg.hist)
+            start, history = self.buffer.sample_starts(
+                2 * batch_size, self.cfg.hist, exam_rows=exam_rows, exam_prob=self._exam_share
+            )
             valid = self.mdp.valid_imagination_start(start["f"], self.cfg.horizon)
             indices = torch.sort((~valid).to(torch.uint8), stable=True).indices[:batch_size]
             return (
@@ -480,7 +639,9 @@ class SuperMimicLearner:
         histories = []
         count = 0
         while count < batch_size:
-            start, history = self.buffer.sample_starts(2 * batch_size, self.cfg.hist)
+            start, history = self.buffer.sample_starts(
+                2 * batch_size, self.cfg.hist, exam_rows=exam_rows, exam_prob=self._exam_share
+            )
             valid = self.mdp.valid_imagination_start(start["f"], self.cfg.horizon)
             indices = valid.nonzero(as_tuple=False).squeeze(-1)[: batch_size - count]
             starts.append({key: value[indices] for key, value in start.items()})
@@ -547,7 +708,15 @@ class SuperMimicLearner:
             discount = self.cfg.gamma ** torch.arange(
                 self.cfg.horizon, device=self.device, dtype=torch.float32
             ).unsqueeze(-1)
-            objective = (discount * continuation * rewards).sum(0)
+            # BlinkMimic2-style actor-only failure penalty: the imagined reward
+            # used by the policy objective is shaped by the soft-termination
+            # probability, while the critic below keeps learning the plain
+            # tracking reward (``detached_rewards``).
+            if self.cfg.fail_penalty:
+                actor_rewards = rewards - self.cfg.fail_penalty * dones
+            else:
+                actor_rewards = rewards
+            objective = (discount * continuation * actor_rewards).sum(0)
             survival = alive[-1]
             reward_sum = (continuation * rewards).detach().sum(0)
             detached_rewards, detached_dones = rewards.detach(), dones.detach()
@@ -769,6 +938,13 @@ class SuperMimicLearner:
                 for iteration in range(start_iteration, self.cfg.iterations):
                     if self.cfg.compile and iteration == start_iteration:
                         logger.log_status("Compiling world model (one-off, slow on first run)")
+                    exam_rows_before = self._exam_rows
+                    self._advance_exam_schedule(iteration)
+                    if self._exam_rows != exam_rows_before:
+                        logger.log_status(
+                            f"Exams active: {self._exam_rows}/{self.env.num_envs} worlds, "
+                            f"imagination exam share {self._exam_share:.3f}"
+                        )
                     iteration_start = time.time()
                     learning_rate = self.lr_at(iteration)
                     for optimizer in (self.opt_wm, self.opt_pi, self.opt_v):
@@ -837,6 +1013,9 @@ class SuperMimicLearner:
                         if total_done > 0
                         else None
                     )
+                    exam_survival = (
+                        self._mean(self.stats["exam_surv"]) if self.stats["exam_surv"] else None
+                    )
                     logger.log_step(
                         self.iteration,
                         wm_loss=float(wm_loss),
@@ -851,6 +1030,8 @@ class SuperMimicLearner:
                         ep_len=ep_len,
                         ep_ret_norm=ep_ret_norm,
                         term_frac=term_frac,
+                        exam_survival=exam_survival,
+                        exam_fail_ema=self._exam_fail_ema,
                         iter_sim_steps=collect_steps * self.env.num_envs,
                         collect_time=train_phase_start - iteration_start,
                         learn_time=train_time,
