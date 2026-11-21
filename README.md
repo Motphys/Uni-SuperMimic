@@ -267,14 +267,11 @@ Previous result tables and ablations (LAFAN1, the 12000-iteration BONES-SEED run
 
 The default recipe trains with unilab 1.6.0's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged.
 
-Three seeds (mjwarp, 4096 environments, one RTX 4090, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol:
+Three seeds (mjwarp, 4096 environments, one RTX 4090, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol. Reported numbers are the mean of the three seeds:
 
-| seed | norm return | frame-weighted | failed clips | success rate | learner wall |
+| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | learner wall |
 |---|---:|---:|---:|---:|---:|
-| 0 | 0.9325 | 0.9285 | 186 | 99.86% | 0.371 h |
-| 1 | 0.9320 | 0.9276 | 289 | 99.78% | 0.373 h |
-| 2 | 0.9321 | 0.9281 | 210 | 99.84% | 0.373 h |
-| **mean of 3 seeds** | **0.9322** | **0.9281** | **228** | **99.82%** | **0.372 h (22.3 min)** |
+| default recipe with `env.autoreset_cuda_graph` | **0.9322** | **0.9281** | **228** | **99.82%** | **0.372 h (22.3 min)** |
 
 Steady-state learner throughput is ~6.2 it/s; the 8,000-iteration run fits in about 22 minutes on a single RTX 4090.
 
