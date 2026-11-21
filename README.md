@@ -199,6 +199,8 @@ Muon uses `match_rms_adamw` scaling, so the existing `algo.lr` and cosine schedu
 
 Evaluation starts every motion from its first frame, disables observation and action noise, and runs the complete clip. Finished environments are recycled for pending clips, with longer clips scheduled first to avoid a long idle batch tail. The standalone evaluator uses at most 16,384 parallel environments by default; use `unisupermimic-eval --num_envs N` to fit a smaller GPU. Strict sim2sim validation checks policy I/O, network shape, motion library, and MJCF identity before environment construction.
 
+To export a checkpoint and inspect it in the same-repository MuJoCo sim2sim viewer, see [Deployment export and sim2sim viewer](docs/SIM2SIM.md).
+
 The standalone evaluator and video exporter accept `--backend mjwarp`, `--backend mujoco`, or `--backend motrix` and default to mjwarp:
 
 ```bash
