@@ -275,7 +275,7 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 稳态 learner 吞吐约 6.2 it/s；8000 轮全库训练在单张 RTX 4090 上约 22 分钟完成。
 
-![评估柱状图：各 seed 的全库 norm return、失败段数与训练墙钟](docs/assets/graph8k_eval_bars.png)
+![评估柱状图：全库 norm return、失败段数与训练墙钟（3 seeds 均值）](docs/assets/graph8k_eval_bars.png)
 
 ![三个 seed 的训练曲线](docs/assets/graph8k_curves.png)
 

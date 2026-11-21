@@ -275,7 +275,7 @@ Three seeds (mjwarp, 4096 environments, one RTX 4090, the complete 129,487-clip 
 
 Steady-state learner throughput is ~6.2 it/s; the 8,000-iteration run fits in about 22 minutes on a single RTX 4090.
 
-![Evaluation bars: full-library norm return, failed clips, and learner wall time per seed](docs/assets/graph8k_eval_bars.png)
+![Evaluation bars: full-library norm return, failed clips, and learner wall time (mean of 3 seeds)](docs/assets/graph8k_eval_bars.png)
 
 ![Training curves for the three seeds](docs/assets/graph8k_curves.png)
 
