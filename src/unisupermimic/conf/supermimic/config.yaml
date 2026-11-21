@@ -29,6 +29,7 @@ algo:
   pi_opt: muon
   wm_opt: muon
   no_sync: true
+  wm_graph: false
   pi_ema: 0.995
   gamma: 0.99
   lam: 0.95
@@ -64,6 +65,10 @@ algo:
   log_backend: tensorboard
   amp: bf16
   compile: true
+  compile_mode: default
+  async_collect: false
+  proc_collect: true
+  three_way: true
   test_hidden_dims: null
 
 training:

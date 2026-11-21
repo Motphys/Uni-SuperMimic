@@ -209,7 +209,7 @@ def make_current_info(
 ) -> dict[str, torch.Tensor]:
     """Materialize the learner's current-state input without backend views."""
     return {
-        "s": flatten_state(state).detach().clone(),
+        "s": flatten_state(state).detach(),
         "f": frames.detach().clone(),
         "xi": context.detach().clone(),
         "a_prev": previous_action.detach().clone(),
@@ -231,8 +231,8 @@ def make_transition_info(
 ) -> dict[str, torch.Tensor]:
     """Materialize one pre-reset transition, including both done causes."""
     return {
-        "s": flatten_state(state).detach().clone(),
-        "s1": flatten_state(next_state).detach().clone(),
+        "s": flatten_state(state).detach(),
+        "s1": flatten_state(next_state).detach(),
         "a": action.detach().clone(),
         "a_prev": previous_action.detach().clone(),
         "xi": context.detach().clone(),

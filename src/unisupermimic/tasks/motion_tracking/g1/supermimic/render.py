@@ -61,17 +61,27 @@ def rollout_qpos(
     if clip_name not in motion.names:
         raise ValueError(f"Unknown motion clip: {clip_name}")
     clip_index = motion.names.index(clip_name)
+    num_envs = getattr(env, "num_envs", None)
+    if num_envs is not None and len(motion.names) > int(num_envs):
+        # Compact libraries can hold far more clips than env slots: put the
+        # requested clip in slot 0 and fill the remaining slots with clip 0.
+        clip_slot = 0
+        start_frames = motion.clip_start[0].expand(int(num_envs)).clone()
+        start_frames[clip_slot] = motion.clip_start[clip_index]
+    else:
+        clip_slot = clip_index
+        start_frames = motion.clip_start.clone()
     max_frames = max(1, round((start + seconds) * CONTROL_FPS))
     args = checkpoint["args"]
     hist = int(args["hist"])
     goal_frames = int(args["goal_frames"])
     policy = load_policy(env, checkpoint)
 
-    _, reset_info = env.reset_to_frames(motion.clip_start.clone())
+    _, reset_info = env.reset_to_frames(start_frames)
     current = reset_info[SUPERMIMIC_STATE_KEY]
     history = None
-    states = [current["s"][clip_index].cpu()]
-    frames = [int(current["f"][clip_index].item())]
+    states = [current["s"][clip_slot].cpu()]
+    frames = [int(current["f"][clip_slot].item())]
     while len(states) < max_frames:
         obs = mdp.obs(
             unflatten_state(current["s"]),
@@ -89,11 +99,11 @@ def rollout_qpos(
         )
         state = env.step(action)
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
-        if bool(transition["done"][clip_index].item()):
+        if bool(transition["done"][clip_slot].item()):
             break
         current = state.info[SUPERMIMIC_STATE_KEY]
-        states.append(current["s"][clip_index].cpu())
-        frames.append(int(current["f"][clip_index].item()))
+        states.append(current["s"][clip_slot].cpu())
+        frames.append(int(current["f"][clip_slot].item()))
 
     start_frame = round(start * CONTROL_FPS)
     if start_frame >= len(states):
