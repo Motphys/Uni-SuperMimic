@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from .proc_collector import ProcCollectDriver
 
 import torch
 import torch.nn as nn
@@ -91,7 +95,12 @@ class SuperMimicConfig:
     seed: int = 0
     amp: str = "bf16"
     compile: bool = True
+    compile_mode: str = "default"
+    wm_graph: bool = False
     test_hidden_dims: tuple[int, ...] | None = None
+    async_collect: bool = False
+    proc_collect: bool = False
+    three_way: bool = False
 
 
 _LOG_FIELDS = (
@@ -128,6 +137,100 @@ def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
         parameter.requires_grad_(enabled)
 
 
+class _CollectWorker(threading.Thread):
+    """Background thread running ``learner._collect_step`` during WM updates.
+
+    The worker owns the environment between ``dispatch`` and ``join``; the main
+    thread must not touch the env, the policy, or ``learner.obs_hist`` in that
+    window. Staged replay rows stay invisible to samplers until the main thread
+    calls ``ReplayBuffer.commit`` after ``join``.
+    """
+
+    def __init__(self, learner: SuperMimicLearner):
+        super().__init__(daemon=True, name="supermimic-collect")
+        self._learner = learner
+        self.stream = torch.cuda.Stream(learner.device) if learner.device.type == "cuda" else None
+        self.pending_steps = 0
+        self.error: BaseException | None = None
+        self.staged_stats: dict[str, list[torch.Tensor]] = _empty_stats()
+        self.staged_transitions: list[dict[str, torch.Tensor]] = []
+        self._request = threading.Event()
+        self._completed = threading.Event()
+        self._completed.set()
+        self._shutdown = False
+
+    def dispatch(self, n_steps: int) -> None:
+        if not self._completed.is_set():
+            raise RuntimeError("collect worker dispatched before previous join")
+        self.pending_steps = n_steps
+        self._completed.clear()
+        self._request.set()
+
+    def run(self) -> None:
+        while True:
+            self._request.wait()
+            self._request.clear()
+            if self._shutdown:
+                self._completed.set()
+                return
+            learner = self._learner
+            try:
+                if self.stream is not None:
+                    with torch.cuda.stream(self.stream):
+                        self._collect_pending(learner)
+                else:
+                    self._collect_pending(learner)
+            except BaseException as exc:  # surfaced to the main thread at join
+                self.error = exc
+            self._completed.set()
+
+    def _collect_pending(self, learner: SuperMimicLearner) -> None:
+        for _ in range(self.pending_steps):
+            transition = learner._collect_step(self.staged_stats)
+            self.staged_transitions.append(transition)
+
+    def harvest(self) -> None:
+        """Wait for in-flight steps, then publish staged rows, norms, and stats."""
+        self._completed.wait()
+        if self.error is not None:
+            raise RuntimeError("collect worker failed") from self.error
+        if self.stream is not None:
+            torch.cuda.current_stream(self._learner.device).wait_stream(self.stream)
+        learner = self._learner
+        for transition in self.staged_transitions:
+            learner._apply_wm_norms(transition)
+        learner.buffer.commit(len(self.staged_transitions))
+        learner.sim_steps += len(self.staged_transitions) * learner.env.num_envs
+        for key, staged in self.staged_stats.items():
+            learner.stats[key].extend(staged)
+        self.staged_transitions = []
+        self.staged_stats = _empty_stats()
+        self.pending_steps = 0
+
+    def shutdown(self) -> None:
+        """Stop the worker loop; never raises (used from ``finally`` blocks)."""
+        self._shutdown = True
+        self._request.set()
+        self._completed.wait()
+        super().join(timeout=5.0)
+
+
+def _maybe_start_profiler(tag: str):
+    """Env-gated torch.profiler (kineto/CUPTI) wrapper for kernel-timeline
+    analysis. Enabled when UNISUPERMIMIC_PROFILE_DIR is set; writes one
+    chrome trace per process into that directory."""
+    directory = os.environ.get("UNISUPERMIMIC_PROFILE_DIR")
+    if not directory:
+        return None
+    from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
+
+    os.makedirs(directory, exist_ok=True)
+    return profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        on_trace_ready=tensorboard_trace_handler(directory, worker_name=tag),
+    ).__enter__()
+
+
 class SuperMimicLearner:
     def __init__(
         self,
@@ -136,6 +239,7 @@ class SuperMimicLearner:
         log_dir: str | Path,
         device: str | torch.device | None = None,
         backend: str = "",
+        collector_env_spec: dict[str, Any] | None = None,
     ):
         if cfg.amp not in ("none", "bf16"):
             raise ValueError(f"amp must be 'none' or 'bf16', got {cfg.amp!r}")
@@ -201,6 +305,43 @@ class SuperMimicLearner:
                 frontier_frac=cfg.frontier_frac, fail_ema=cfg.fail_ema
             )
         self._exam_rows_planned = exam_rows
+        if cfg.compile_mode == "reduce-overhead":
+            # policy_update stores compiled-fn outputs (states/rewards) across
+            # loop generations; cudagraph_trees reuses those buffers unless
+            # user-visible outputs are cloned.
+            import torch._inductor.config as _inductor_config
+
+            _inductor_config.triton.cudagraph_trees_generation_cloning = "user_visible"
+            _inductor_config.triton.cudagraph_trees_history_recording = True
+        if cfg.compile_mode not in ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"):
+            raise ValueError(
+                f"compile_mode must be default/reduce-overhead/max-autotune/max-autotune-no-cudagraphs, got {cfg.compile_mode!r}"
+            )
+        if not isinstance(cfg.async_collect, bool):
+            raise TypeError(
+                f"async_collect must be a bool (use true/false, not on/off), got {cfg.async_collect!r}"
+            )
+        if not isinstance(cfg.proc_collect, bool):
+            raise TypeError(
+                f"proc_collect must be a bool (use true/false, not on/off), got {cfg.proc_collect!r}"
+            )
+        if cfg.async_collect and cfg.proc_collect:
+            raise ValueError("async_collect and proc_collect are mutually exclusive")
+        if cfg.async_collect and backend:
+            from unilab.base.process_device import is_host_bridge_backend
+
+            if not is_host_bridge_backend(backend):
+                raise ValueError(
+                    f"threaded async_collect is only safe for HOST_BRIDGE backends, got "
+                    f"{backend!r}; use proc_collect (process-isolated collector) instead"
+                )
+        if cfg.proc_collect and collector_env_spec is None:
+            raise ValueError("proc_collect requires collector_env_spec")
+        if not isinstance(cfg.three_way, bool):
+            raise TypeError(f"three_way must be a bool, got {cfg.three_way!r}")
+        if cfg.three_way and not cfg.proc_collect:
+            raise ValueError("three_way requires proc_collect")
+        self._collector_env_spec = collector_env_spec
 
         self.env = env
         self.cfg = cfg
@@ -223,6 +364,7 @@ class SuperMimicLearner:
         # rocBLAS kernel selection costing ~100 ms per call.
         torch.backends.cuda.matmul.allow_tf32 = cfg.amp == "none"
         torch.backends.cudnn.allow_tf32 = True
+        self._wm_graph_state: dict = {"warmups": 0, "graph": None}
         torch.manual_seed(cfg.seed)
         networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
         networks.RunningNorm.no_sync = cfg.no_sync
@@ -251,6 +393,7 @@ class SuperMimicLearner:
                 lr=cfg.lr,
                 betas=(0.9, 0.999),
                 fused=fused_adam,
+                capturable=cfg.wm_graph,
             )
         else:
             self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
@@ -303,11 +446,27 @@ class SuperMimicLearner:
         self._exam_share = 0.0
         self._exam_fail_ema: float | None = None
         self.stats = _empty_stats()
+        # three_way: frozen one-iteration-lagged WM so policy_update overlaps
+        # WM training (collector ∥ WM ∥ policy). Params stay frozen forever.
+        self.wm_shadow: WorldModel | None = None
+        self._imag_step_shadow_fn = None
+        self._pi_stream: torch.cuda.Stream | None = None
+        if cfg.three_way:
+            self.wm_shadow = self._make_world_model().to(self.device)
+            _set_requires_grad(self.wm_shadow, False)
+        self._pi_metrics: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._pi_error: BaseException | None = None
         self._wm_rollout_fn = self._compile(self._wm_rollout)
         self._wm_err_fn = self._compile(self._wm_err)
-        self._imag_step_fn = self._compile(self._imag_step)
+        self._imag_step_fn = self._compile(self._imag_step_main)
         self._reward_term_fn = self._compile(self._reward_term)
         self._critic_input_fn = self._compile(self._critic_input)
+        if cfg.three_way:
+            self._imag_step_shadow_fn = self._compile(self._imag_step_shadow)
+            if self.device.type == "cuda":
+                self._pi_stream = torch.cuda.Stream(self.device)
 
         with (self.log_dir / "args.json").open("w", encoding="utf-8") as stream:
             json.dump(asdict(cfg), stream, indent=2)
@@ -319,6 +478,8 @@ class SuperMimicLearner:
             # Inductor Metal codegen is not usable on MPS; keep AOT graph
             # capture without kernel generation.
             return torch.compile(function, backend="aot_eager")
+        if self.cfg.compile_mode != "default":
+            return torch.compile(function, mode=self.cfg.compile_mode)
         return torch.compile(function)
 
     def _make_world_model(self) -> WorldModel:
@@ -393,7 +554,7 @@ class SuperMimicLearner:
                 actions[:, index],
                 self.mdp.normalize_context(contexts[:, index]),
             )
-            predictions.append(state)
+            predictions.append(tuple(t.clone() for t in state))
         return (
             torch.stack([prediction[0] for prediction in predictions], 1),
             torch.stack([prediction[1] for prediction in predictions], 1),
@@ -413,6 +574,7 @@ class SuperMimicLearner:
 
     def _imag_step(
         self,
+        wm: WorldModel,
         state: State,
         obs_hist: torch.Tensor,
         previous_action: torch.Tensor,
@@ -422,12 +584,48 @@ class SuperMimicLearner:
         goal: torch.Tensor,
     ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         action = self.pi(obs_hist, goal)
-        next_state = self.wm.step(state, action, normalized_context)
+        next_state = wm.step(state, action, normalized_context)
         next_frames = frames + 1
         obs = self.mdp.add_noise(self.mdp.obs(next_state, action, context, next_frames))
         next_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
         next_goal = self.mdp.goal(next_state, next_frames, self.cfg.goal_frames)
         return next_state, action, next_hist, next_frames, next_goal
+
+    def _imag_step_main(
+        self,
+        state: State,
+        obs_hist: torch.Tensor,
+        previous_action: torch.Tensor,
+        frames: torch.Tensor,
+        context: torch.Tensor,
+        normalized_context: torch.Tensor,
+        goal: torch.Tensor,
+    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._imag_step(
+            self.wm, state, obs_hist, previous_action, frames, context, normalized_context, goal
+        )
+
+    def _imag_step_shadow(
+        self,
+        state: State,
+        obs_hist: torch.Tensor,
+        previous_action: torch.Tensor,
+        frames: torch.Tensor,
+        context: torch.Tensor,
+        normalized_context: torch.Tensor,
+        goal: torch.Tensor,
+    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.wm_shadow is not None
+        return self._imag_step(
+            self.wm_shadow,
+            state,
+            obs_hist,
+            previous_action,
+            frames,
+            context,
+            normalized_context,
+            goal,
+        )
 
     def _reward_term(
         self,
@@ -457,7 +655,7 @@ class SuperMimicLearner:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
             reward, done = self._reward_term_fn(state, frames, action, previous_action)
-            return reward, done
+            return reward.clone(), done.clone()
         reward_parts, done_parts = [], []
         for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
             stop = start + _SAFE_GEOMETRY_BATCH
@@ -478,7 +676,7 @@ class SuperMimicLearner:
         normalized_context: torch.Tensor,
     ) -> torch.Tensor:
         if not _SAFE_GEOMETRY_BATCH or len(frames) <= _SAFE_GEOMETRY_BATCH:
-            return self._critic_input_fn(state, frames, normalized_context)
+            return self._critic_input_fn(state, frames, normalized_context).clone()
         parts = []
         for start in range(0, len(frames), _SAFE_GEOMETRY_BATCH):
             stop = start + _SAFE_GEOMETRY_BATCH
@@ -494,83 +692,98 @@ class SuperMimicLearner:
     @torch.no_grad()
     def collect(self, n_steps: int) -> None:
         for _ in range(n_steps):
-            info = self._state_info()
-            state = unflatten_state(info["s"])
-            obs = self.mdp.add_noise(self.mdp.obs(state, info["a_prev"], info["xi"], info["f"]))
-            fresh = info["ep_step"] == 0
-            shifted = torch.cat((self.obs_hist[:, 1:], obs.unsqueeze(1)), 1)
-            self.obs_hist = torch.where(
-                fresh[:, None, None], obs.unsqueeze(1).expand_as(self.obs_hist), shifted
-            )
-            goal = self.mdp.goal(state, info["f"], self.cfg.goal_frames)
-            self.pi.obs_norm.update(obs)
-            self.pi.goal_norm.update(goal)
-            action = self.pi(self.obs_hist, goal)
-            action = torch.clamp(action, -20, 20)
-            if self._exam_rows:
-                # Exam worlds act with the deployed (EMA) policy, as the
-                # evaluation would; their transitions still feed the replay
-                # buffer and the world-model normalizers below.
-                assert self.pi_avg is not None
-                exam_action = self.pi_avg.module(
-                    self.obs_hist[-self._exam_rows :], goal[-self._exam_rows :]
-                )
-                action[-self._exam_rows :] = torch.clamp(exam_action, -20, 20).to(action.dtype)
-            if self._bridged:
-                step_state = self.env.step(action.to(self.env_device))
-            else:
-                step_state = self.env.step(action)
-            transition = step_state.info[SUPERMIMIC_TRANSITION_KEY]
-            if self._bridged:
-                transition = {key: value.to(self.device) for key, value in transition.items()}
-            self.buffer.add(transition)
-            initial = unflatten_state(transition["s"])
-            next_state = unflatten_state(transition["s1"])
-            self.wm.in_norm.update(
-                self.wm.inputs(
-                    initial,
-                    transition["a"],
-                    self.mdp.normalize_context(transition["xi"]),
-                )
-            )
-            target = self.wm.targets(initial, next_state)
-            self.wm.out_norm.update(target)
-            if self.cfg.wm_structured:
-                self.wm.inc_norm.update(self.wm.increments(initial, next_state))
-            else:
-                self.wm.inc_norm.update(target)
+            transition = self._collect_step(self.stats)
+            self._apply_wm_norms(transition)
+            self.buffer.commit(1)
             self.sim_steps += self.env.num_envs
-            self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+
+    @torch.no_grad()
+    def _collect_step(self, stats: dict[str, list[torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """Run one environment step and stage the transition (not yet committed)."""
+        info = self._state_info()
+        state = unflatten_state(info["s"])
+        obs = self.mdp.add_noise(self.mdp.obs(state, info["a_prev"], info["xi"], info["f"]))
+        fresh = info["ep_step"] == 0
+        shifted = torch.cat((self.obs_hist[:, 1:], obs.unsqueeze(1)), 1)
+        self.obs_hist = torch.where(
+            fresh[:, None, None], obs.unsqueeze(1).expand_as(self.obs_hist), shifted
+        )
+        goal = self.mdp.goal(state, info["f"], self.cfg.goal_frames)
+        self.pi.obs_norm.update(obs)
+        self.pi.goal_norm.update(goal)
+        action = self.pi(self.obs_hist, goal)
+        action = torch.clamp(action, -20, 20)
+        if self._exam_rows:
+            # Exam worlds act with the deployed (EMA) policy, as the
+            # evaluation would; their transitions still feed the replay
+            # buffer and the world-model normalizers below.
+            assert self.pi_avg is not None
+            exam_action = self.pi_avg.module(
+                self.obs_hist[-self._exam_rows :], goal[-self._exam_rows :]
+            )
+            action[-self._exam_rows :] = torch.clamp(exam_action, -20, 20).to(action.dtype)
+        if self._bridged:
+            step_state = self.env.step(action.to(self.env_device))
+        else:
+            step_state = self.env.step(action)
+        transition = cast(dict[str, torch.Tensor], step_state.info[SUPERMIMIC_TRANSITION_KEY])
+        if self._bridged:
+            transition = {key: value.to(self.device) for key, value in transition.items()}
+        self.buffer.add_staged(transition)
+        stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+        if self._exam_rows:
+            # Per-step survival of the exam worlds: the share whose danger
+            # probability stays under the termination band. These episodes
+            # never hard-terminate, so this is the observable for whether
+            # the exams are improving.
+            rows = slice(self.env.num_envs - self._exam_rows, None)
+            danger = self.mdp.soft_termination(
+                unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
+            )
+            stats["exam_surv"].append((danger < 0.5).float().mean())
+        if "ep_len" in transition:
+            done = transition["done"]
+            term = transition["term"]
+            ep_len = transition["ep_len"]
+            ep_ret = transition["ep_ret_norm"]
             if self._exam_rows:
-                # Per-step survival of the exam worlds: the share whose danger
-                # probability stays under the termination band. These episodes
-                # never hard-terminate, so this is the observable for whether
-                # the exams are improving.
-                rows = slice(self.env.num_envs - self._exam_rows, None)
-                danger = self.mdp.soft_termination(
-                    unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
-                )
-                self.stats["exam_surv"].append((danger < 0.5).float().mean())
-            if "ep_len" in transition:
-                # Episode statistics are full-width and masked (non-done rows
-                # carry zero), so aggregate with the done count. Exam episodes
-                # stay out of them: their only end is the clip end.
-                done = transition["done"]
-                term = transition["term"]
-                if self._exam_rows:
-                    done = done[: self.env.num_envs - self._exam_rows]
-                    term = term[: self.env.num_envs - self._exam_rows]
-                done_count = float(done.sum())
-                if done_count > 0.0:
-                    self.stats["ep_len"].append(float(transition["ep_len"].sum()) / done_count)
-                    self.stats["ep_ret"].append(float(transition["ep_ret_norm"].sum()) / done_count)
-                self.stats["term"].append(term.float().sum())
-                self.stats["done"].append(done.float().sum())
+                keep = self.env.num_envs - self._exam_rows
+                done, term, ep_len, ep_ret = done[:keep], term[:keep], ep_len[:keep], ep_ret[:keep]
+            done_count = float(done.sum())
+            if done_count > 0.0:
+                stats["ep_len"].append(float(ep_len.sum()) / done_count)
+                stats["ep_ret"].append(float(ep_ret.sum()) / done_count)
+            stats["term"].append(term.float().sum())
+            stats["done"].append(done.float().sum())
+        return transition
+
+    def _apply_wm_norms(self, transition: dict[str, torch.Tensor]) -> None:
+        initial = unflatten_state(transition["s"])
+        next_state = unflatten_state(transition["s1"])
+        self.wm.in_norm.update(
+            self.wm.inputs(
+                initial,
+                transition["a"],
+                self.mdp.normalize_context(transition["xi"]),
+            )
+        )
+        target = self.wm.targets(initial, next_state)
+        self.wm.out_norm.update(target)
+        if self.cfg.wm_structured:
+            self.wm.inc_norm.update(self.wm.increments(initial, next_state))
+        else:
+            self.wm.inc_norm.update(target)
 
     def wm_update(self) -> tuple[torch.Tensor, torch.Tensor]:
         window = self.buffer.sample_windows(self.cfg.wm_batch, self.cfg.wm_window)
+        if self.cfg.wm_graph:
+            return self._wm_update_graphed(window)
+        return self._wm_update_body(window)
+
+    def _wm_update_body(self, window: dict) -> tuple[torch.Tensor, torch.Tensor]:
         predicted = self._wm_rollout_fn(window["s"], window["a"], window["xi"])
         loss, last_error = self._wm_err_fn(predicted, window["s1"], window["mask"])
+        loss, last_error = loss.clone(), last_error.clone()
         self.opt_wm.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
@@ -614,6 +827,46 @@ class SuperMimicLearner:
             # One host read per refresh window (never inside a captured
             # segment) so TensorBoard can watch the margin converge.
             self._exam_fail_ema = float(mean_fail_ema)
+    def _wm_graph_body(self, window: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        # zero_grad must be a captured kernel (set_to_none=False): a Python-level
+        # ``grad = None`` assignment would not replay, leaving stale gradients.
+        predicted = self._wm_rollout_fn(window["s"], window["a"], window["xi"])
+        loss, last_error = self._wm_err_fn(predicted, window["s1"], window["mask"])
+        self.opt_wm.zero_grad(set_to_none=False)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
+        self.opt_wm.step()
+        mask = window["mask"][:, -1]
+        mean_last_error = (last_error.detach() * mask).sum() / mask.sum().clamp(min=1)
+        return loss.detach() / self.cfg.wm_window, mean_last_error
+
+    def _wm_update_graphed(self, window: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._wm_graph_state
+        if state["warmups"] < 3:
+            state["warmups"] += 1
+            return self._wm_update_body(window)
+        if state["graph"] is None:
+            statics = {key: value.clone() for key, value in window.items()}
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    self._wm_graph_body(statics)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            # Free stale grads so capture-time backward allocates them INTO the
+            # graph pool; otherwise replay keeps writing to freed general-heap
+            # addresses that the allocator may hand to other tensors (opt state).
+            self.opt_wm.zero_grad(set_to_none=True)
+            with torch.cuda.graph(graph):
+                outs = self._wm_graph_body(statics)
+            state.update(graph=graph, statics=statics, outs=outs)
+            return self._wm_update_body(window)
+        for key, value in window.items():
+            state["statics"][key].copy_(value, non_blocking=True)
+        state["graph"].replay()
+        out_loss, out_err = state["outs"]
+        return out_loss.clone(), out_err.clone()
 
     def _sample_valid_starts(
         self, batch_size: int
@@ -653,9 +906,15 @@ class SuperMimicLearner:
 
         return concatenate(starts), concatenate(histories)
 
+
     def policy_update(
         self,
+        *,
+        wm: WorldModel | None = None,
+        imag_step_fn=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        wm = self.wm if wm is None else wm
+        imag_step_fn = self._imag_step_fn if imag_step_fn is None else imag_step_fn
         start, history = self._sample_valid_starts(self.cfg.pi_batch)
         state = unflatten_state(start["s"])
         context, frames, previous_action = start["xi"], start["f"], start["a_prev"]
@@ -668,7 +927,7 @@ class SuperMimicLearner:
                 history["f"],
             )
         obs_hist = self.mdp.add_noise(obs_hist)
-        _set_requires_grad(self.wm, False)
+        _set_requires_grad(wm, False)
         _set_requires_grad(self.critic, False)
 
         batch_size = self.cfg.pi_batch
@@ -677,8 +936,10 @@ class SuperMimicLearner:
         states, actions, previous_actions, all_frames = [], [], [], []
         try:
             for _ in range(self.cfg.horizon):
-                previous_actions.append(previous_action)
-                state, previous_action, obs_hist, frames, goal = self._imag_step_fn(
+                if self.cfg.compile_mode == "reduce-overhead":
+                    torch.compiler.cudagraph_mark_step_begin()
+                previous_actions.append(previous_action.clone())
+                next_out = imag_step_fn(
                     state,
                     obs_hist,
                     previous_action,
@@ -687,8 +948,13 @@ class SuperMimicLearner:
                     normalized_context,
                     goal,
                 )
-                states.append(state)
-                actions.append(previous_action)
+                state = tuple(t.clone() for t in next_out[0])
+                previous_action = next_out[1].clone()
+                obs_hist = next_out[2].clone()
+                frames = next_out[3].clone()
+                goal = next_out[4].clone()
+                states.append(tuple(t.clone() for t in state))
+                actions.append(previous_action.clone())
                 all_frames.append(frames)
 
             def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
@@ -743,7 +1009,7 @@ class SuperMimicLearner:
             if self.pi_avg is not None:
                 self.pi_avg.update_parameters(self.pi)
         finally:
-            _set_requires_grad(self.wm, True)
+            _set_requires_grad(wm, True)
             _set_requires_grad(self.critic, True)
 
         value_loss = torch.zeros((), device=self.device)
@@ -770,9 +1036,11 @@ class SuperMimicLearner:
                     .expand(self.cfg.horizon + 1, -1, -1)
                     .flatten(0, 1)
                 )
-                critic_input = self._batched_critic_input(
-                    critic_states, critic_frames, critic_context
-                ).view(self.cfg.horizon + 1, batch_size, -1)
+                critic_input = (
+                    self._batched_critic_input(critic_states, critic_frames, critic_context)
+                    .clone()
+                    .view(self.cfg.horizon + 1, batch_size, -1)
+                )
             self.critic.norm.update(critic_input)
             with torch.no_grad():
                 values = self.critic(critic_input) * self._v_std + self._v_mean
@@ -787,8 +1055,8 @@ class SuperMimicLearner:
                 target_mean = targets.mean()
                 target_std = targets.std().clamp(min=1e-2)
                 if not self._v_init:
-                    self._v_mean = target_mean.detach()
-                    self._v_std = target_std.detach()
+                    self._v_mean = target_mean.detach().clone()
+                    self._v_std = target_std.detach().clone()
                     self._v_init = True
                 else:
                     self._v_mean = (1 - self._v_ema) * self._v_mean + self._v_ema * target_mean
@@ -824,6 +1092,21 @@ class SuperMimicLearner:
             grad_norm.detach(),
             survival.mean().detach(),
         )
+
+    def _run_policy_shadow(self) -> None:
+        """Policy-update worker for three_way: uses the 1-iter-lagged shadow WM."""
+        try:
+            if self._pi_stream is not None:
+                with torch.cuda.stream(self._pi_stream):
+                    self._pi_metrics = self.policy_update(
+                        wm=self.wm_shadow, imag_step_fn=self._imag_step_shadow_fn
+                    )
+            else:
+                self._pi_metrics = self.policy_update(
+                    wm=self.wm_shadow, imag_step_fn=self._imag_step_shadow_fn
+                )
+        except BaseException as exc:  # surfaced to the main thread at join
+            self._pi_error = exc
 
     def lr_at(self, iteration: int) -> float:
         if iteration >= self.cfg.lr_decay_iters:
@@ -904,6 +1187,10 @@ class SuperMimicLearner:
         if resume is not None:
             self.load(resume)
         start_iteration = self.iteration
+        if self.cfg.three_way and self.wm_shadow is not None and start_iteration > 0:
+            # Resume: the shadow WM must mirror the restored live WM, not the
+            # freshly initialized module.
+            self.wm_shadow.load_state_dict(self.wm.state_dict())
         self.stats = _empty_stats()
         logger = SuperMimicLogger(
             env_name=type(self.env).__name__,
@@ -915,6 +1202,8 @@ class SuperMimicLearner:
             log_backend=self.cfg.log_backend,
         )
         logger.start(status="Warming up...")
+        worker: _CollectWorker | ProcCollectDriver | None = None
+        profiler = None
         try:
             # Match upstream: start training as soon as the buffer holds one
             # full window; no extra collection warmup or WM-only phase.
@@ -931,6 +1220,24 @@ class SuperMimicLearner:
                 train_start = time.time() - self.wall_time
                 log_start = time.time()
                 step_accumulator = 0.0
+                if self.cfg.proc_collect:
+                    from .proc_collector import ProcCollectDriver
+
+                    env_spec = self._collector_env_spec
+                    if env_spec is None:  # pragma: no cover - validated in __init__
+                        raise ValueError("proc_collect requires collector_env_spec")
+                    worker = ProcCollectDriver(self, env_spec, asdict(self.cfg))
+                    worker.start()
+                elif self.cfg.async_collect:
+                    worker = _CollectWorker(self)
+                    worker.start()
+                if worker is not None:
+                    step_accumulator += 1.0 / self.cfg.utd
+                    dispatch_steps = int(step_accumulator)
+                    step_accumulator -= dispatch_steps
+                    worker.dispatch(dispatch_steps)
+                if profiler is None:
+                    profiler = _maybe_start_profiler("learner")
                 aggregate: dict[str, list[torch.Tensor]] = {
                     key: [] for key in ("wm", "wm8", "pi", "v", "ir", "gn", "surv")
                 }
@@ -949,13 +1256,33 @@ class SuperMimicLearner:
                     learning_rate = self.lr_at(iteration)
                     for optimizer in (self.opt_wm, self.opt_pi, self.opt_v):
                         for group in optimizer.param_groups:
-                            group["lr"] = learning_rate
-                    step_accumulator += 1.0 / self.cfg.utd
-                    collect_steps = int(step_accumulator)
-                    step_accumulator -= collect_steps
+                            current_lr = group["lr"]
+                            if isinstance(current_lr, torch.Tensor):
+                                current_lr.fill_(learning_rate)
+                            else:
+                                group["lr"] = learning_rate
                     stats_mark = len(self.stats["r"])
-                    self.collect(collect_steps)
+                    join_wait = 0.0
+                    if worker is None:
+                        step_accumulator += 1.0 / self.cfg.utd
+                        collect_steps = int(step_accumulator)
+                        step_accumulator -= collect_steps
+                        self.collect(collect_steps)
+                    else:
+                        # This iteration's steps were dispatched one iteration
+                        # ahead and overlap the WM updates below.
+                        collect_steps = worker.pending_steps
                     train_phase_start = time.time()
+                    pi_thread: threading.Thread | None = None
+                    if self.cfg.three_way and iteration > start_iteration:
+                        self._pi_metrics = None
+                        self._pi_error = None
+                        pi_thread = threading.Thread(
+                            target=self._run_policy_shadow,
+                            daemon=True,
+                            name="supermimic-policy",
+                        )
+                        pi_thread.start()
                     wm_loss = torch.zeros((), device=self.device)
                     wm_error = torch.zeros((), device=self.device)
                     for _ in range(self.cfg.wm_batches):
@@ -972,9 +1299,33 @@ class SuperMimicLearner:
                     imag_rew: float | None = None
                     pi_gradnorm: float | None = None
                     imag_survival: float | None = None
-                    policy_loss, value_loss, imagined_reward, grad_norm, survival = (
-                        self.policy_update()
-                    )
+                    if pi_thread is not None:
+                        pi_thread.join()
+                        if self._pi_error is not None:
+                            raise RuntimeError("policy shadow worker failed") from self._pi_error
+                        assert self._pi_metrics is not None
+                        (
+                            policy_loss,
+                            value_loss,
+                            imagined_reward,
+                            grad_norm,
+                            survival,
+                        ) = self._pi_metrics
+                    else:
+                        policy_loss, value_loss, imagined_reward, grad_norm, survival = (
+                            self.policy_update()
+                        )
+                    if worker is not None:
+                        join_start = time.time()
+                        worker.harvest()
+                        join_wait = time.time() - join_start
+                    if self.cfg.three_way and self.wm_shadow is not None:
+                        self.wm_shadow.load_state_dict(self.wm.state_dict())
+                    if worker is not None and iteration + 1 < self.cfg.iterations:
+                        step_accumulator += 1.0 / self.cfg.utd
+                        dispatch_steps = int(step_accumulator)
+                        step_accumulator -= dispatch_steps
+                        worker.dispatch(dispatch_steps)
                     # Fail fast on divergence instead of checkpointing a diverged model.
                     # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
                     # handles a non-finite gradient by zeroing it and stepping, so a non-finite
@@ -1033,7 +1384,9 @@ class SuperMimicLearner:
                         exam_survival=exam_survival,
                         exam_fail_ema=self._exam_fail_ema,
                         iter_sim_steps=collect_steps * self.env.num_envs,
-                        collect_time=train_phase_start - iteration_start,
+                        collect_time=(
+                            join_wait if worker is not None else train_phase_start - iteration_start
+                        ),
                         learn_time=train_time,
                         iteration_time=iteration_time,
                     )
@@ -1097,6 +1450,10 @@ class SuperMimicLearner:
                 **last_metrics,
             }
         finally:
+            if worker is not None:
+                worker.shutdown()
+            if profiler is not None:
+                profiler.__exit__(None, None, None)
             logger.close()
 
 

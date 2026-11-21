@@ -166,6 +166,18 @@ def main(cfg: DictConfig) -> None:
             log_dir,
             device=str(device),
             backend=str(cfg.training.sim_backend),
+            collector_env_spec=(
+                {
+                    "cfg_dict": OmegaConf.to_container(cfg, resolve=True),
+                    "env_override": env_override,
+                    "num_envs": int(cfg.algo.num_envs),
+                    "device": str(device),
+                    "sim_backend": str(cfg.training.sim_backend),
+                    "seed": int(cfg.algo.seed),
+                }
+                if bool(cfg.algo.get("proc_collect", False))
+                else None
+            ),
         )
         summary = learner.train(resume=checkpoint)
         print(json.dumps(summary, indent=2))

@@ -47,10 +47,18 @@ class ReplayBuffer:
         self.size = 0
 
     def add(self, transition: dict[str, torch.Tensor]) -> None:
+        self.add_staged(transition)
+        self.commit(1)
+
+    def add_staged(self, transition: dict[str, torch.Tensor]) -> None:
+        """Write a row without making it visible to samplers (see ``commit``)."""
         for key in self.fields:
             self.data[key][self.ptr] = transition[key]
         self.ptr = (self.ptr + 1) % self.T
-        self.size = min(self.size + 1, self.T)
+
+    def commit(self, n: int) -> None:
+        """Publish the ``n`` most recently staged rows to samplers."""
+        self.size = min(self.size + n, self.T)
 
     def _row(self, age: torch.Tensor) -> torch.Tensor:
         """Map age-ordered time indices (zero is oldest) to storage rows."""
