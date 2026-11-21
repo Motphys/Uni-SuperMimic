@@ -67,8 +67,8 @@ algo:
   compile: true
   compile_mode: default
   async_collect: false
-  proc_collect: false
-  three_way: false
+  proc_collect: true
+  three_way: true
   test_hidden_dims: null
 
 training:

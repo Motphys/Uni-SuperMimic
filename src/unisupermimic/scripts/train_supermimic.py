@@ -3,9 +3,53 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+
+
+def _early_mps_bootstrap() -> None:
+    """Provide the CUDA MPS environment before any import can initialize CUDA.
+
+    proc_collect/three_way need the learner process itself to be an MPS client;
+    injecting after torch/warp has initialized CUDA is too late. Skipped when the
+    caller passes an explicit sync intent (``three_way=false``) or already
+    exported MPS env.
+    """
+    if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
+        return
+    argv = " ".join(sys.argv)
+    if "three_way=false" in argv:
+        return
+    out = subprocess.run(
+        [sys.executable, "-m", "unilab.training.cuda_mps_cli", "env"],
+        capture_output=True,
+        text=True,
+    )
+    if "CUDA_MPS_PIPE_DIRECTORY" not in out.stdout:
+        proc = subprocess.run(
+            [sys.executable, "-m", "unilab.training.cuda_mps_cli", "start", "--daemon"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return
+        out = subprocess.run(
+            [sys.executable, "-m", "unilab.training.cuda_mps_cli", "env"],
+            capture_output=True,
+            text=True,
+        )
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("export ") and "=" in line:
+            key, _, value = line[len("export ") :].partition("=")
+            os.environ.setdefault(key, value)
+
+
+_early_mps_bootstrap()
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -27,6 +71,43 @@ from unilab.utils.device import get_default_device
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
 from unisupermimic.sim2sim import extract_contract_snapshot
 from unisupermimic.tasks.motion_tracking.g1.supermimic.motion import compact_motion_clip_count
+
+
+def ensure_mps_for_proc_collect(cfg: DictConfig) -> None:
+    """Auto-start CUDA MPS and inject its env when proc_collect/three_way is on.
+
+    Without MPS, the process-isolated collector contends with the learner
+    through coarse context time-slicing and proc/three_way can be *slower*
+    than sync. If the caller already exported MPS env, respect it.
+    """
+    algo = cfg.algo
+    if not (bool(algo.get("proc_collect", False)) or bool(algo.get("three_way", False))):
+        return
+    if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
+        return
+    out = subprocess.run(
+        [sys.executable, "-m", "unilab.training.cuda_mps_cli", "env"],
+        capture_output=True,
+        text=True,
+    )
+    if "CUDA_MPS_PIPE_DIRECTORY" not in out.stdout:
+        subprocess.run(
+            [sys.executable, "-m", "unilab.training.cuda_mps_cli", "start", "--daemon"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = subprocess.run(
+            [sys.executable, "-m", "unilab.training.cuda_mps_cli", "env"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("export ") and "=" in line:
+            key, _, value = line[len("export ") :].partition("=")
+            os.environ.setdefault(key, value)
 
 
 def build_learner_config(cfg: DictConfig) -> SuperMimicConfig:
@@ -127,6 +208,7 @@ def main(cfg: DictConfig) -> None:
             "(the critic goal window is sized by the command)"
         )
     seed_info = apply_configured_training_seed(cfg, torch_runtime=True, cuda=True)
+    ensure_mps_for_proc_collect(cfg)
     device = get_default_device()
     bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)
     if bound_device is not None:
