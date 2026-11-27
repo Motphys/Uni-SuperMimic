@@ -21,9 +21,9 @@ license-files = ["LICENSE", "NOTICE", "LICENSES/*"]
 authors = [{ name = "UniSuperMimic Authors" }]
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "unilab[mujoco,motrix]==1.6.0",
+    "unilab[mujoco,motrix]==1.6.4",
     "imageio[ffmpeg]>=2.37",
-    # Follows unilab 1.6.0rc1's MuJoCo 4.0.1 runtime line (mjwarp + mujoco
+    # Follows unilab 1.6.4's MuJoCo 4.0.1 runtime line (mjwarp + mujoco
     # extras); Newton/SuperDex backends stay on 3.11 but this repo uses neither.
     "mujoco~=4.0.1",
     "pillow>=10",

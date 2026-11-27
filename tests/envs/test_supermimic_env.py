@@ -152,7 +152,9 @@ def _assert_runtime_context(
         friction[:, robot_geoms, 0],
         np.broadcast_to(context[:, :1], (env.num_envs, len(robot_geoms))),
     )
-    expected_floor_friction = 0.3 if backend_name == "motrix" or not command.eval_mode else 1.0
+    # Ground friction is randomized on every backend (motrix included since
+    # unilab 1.6.0); the deterministic evaluation pins it to 1.0.
+    expected_floor_friction = 1.0 if command.eval_mode else 0.3
     np.testing.assert_allclose(
         friction[:, floor_geom, 0],
         np.full(env.num_envs, expected_floor_friction),

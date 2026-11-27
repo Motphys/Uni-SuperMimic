@@ -192,7 +192,7 @@ uv run unisupermimic-train \
   training.log_dir=runs/supermimic_motrix_001
 ```
 
-Use the same `task=g1_super_mimic/<backend>` override when resuming or evaluating a MuJoCo or Motrix run. Motrix uses fixed friction; center-of-mass and joint-offset domain randomization remain enabled. Use Hydra syntax for other configuration overrides. For a quick smoke run, override options such as `algo.num_envs`, `algo.iterations`, `algo.wm_hidden`, `algo.policy_hidden`, and `algo.compile=false`. See `src/unisupermimic/conf/supermimic/config.yaml` for the complete default configuration.
+Use the same `task=g1_super_mimic/<backend>` override when resuming or evaluating a MuJoCo or Motrix run. All three backends apply the same friction, center-of-mass, and joint-offset domain randomization. Use Hydra syntax for other configuration overrides. For a quick smoke run, override options such as `algo.num_envs`, `algo.iterations`, `algo.wm_hidden`, `algo.policy_hidden`, and `algo.compile=false`. See `src/unisupermimic/conf/supermimic/config.yaml` for the complete default configuration.
 
 The optimizer remains Adam by default. To use Muon for the hidden weight matrices of the policy and world model (with Adam retained for input/output layers, vectors, normalizers, and the critic), add:
 
