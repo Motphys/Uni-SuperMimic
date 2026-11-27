@@ -28,6 +28,7 @@ from .manager_terms import (
     make_current_info,
     make_transition_info,
 )
+from .mdp import step_path_compile_backend
 from .motion import CONTROL_DT
 from .robot import COLLISION_GEOM_NAMES
 
@@ -65,7 +66,11 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
         # path (current-info snapshots) stays eager: it runs inside the
         # reset-segment CUDA graph body.
         self._make_transition_info = (
-            torch.compile(make_transition_info) if commands[0].cfg.compile else make_transition_info
+            torch.compile(
+                make_transition_info, backend=step_path_compile_backend(torch.device(self.device))
+            )
+            if commands[0].cfg.compile
+            else make_transition_info
         )
 
     @property

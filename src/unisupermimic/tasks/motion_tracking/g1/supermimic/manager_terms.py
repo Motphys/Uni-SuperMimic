@@ -31,7 +31,7 @@ from unisupermimic.rl.algos.supermimic.geometry import (
 from unisupermimic.rl.contracts.supermimic import State
 
 from .kinematics import G1Kinematics
-from .mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_DIM, RewardCfg
+from .mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_DIM, RewardCfg, step_path_compile_backend
 from .motion import BIN_FRAMES, MotionLib
 from .robot import G1_JOINT_NAMES, action_scale
 
@@ -443,15 +443,10 @@ class SuperMimicCommand(CommandTerm):
         reset path stays eager so the reset-segment capture never meets an
         inductor recompile.
         """
-        for owner, names in (
-            (
-                self.mdp,
-                ("obs", "goal", "reward", "termination", "add_noise", "normalize_context"),
-            ),
-            (self, ("state",)),
-        ):
-            for name in names:
-                setattr(owner, name, torch.compile(getattr(owner, name)))
+        self.mdp.compile_step_path()
+        self.state = torch.compile(
+            self.state, backend=step_path_compile_backend(torch.device(self._device))
+        )
 
     @staticmethod
     def _validate_cfg(cfg: SuperMimicCommandCfg) -> None:
