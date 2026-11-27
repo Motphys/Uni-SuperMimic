@@ -7,11 +7,6 @@ training:
   task_name: G1SuperMimic
   sim_backend: motrix
 
-env:
-  events:
-    startup_context:
-      params:
-        randomize_friction: false
-    reset_context:
-      params:
-        randomize_friction: false
+# Since unilab 1.6.0 the motrix backend inherits the default friction DR
+# (randomize_friction) from the base task's startup/reset contexts, same as
+# the mjwarp backend; the old per-context `false` overrides were removed.

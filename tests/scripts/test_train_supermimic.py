@@ -38,7 +38,7 @@ def _compose(backend: str = "mjwarp") -> Any:
 def test_owner_materializes_complete_task(backend: str) -> None:
     cfg = _compose(backend)
     override = EnvConfigAdapter(
-        cfg, root_dir=Path.cwd(), algo_name="supermimic"
+        cfg, root_dir=Path.cwd()
     ).build_task_env_cfg_override()
     registry.ensure_registries()
     env_cfg = registry.materialize_env_config("G1SuperMimic")
@@ -57,8 +57,10 @@ def test_owner_materializes_complete_task(backend: str) -> None:
     assert env_cfg.commands["motion"].goal_frames == 10
     assert env_cfg.rewards["tracking"].weight == pytest.approx(1.0)
     for event_name in ("startup_context", "reset_context"):
+        # Since unilab 1.6.0 every backend (motrix included) inherits the
+        # default friction randomization from the base task.
         randomize_friction = env_cfg.events[event_name].params.get("randomize_friction", True)
-        assert randomize_friction is (backend != "motrix")
+        assert randomize_friction is True
 
 
 def test_backend_owners_have_identical_sim2sim_contracts() -> None:

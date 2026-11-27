@@ -78,14 +78,33 @@ class ReplayBuffer:
         self,
         B: int,
         hist: int,
+        exam_rows: int = 0,
+        exam_prob: float = 0.0,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Sample imagination starts and oldest-first, boundary-padded histories."""
+        """Sample imagination starts and oldest-first, boundary-padded histories.
+
+        With ``exam_rows`` > 0 and ``exam_prob`` > 0, each start is drawn from
+        the last ``exam_rows`` environment rows (the exam worlds) with
+        probability ``exam_prob`` and uniformly from the remaining practice
+        rows otherwise — BlinkMimic2's ``--start_prac_frac`` split, so policy
+        imagination concentrates on full-clip exam transitions.
+        """
         if self.size == 0:
             raise ValueError("cannot sample from an empty replay buffer")
         if hist < 1:
             raise ValueError(f"history length must be positive, got {hist}")
+        if exam_rows < 0 or exam_rows > self.N:
+            raise ValueError(f"exam_rows must be in [0, {self.N}], got {exam_rows}")
+        if not 0.0 <= exam_prob <= 1.0:
+            raise ValueError(f"exam_prob must be in [0, 1], got {exam_prob}")
         age = torch.randint(0, self.size, (B,), device=self.device)
-        env = torch.randint(0, self.N, (B,), device=self.device)
+        if 0 < exam_rows < self.N and exam_prob > 0.0:
+            practice = torch.randint(0, self.N - exam_rows, (B,), device=self.device)
+            exam = torch.randint(0, exam_rows, (B,), device=self.device) + (self.N - exam_rows)
+            pick_exam = torch.rand(B, device=self.device) < exam_prob
+            env = torch.where(pick_exam, exam, practice)
+        else:
+            env = torch.randint(0, self.N, (B,), device=self.device)
         row = self._row(age)
         ep_step = self.data["ep_step"][row, env].long()
         back = torch.arange(hist - 1, -1, -1, device=self.device)
