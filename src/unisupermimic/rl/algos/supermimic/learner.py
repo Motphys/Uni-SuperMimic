@@ -24,6 +24,7 @@ from unisupermimic.rl.contracts.supermimic import (
 from unisupermimic.rl.logging import SuperMimicLogger
 
 from . import networks
+from .cuda_graph import CapturedUpdate, cumprod_without_host_sync
 from .geometry import unflatten_state
 from .networks import Critic, Policy, WorldModel, mlp
 from .optim import MuonAdam
@@ -57,6 +58,13 @@ class SuperMimicConfig:
     critic_epochs: int = 5
     critic_minibatches: int = 4
     no_critic: bool = False
+    # How the ``critic_epochs x critic_minibatches`` loop of ``policy_update`` runs.
+    # ``eager`` steps every minibatch from Python (the original path). ``graph`` captures
+    # the whole loop (forward, backward, gradient clipping, Adam step) into one CUDA graph
+    # on the first use and replays it once per iteration; the math is the same eager ops on
+    # static buffers, with the permutations still drawn outside the graph. CUDA graphs
+    # only exist on NVIDIA CUDA, so other devices (CPU, MPS, ROCm) keep ``eager``.
+    critic_update: str = "eager"
     lr_decay_iters: int = 250_000
     fail_penalty: float = 0.0
     # BlinkMimic2-style exams, all off by default: ``exam_frac`` 0 disables the
@@ -92,6 +100,28 @@ class SuperMimicConfig:
     amp: str = "bf16"
     compile: bool = True
     test_hidden_dims: tuple[int, ...] | None = None
+    # Host launch-overhead reductions, all off by default (they need CUDA and change
+    # nothing about the update math):
+    # ``inductor_cpp_wrapper`` makes torch.compile emit its wrapper code in C++ instead
+    # of Python, so the Triton kernels of the compiled forward/backward are launched
+    # without going through the Python launcher (slow C++ compile on a cold cache).
+    # ``wm_graph`` / ``policy_graph`` replay the gradient step of ``wm_update`` / of
+    # the policy in ``policy_update`` (imagination rollout + objective + backward) from
+    # an explicit CUDA graph with persistent input buffers. Gradient clipping and the
+    # optimizer step stay eager. CUDA only.
+    inductor_cpp_wrapper: bool = False
+    wm_graph: bool = False
+    policy_graph: bool = False
+    # Collect-side logging statistics (sim_rew, ep_len, ep_ret_norm, term_frac,
+    # exam_survival) without the per-step host sync. Off keeps the synced path:
+    # one ``float(done.sum())`` per collect step (plus two more when an episode
+    # ends) stalls the host until the env pipeline has drained, and the
+    # per-iteration logging reads the lists back one scalar at a time. On, the
+    # statistics accumulate in float64 on the device and are read back once per
+    # ``log_every`` period; ``train_log.csv`` keeps its definitions, while the
+    # matching TensorBoard scalars get one point per log period instead of per
+    # iteration.
+    stats_on_device: bool = False
 
 
 _LOG_FIELDS = (
@@ -123,9 +153,39 @@ def _empty_stats() -> dict[str, list[torch.Tensor]]:
     return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": [], "exam_surv": []}
 
 
+# Slots of the device-side statistics vector (``cfg.stats_on_device``): running
+# float64 sums over the collect steps of the current log period.
+_DEV_STAT_FIELDS = (
+    "steps",  # collect steps
+    "r_sum",  # sum of mean(r) / max_step_reward
+    "done_sum",  # sum of sum(done)
+    "term_sum",  # sum of sum(term)
+    "ep_steps",  # steps with at least one episode end
+    "ep_len_sum",  # over those steps: sum of sum(ep_len) / done_count
+    "ep_ret_sum",  # over those steps: sum of sum(ep_ret_norm) / done_count
+    "exam_steps",  # collect steps taken while exam worlds were active
+    "exam_surv_sum",  # over those steps: sum of the exam survival share
+)
+
+
 def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
     for parameter in module.parameters():
         parameter.requires_grad_(enabled)
+
+
+@dataclass
+class _CriticGraph:
+    """One captured critic training loop and the static buffers it was captured on."""
+
+    key: tuple[tuple[int, ...], ...]
+    graph: "torch.cuda.CUDAGraph"
+    input: torch.Tensor
+    targets: torch.Tensor
+    permutations: torch.Tensor
+    loss: torch.Tensor
+    # Storages the capture is bound to (critic parameters and buffers, Adam state).
+    # A replay is only valid while every one of them is still the same tensor object.
+    tensors: list[torch.Tensor]
 
 
 class SuperMimicLearner:
@@ -145,6 +205,8 @@ class SuperMimicLearner:
             raise ValueError(f"pi_opt must be 'adam' or 'muon', got {cfg.pi_opt!r}")
         if cfg.wm_opt not in ("adam", "muon"):
             raise ValueError(f"wm_opt must be 'adam' or 'muon', got {cfg.wm_opt!r}")
+        if cfg.critic_update not in ("eager", "graph"):
+            raise ValueError(f"critic_update must be 'eager' or 'graph', got {cfg.critic_update!r}")
         if cfg.test_hidden_dims is not None and not cfg.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
         exam_rows = 0
@@ -214,6 +276,17 @@ class SuperMimicLearner:
         # the learner works on its own MDP copy and bridges tensors at the env
         # boundary. On CUDA/ROCm the devices always match and nothing changes.
         self._bridged = self.device != self.env_device
+        graphs = cfg.wm_graph or cfg.policy_graph
+        if (cfg.inductor_cpp_wrapper or graphs) and self.device.type != "cuda":
+            raise ValueError(
+                "SuperMimicConfig.inductor_cpp_wrapper / wm_graph / policy_graph require a "
+                f"CUDA device, got {self.device}"
+            )
+        if cfg.inductor_cpp_wrapper:
+            # Process-wide inductor switch; it has to be set before the first compile.
+            import torch._inductor.config as inductor_config
+
+            inductor_config.cpp_wrapper = True
         mdp = get_supermimic_mdp(env)
         self.mdp = mdp.to(self.device) if self._bridged else mdp
 
@@ -266,7 +339,29 @@ class SuperMimicLearner:
             self.opt_pi = torch.optim.Adam(
                 self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95), fused=fused_adam
             )
-        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
+        self._critic_params = list(self.critic.parameters())
+        self._critic_buffers = list(self.critic.buffers())
+        # CUDA graphs only exist on NVIDIA CUDA; anywhere else ``graph`` falls back to the
+        # eager loop, so the training semantics are the same on every device.
+        self._critic_graph_enabled = (
+            cfg.critic_update == "graph"
+            and not cfg.no_critic
+            and self.device.type == "cuda"
+            and getattr(torch.version, "hip", None) is None
+        )
+        self._critic_graph_state: _CriticGraph | None = None
+        if self._critic_graph_enabled:
+            # A captured graph freezes every Python float it reads, but ``train()`` re-binds
+            # a float lr on the param group each iteration (cosine decay). The capturable
+            # fused Adam takes the learning rate from a device tensor instead, which
+            # ``_sync_critic_lr`` refreshes between replays. It is the same fused kernel, so
+            # the updates stay bit-identical to the float-lr path.
+            self._v_lr = torch.tensor(cfg.lr, dtype=torch.float32, device=self.device)
+            self.opt_v = torch.optim.Adam(
+                self._critic_params, lr=self._v_lr, fused=True, capturable=True
+            )
+        else:
+            self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, fused=fused_adam)
         self._v_mean = torch.zeros((), device=self.device)
         self._v_std = torch.ones((), device=self.device)
         self._v_ema = 0.01
@@ -303,11 +398,24 @@ class SuperMimicLearner:
         self._exam_share = 0.0
         self._exam_fail_ema: float | None = None
         self.stats = _empty_stats()
+        # Device-side collect statistics (``cfg.stats_on_device``), see ``_accumulate_stats``.
+        self._dev_stats = None
+        self._dev_unit = None
+        if cfg.stats_on_device:
+            self._dev_stats = torch.zeros(
+                len(_DEV_STAT_FIELDS), dtype=torch.float64, device=self.device
+            )
+            # Scalar constants (one, zero) for the per-step row, without a host->device copy.
+            self._dev_unit = torch.tensor([1.0, 0.0], dtype=torch.float64, device=self.device)
         self._wm_rollout_fn = self._compile(self._wm_rollout)
         self._wm_err_fn = self._compile(self._wm_err)
         self._imag_step_fn = self._compile(self._imag_step)
         self._reward_term_fn = self._compile(self._reward_term)
         self._critic_input_fn = self._compile(self._critic_input)
+        # Explicit CUDA graphs over the gradient steps (off by default). The policy
+        # graph clones the outputs the training loop keeps past the next replay.
+        self._wm_graph = CapturedUpdate() if cfg.wm_graph else None
+        self._pi_graph = CapturedUpdate(clone_outputs=(0, 4, 7)) if cfg.policy_graph else None
 
         with (self.log_dir / "args.json").open("w", encoding="utf-8") as stream:
             json.dump(asdict(cfg), stream, indent=2)
@@ -540,6 +648,12 @@ class SuperMimicLearner:
             else:
                 self.wm.inc_norm.update(target)
             self.sim_steps += self.env.num_envs
+            if self.cfg.stats_on_device:
+                # The same statistics as the appends below, accumulated on the device:
+                # no ``float()`` and no host branch, so the host runs on without
+                # waiting for the env pipeline to drain.
+                self._accumulate_stats(transition)
+                continue
             self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
             if self._exam_rows:
                 # Per-step survival of the exam worlds: the share whose danger
@@ -567,12 +681,21 @@ class SuperMimicLearner:
                 self.stats["term"].append(term.float().sum())
                 self.stats["done"].append(done.float().sum())
 
-    def wm_update(self) -> tuple[torch.Tensor, torch.Tensor]:
-        window = self.buffer.sample_windows(self.cfg.wm_batch, self.cfg.wm_window)
+    def _wm_loss_grads(self, window: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward, loss and backward of one window (eager and graph-replayed alike)."""
         predicted = self._wm_rollout_fn(window["s"], window["a"], window["xi"])
         loss, last_error = self._wm_err_fn(predicted, window["s1"], window["mask"])
         self.opt_wm.zero_grad(set_to_none=True)
         loss.backward()
+        return loss, last_error
+
+    def wm_update(self) -> tuple[torch.Tensor, torch.Tensor]:
+        window = self.buffer.sample_windows(self.cfg.wm_batch, self.cfg.wm_window)
+        graph = self._wm_graph
+        if graph is None:
+            loss, last_error = self._wm_loss_grads(window)
+        else:
+            loss, last_error = graph.step(self._wm_loss_grads, window)
         nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
         self.opt_wm.step()
         mask = window["mask"][:, -1]
@@ -653,13 +776,26 @@ class SuperMimicLearner:
 
         return concatenate(starts), concatenate(histories)
 
-    def policy_update(
+    def _pi_loss_grads(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        start, history = self._sample_valid_starts(self.cfg.pi_batch)
+        start: dict[str, torch.Tensor],
+        history: dict[str, torch.Tensor],
+        normalized_context: torch.Tensor,
+        v_mean: torch.Tensor,
+        v_std: torch.Tensor,
+        set_to_none: bool,
+        capturable: bool,
+    ) -> tuple[Any, ...]:
+        """Imagination rollout, policy objective and its backward.
+
+        Shared by the eager path and the ``policy_graph`` replay, so the captured
+        computation is the eager one by construction. ``v_mean`` / ``v_std`` are
+        arguments because the graph has to read them from persistent buffers, and
+        ``capturable`` swaps the survival cumprod for the variant whose backward can be
+        captured (ATen's synchronizes with the host).
+        """
         state = unflatten_state(start["s"])
         context, frames, previous_action = start["xi"], start["f"], start["a_prev"]
-        normalized_context = self.mdp.normalize_context(context)
         with torch.no_grad():
             obs_hist = self.mdp.obs(
                 unflatten_state(history["s"]),
@@ -668,66 +804,139 @@ class SuperMimicLearner:
                 history["f"],
             )
         obs_hist = self.mdp.add_noise(obs_hist)
-        _set_requires_grad(self.wm, False)
-        _set_requires_grad(self.critic, False)
 
         batch_size = self.cfg.pi_batch
         goal = self.mdp.goal(state, frames, self.cfg.goal_frames)
         initial_state = state
         states, actions, previous_actions, all_frames = [], [], [], []
+        for _ in range(self.cfg.horizon):
+            previous_actions.append(previous_action)
+            state, previous_action, obs_hist, frames, goal = self._imag_step_fn(
+                state,
+                obs_hist,
+                previous_action,
+                frames,
+                context,
+                normalized_context,
+                goal,
+            )
+            states.append(state)
+            actions.append(previous_action)
+            all_frames.append(frames)
+
+        def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
+            return torch.stack(parts).flatten(0, 1)
+
+        all_states = cast(
+            State, tuple(flatten([item[index] for item in states]) for index in range(6))
+        )
+        flat_frames = flatten(all_frames)
+        rewards, dones = self._batched_reward_term(
+            all_states, flat_frames, flatten(actions), flatten(previous_actions)
+        )
+        rewards = rewards.view(self.cfg.horizon, batch_size)
+        dones = dones.view(self.cfg.horizon, batch_size)
+        alive = cumprod_without_host_sync(1 - dones) if capturable else torch.cumprod(1 - dones, 0)
+        continuation = torch.cat((torch.ones(1, batch_size, device=self.device), alive[:-1]), 0)
+        discount = self.cfg.gamma ** torch.arange(
+            self.cfg.horizon, device=self.device, dtype=torch.float32
+        ).unsqueeze(-1)
+        # BlinkMimic2-style actor-only failure penalty: the imagined reward
+        # used by the policy objective is shaped by the soft-termination
+        # probability, while the critic below keeps learning the plain
+        # tracking reward (``detached_rewards``).
+        if self.cfg.fail_penalty:
+            actor_rewards = rewards - self.cfg.fail_penalty * dones
+        else:
+            actor_rewards = rewards
+        objective = (discount * continuation * actor_rewards).sum(0)
+        survival = alive[-1]
+        reward_sum = (continuation * rewards).detach().sum(0)
+        detached_rewards, detached_dones = rewards.detach(), dones.detach()
+        if not self.cfg.no_critic:
+            bootstrap = self.critic(self._critic_input_fn(state, frames, normalized_context))
+            objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
+                bootstrap * v_std + v_mean
+            )
+        loss = -objective.mean()
+        self.opt_pi.zero_grad(set_to_none=set_to_none)
+        loss.backward()
+        return (
+            loss,
+            initial_state,
+            states,
+            all_frames,
+            reward_sum,
+            detached_rewards,
+            detached_dones,
+            survival,
+        )
+
+    def _pi_graph_body(self, inputs: dict[str, Any]) -> tuple[Any, ...]:
+        # ``set_to_none=False`` keeps every gradient at the address the captured graph
+        # writes to; the eager clip and optimizer step outside the graph read it.
+        return self._pi_loss_grads(
+            inputs["start"],
+            inputs["history"],
+            inputs["normalized_context"],
+            inputs["v_mean"],
+            inputs["v_std"],
+            set_to_none=False,
+            capturable=True,
+        )
+
+    def policy_update(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        start, history = self._sample_valid_starts(self.cfg.pi_batch)
+        normalized_context = self.mdp.normalize_context(start["xi"])
+        batch_size = self.cfg.pi_batch
+        _set_requires_grad(self.wm, False)
+        _set_requires_grad(self.critic, False)
+        graph = self._pi_graph
         try:
-            for _ in range(self.cfg.horizon):
-                previous_actions.append(previous_action)
-                state, previous_action, obs_hist, frames, goal = self._imag_step_fn(
-                    state,
-                    obs_hist,
-                    previous_action,
-                    frames,
-                    context,
+            if graph is None:
+                (
+                    loss,
+                    initial_state,
+                    states,
+                    all_frames,
+                    reward_sum,
+                    detached_rewards,
+                    detached_dones,
+                    survival,
+                ) = self._pi_loss_grads(
+                    start,
+                    history,
                     normalized_context,
-                    goal,
+                    self._v_mean,
+                    self._v_std,
+                    set_to_none=True,
+                    capturable=False,
                 )
-                states.append(state)
-                actions.append(previous_action)
-                all_frames.append(frames)
-
-            def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
-                return torch.stack(parts).flatten(0, 1)
-
-            all_states = cast(
-                State, tuple(flatten([item[index] for item in states]) for index in range(6))
-            )
-            flat_frames = flatten(all_frames)
-            rewards, dones = self._batched_reward_term(
-                all_states, flat_frames, flatten(actions), flatten(previous_actions)
-            )
-            rewards = rewards.view(self.cfg.horizon, batch_size)
-            dones = dones.view(self.cfg.horizon, batch_size)
-            alive = torch.cumprod(1 - dones, 0)
-            continuation = torch.cat((torch.ones(1, batch_size, device=self.device), alive[:-1]), 0)
-            discount = self.cfg.gamma ** torch.arange(
-                self.cfg.horizon, device=self.device, dtype=torch.float32
-            ).unsqueeze(-1)
-            # BlinkMimic2-style actor-only failure penalty: the imagined reward
-            # used by the policy objective is shaped by the soft-termination
-            # probability, while the critic below keeps learning the plain
-            # tracking reward (``detached_rewards``).
-            if self.cfg.fail_penalty:
-                actor_rewards = rewards - self.cfg.fail_penalty * dones
             else:
-                actor_rewards = rewards
-            objective = (discount * continuation * actor_rewards).sum(0)
-            survival = alive[-1]
-            reward_sum = (continuation * rewards).detach().sum(0)
-            detached_rewards, detached_dones = rewards.detach(), dones.detach()
-            if not self.cfg.no_critic:
-                bootstrap = self.critic(self._critic_input_fn(state, frames, normalized_context))
-                objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * (
-                    bootstrap * self._v_std + self._v_mean
+                # ``_v_mean`` / ``_v_std`` are rebound every iteration by the critic
+                # targets below; copying them into the graph's input buffers is what
+                # keeps the replayed objective reading the current values.
+                (
+                    loss,
+                    initial_state,
+                    states,
+                    all_frames,
+                    reward_sum,
+                    detached_rewards,
+                    detached_dones,
+                    survival,
+                ) = graph.step(
+                    self._pi_graph_body,
+                    {
+                        "start": start,
+                        "history": history,
+                        "normalized_context": normalized_context,
+                        "v_mean": self._v_mean,
+                        "v_std": self._v_std,
+                    },
                 )
-            loss = -objective.mean()
-            self.opt_pi.zero_grad(set_to_none=True)
-            loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
             nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
             if self.cfg.no_sync:
@@ -804,17 +1013,20 @@ class SuperMimicLearner:
             minibatch_size = num_samples // self.cfg.critic_minibatches
             if minibatch_size == 0:
                 raise ValueError("critic_minibatches exceeds the number of imagined transitions")
-            for _ in range(self.cfg.critic_epochs):
-                permutation = torch.randperm(num_samples, device=self.device)
-                for index in range(self.cfg.critic_minibatches):
-                    indices = permutation[index * minibatch_size : (index + 1) * minibatch_size]
-                    value_loss = (
-                        (self.critic(flat_input[indices]) - flat_targets[indices]) ** 2
-                    ).mean()
-                    self.opt_v.zero_grad(set_to_none=True)
-                    value_loss.backward()
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.opt_v.step()
+            if self._critic_graph_enabled:
+                value_loss = self._critic_train_graph(flat_input, flat_targets, num_samples)
+            else:
+                for _ in range(self.cfg.critic_epochs):
+                    permutation = torch.randperm(num_samples, device=self.device)
+                    for index in range(self.cfg.critic_minibatches):
+                        indices = permutation[index * minibatch_size : (index + 1) * minibatch_size]
+                        value_loss = (
+                            (self.critic(flat_input[indices]) - flat_targets[indices]) ** 2
+                        ).mean()
+                        self.opt_v.zero_grad(set_to_none=True)
+                        value_loss.backward()
+                        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                        self.opt_v.step()
 
         imagined_reward = (reward_sum / self.cfg.horizon / self.mdp.max_step_reward).mean()
         return (
@@ -824,6 +1036,166 @@ class SuperMimicLearner:
             grad_norm.detach(),
             survival.mean().detach(),
         )
+
+    def _sync_critic_lr(self) -> None:
+        """Push the param group's learning rate into the device tensor the graph reads.
+
+        ``train()`` re-binds a Python float on the group every iteration (cosine decay) and a
+        resume re-binds the checkpoint's value, so the tensor is refreshed from the group
+        whenever the two went apart, and becomes the group's lr again.
+        """
+        group = self.opt_v.param_groups[0]
+        if group["lr"] is not self._v_lr:
+            if isinstance(group["lr"], torch.Tensor):
+                self._v_lr.copy_(group["lr"])
+            else:
+                self._v_lr.fill_(group["lr"])
+            group["lr"] = self._v_lr
+
+    def _critic_graph_tensors(self) -> list[torch.Tensor]:
+        """Return the storages a captured critic graph is bound to."""
+        tensors = self._critic_params + self._critic_buffers
+        for parameter in self._critic_params:
+            state = self.opt_v.state.get(parameter)
+            if state:
+                tensors.extend(state.values())
+        return tensors
+
+    def _critic_train_captured(
+        self, flat_input: torch.Tensor, flat_targets: torch.Tensor, permutations: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the minibatch loop on static buffers; this is what the CUDA graph records.
+
+        It mirrors the eager loop step by step, with two substitutions that leave the math
+        bit-identical:
+
+        * ``zero_grad(set_to_none=True)`` becomes an in-place zeroing: a captured graph
+          cannot drop and re-allocate its gradients, so they are persistent buffers that
+          backward accumulates into exactly as it would into fresh ones.
+        * The input normalizer is frozen for the whole loop, and autocast casts the same
+          minibatch to the same dtype in every epoch. The eager loop re-normalizes and
+          re-casts each sample once per epoch; here every sample is normalized (and cast)
+          once per iteration, right after the gather. Both are elementwise per sample, so
+          every minibatch sees exactly the values ``self.critic`` would produce, with a
+          fraction of the memory traffic (the loop is bandwidth-bound on its [16384, 834]
+          input).
+        """
+        minibatch_size = flat_input.shape[0] // self.cfg.critic_minibatches
+        normalized = self.critic.norm(flat_input)
+        if networks.AMP_DTYPE is not None:
+            normalized = normalized.to(networks.AMP_DTYPE)
+        value_loss = torch.zeros((), device=self.device)
+        for permutation in permutations:
+            for index in range(self.cfg.critic_minibatches):
+                indices = permutation[index * minibatch_size : (index + 1) * minibatch_size]
+                prediction = networks.run_mlp(self.critic.net, normalized[indices]).squeeze(-1)
+                value_loss = ((prediction - flat_targets[indices]) ** 2).mean()
+                for parameter in self._critic_params:
+                    parameter.grad.zero_()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(self._critic_params, 1.0)
+                self.opt_v.step()
+        return value_loss.detach()
+
+    def _capture_critic_graph(
+        self, flat_input: torch.Tensor, flat_targets: torch.Tensor, permutations: torch.Tensor
+    ) -> _CriticGraph:
+        """Warm up on a side stream, then capture the whole loop into one CUDA graph.
+
+        Warm-up steps execute for real (they create cuBLAS workspaces and the lazily
+        allocated Adam state), so the critic parameters, its normalizer buffers, and the
+        optimizer state are snapshotted first and restored in place afterwards; state the
+        warm-up created is reset to the zeros a fresh Adam starts from. Nothing here touches
+        the RNG.
+        """
+        params, buffers = self._critic_params, self._critic_buffers
+        for parameter in params:
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+        live = params + buffers
+        saved = [tensor.detach().clone() for tensor in live]
+        saved_state = [
+            {name: value.detach().clone() for name, value in self.opt_v.state.get(p, {}).items()}
+            for p in params
+        ]
+        state = _CriticGraph(
+            key=(
+                tuple(flat_input.shape),
+                tuple(flat_targets.shape),
+                tuple(permutations.shape),
+            ),
+            graph=torch.cuda.CUDAGraph(),
+            input=flat_input.clone(),
+            targets=flat_targets.clone(),
+            permutations=permutations.clone(),
+            loss=torch.zeros((), device=self.device),
+            tensors=[],
+        )
+        try:
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    state.loss = self._critic_train_captured(
+                        state.input, state.targets, state.permutations
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            with torch.cuda.graph(state.graph):
+                state.loss = self._critic_train_captured(
+                    state.input, state.targets, state.permutations
+                )
+        finally:
+            with torch.no_grad():
+                for tensor, snapshot in zip(live, saved, strict=True):
+                    tensor.copy_(snapshot)
+                for parameter, snapshot in zip(params, saved_state, strict=True):
+                    for name, value in self.opt_v.state.get(parameter, {}).items():
+                        if name in snapshot:
+                            value.copy_(snapshot[name])
+                        else:
+                            value.zero_()
+        state.tensors = self._critic_graph_tensors()
+        return state
+
+    def _critic_train_graph(
+        self,
+        flat_input: torch.Tensor,
+        flat_targets: torch.Tensor,
+        num_samples: int,
+    ) -> torch.Tensor:
+        """Draw the permutations like the eager loop and replay the captured update."""
+        # Same calls with the same shapes as the eager loop, so the global generator is
+        # consumed identically and a seeded run sees the same minibatches. The captured
+        # graph itself draws no random numbers.
+        permutations = torch.stack(
+            [torch.randperm(num_samples, device=self.device) for _ in range(self.cfg.critic_epochs)]
+        )
+        key = (
+            tuple(flat_input.shape),
+            tuple(flat_targets.shape),
+            tuple(permutations.shape),
+        )
+        # Before any capture: the graph must record the fused Adam reading the lr tensor, so
+        # the tensor has to be the group's lr by then (a float on the group would be baked in).
+        self._sync_critic_lr()
+        tensors = self._critic_graph_tensors()
+        state = self._critic_graph_state
+        if (
+            state is None
+            or state.key != key
+            or len(tensors) != len(state.tensors)
+            or any(a is not b for a, b in zip(tensors, state.tensors))
+        ):
+            state = self._critic_graph_state = self._capture_critic_graph(
+                flat_input, flat_targets, permutations
+            )
+        state.input.copy_(flat_input)
+        state.targets.copy_(flat_targets)
+        state.permutations.copy_(permutations)
+        state.graph.replay()
+        # Every replay rewrites this buffer, while ``train()`` keeps the loss until the next
+        # log point: hand out a private copy.
+        return state.loss.clone()
 
     def lr_at(self, iteration: int) -> float:
         if iteration >= self.cfg.lr_decay_iters:
@@ -900,11 +1272,88 @@ class SuperMimicLearner:
     def _mean(values: list[torch.Tensor]) -> float:
         return float(sum(float(value) for value in values) / max(len(values), 1))
 
+    def _accumulate_stats(self, transition: dict[str, torch.Tensor]) -> None:
+        """Add one collect step's logging statistics to the device-side sums.
+
+        Device-side counterpart of the ``self.stats`` appends in ``collect``: every
+        per-step value is still an fp32 reduction (as the synced path computes it)
+        that only then turns into float64, and the accumulator is updated on the
+        current stream right after the step, so stream order pairs each value with
+        its step. A step without an episode end contributes zero to ``ep_len`` and
+        ``ep_ret_norm`` through ``torch.where`` instead of a host branch.
+        """
+        if self._dev_stats is None or self._dev_unit is None:
+            raise RuntimeError("device-side statistics require cfg.stats_on_device")
+        float64 = torch.float64
+        one, zero = self._dev_unit[0], self._dev_unit[1]
+        row = [one, (transition["r"].mean() / self.mdp.max_step_reward).to(float64)]
+        row += [zero] * 5
+        if self._exam_rows:
+            # Per-step survival of the exam worlds: the share whose danger
+            # probability stays under the termination band. These episodes
+            # never hard-terminate, so this is the observable for whether
+            # the exams are improving.
+            rows = slice(self.env.num_envs - self._exam_rows, None)
+            danger = self.mdp.soft_termination(
+                unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
+            )
+            row += [one, (danger < 0.5).float().mean().to(float64)]
+        else:
+            row += [zero, zero]
+        if "ep_len" in transition:
+            # Episode statistics are full-width and masked (non-done rows
+            # carry zero), so aggregate with the done count. Exam episodes
+            # stay out of them: their only end is the clip end.
+            done = transition["done"]
+            term = transition["term"]
+            if self._exam_rows:
+                done = done[: self.env.num_envs - self._exam_rows]
+                term = term[: self.env.num_envs - self._exam_rows]
+            done_count = done.float().sum()
+            ended = done_count > 0.0
+            divisor = torch.where(ended, done_count.to(float64), one)
+            # ``ep_len`` / ``ep_ret_norm`` are full-width and summed uncut (as in the
+            # synced path), so a step with no counted end must drop out entirely.
+            row[2:7] = [
+                done_count.to(float64),
+                term.float().sum().to(float64),
+                ended.to(float64),
+                torch.where(ended, transition["ep_len"].sum().to(float64) / divisor, zero),
+                torch.where(ended, transition["ep_ret_norm"].sum().to(float64) / divisor, zero),
+            ]
+        self._dev_stats.add_(torch.stack(row))
+
+    def _read_dev_stats(self) -> dict[str, float]:
+        """Read the period's collect statistics back once and reset the sums.
+
+        The single host read of the device-side statistics (one small D2H copy per
+        log period). The results follow the ``train_log.csv`` definitions: means
+        over the steps of the period (unweighted for the per-step episode means;
+        0.0 when no step qualified), and the terminated share of all episode ends.
+        ``exam_survival`` is present only when exam worlds collected in the period.
+        """
+        if self._dev_stats is None:
+            raise RuntimeError("device-side statistics require cfg.stats_on_device")
+        sums = dict(zip(_DEV_STAT_FIELDS, self._dev_stats.tolist(), strict=True))
+        self._dev_stats.zero_()
+        stats = {
+            "sim_rew": sums["r_sum"] / max(sums["steps"], 1),
+            "ep_len": sums["ep_len_sum"] / max(sums["ep_steps"], 1),
+            "ep_ret_norm": sums["ep_ret_sum"] / max(sums["ep_steps"], 1),
+            "term_frac": sums["term_sum"] / max(sums["done_sum"], 1),
+        }
+        if sums["exam_steps"] > 0:
+            stats["exam_survival"] = sums["exam_surv_sum"] / max(sums["exam_steps"], 1)
+        return stats
+
     def train(self, resume: str | Path | None = None) -> dict[str, float | int | bool]:
         if resume is not None:
             self.load(resume)
         start_iteration = self.iteration
         self.stats = _empty_stats()
+        if self._dev_stats is not None:
+            # Device-side statistics start a fresh period as well (resume included).
+            self._dev_stats.zero_()
         logger = SuperMimicLogger(
             env_name=type(self.env).__name__,
             backend=self.backend,
@@ -935,6 +1384,14 @@ class SuperMimicLearner:
                     key: [] for key in ("wm", "wm8", "pi", "v", "ir", "gn", "surv")
                 }
                 last_metrics: dict[str, float | int] = {}
+                # Collect statistics handed to the logger; ``period`` is the closing
+                # log period's row when this iteration writes one (device-side path).
+                period: dict[str, float] | None
+                mean_reward: float | None
+                ep_len: float | None
+                ep_ret_norm: float | None
+                term_frac: float | None
+                exam_survival: float | None
                 for iteration in range(start_iteration, self.cfg.iterations):
                     if self.cfg.compile and iteration == start_iteration:
                         logger.log_status("Compiling world model (one-off, slow on first run)")
@@ -1003,19 +1460,39 @@ class SuperMimicLearner:
                     self.wall_time = time.time() - train_start
                     iteration_time = time.time() - iteration_start
 
-                    iter_rewards = self.stats["r"][stats_mark:]
-                    mean_reward = self._mean(iter_rewards) if iter_rewards else None
-                    ep_len = self._mean(self.stats["ep_len"]) if self.stats["ep_len"] else None
-                    ep_ret_norm = self._mean(self.stats["ep_ret"]) if self.stats["ep_ret"] else None
-                    total_done = sum(float(value) for value in self.stats["done"])
-                    term_frac = (
-                        sum(float(value) for value in self.stats["term"]) / total_done
-                        if total_done > 0
-                        else None
-                    )
-                    exam_survival = (
-                        self._mean(self.stats["exam_surv"]) if self.stats["exam_surv"] else None
-                    )
+                    period = None
+                    if self.cfg.stats_on_device:
+                        # Nothing is read per iteration: the collect statistics are
+                        # read back once, here, when the log period closes, and the
+                        # collect tags are logged at that iteration with the period's
+                        # value (one point per log period instead of per iteration).
+                        if self.iteration % self.cfg.log_every == 0:
+                            period = self._read_dev_stats()
+                        if period is None:
+                            mean_reward = ep_len = ep_ret_norm = None
+                            term_frac = exam_survival = None
+                        else:
+                            mean_reward = period["sim_rew"]
+                            ep_len = period["ep_len"]
+                            ep_ret_norm = period["ep_ret_norm"]
+                            term_frac = period["term_frac"]
+                            exam_survival = period.get("exam_survival")
+                    else:
+                        iter_rewards = self.stats["r"][stats_mark:]
+                        mean_reward = self._mean(iter_rewards) if iter_rewards else None
+                        ep_len = self._mean(self.stats["ep_len"]) if self.stats["ep_len"] else None
+                        ep_ret_norm = (
+                            self._mean(self.stats["ep_ret"]) if self.stats["ep_ret"] else None
+                        )
+                        total_done = sum(float(value) for value in self.stats["done"])
+                        term_frac = (
+                            sum(float(value) for value in self.stats["term"]) / total_done
+                            if total_done > 0
+                            else None
+                        )
+                        exam_survival = (
+                            self._mean(self.stats["exam_surv"]) if self.stats["exam_surv"] else None
+                        )
                     logger.log_step(
                         self.iteration,
                         wm_loss=float(wm_loss),
@@ -1041,10 +1518,24 @@ class SuperMimicLearner:
                     if self.iteration % self.cfg.log_every == 0:
                         iterations_per_second = self.cfg.log_every / (time.time() - log_start)
                         log_start = time.time()
-                        term_frac = float(
-                            sum(float(value) for value in self.stats["term"])
-                            / max(sum(float(value) for value in self.stats["done"]), 1)
-                        )
+                        if period is not None:
+                            # Device-side statistics: already read back once for this row.
+                            collect_row = (
+                                period["sim_rew"],
+                                period["ep_len"],
+                                period["ep_ret_norm"],
+                                period["term_frac"],
+                            )
+                        else:
+                            collect_row = (
+                                self._mean(self.stats["r"]),
+                                self._mean(self.stats["ep_len"]),
+                                self._mean(self.stats["ep_ret"]),
+                                float(
+                                    sum(float(value) for value in self.stats["term"])
+                                    / max(sum(float(value) for value in self.stats["done"]), 1)
+                                ),
+                            )
                         row = [
                             self.iteration,
                             self.wall_time / 3600,
@@ -1056,10 +1547,7 @@ class SuperMimicLearner:
                             self._mean(aggregate["ir"]),
                             self._mean(aggregate["gn"]),
                             self._mean(aggregate["surv"]),
-                            self._mean(self.stats["r"]),
-                            self._mean(self.stats["ep_len"]),
-                            self._mean(self.stats["ep_ret"]),
-                            term_frac,
+                            *collect_row,
                             iterations_per_second,
                             learning_rate,
                         ]
