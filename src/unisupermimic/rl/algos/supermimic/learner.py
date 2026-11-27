@@ -1447,13 +1447,15 @@ class SuperMimicLearner:
                     train_phase_start = time.time()
                     wm_loss = torch.zeros((), device=self.device)
                     wm_error = torch.zeros((), device=self.device)
+                    # The finite verdicts stay on the device: reading each batch's metrics
+                    # here would drain the GPU queue after every batch and leave the GPU
+                    # waiting for the host. The first host read is the fail-fast check after
+                    # the policy update, which syncs anyway. A non-finite batch cannot be
+                    # masked by a later finite one, because the flags are only ever cleared.
+                    wm_finite = torch.ones(2, dtype=torch.bool, device=self.device)
                     for _ in range(self.cfg.wm_batches):
                         wm_loss, wm_error = self.wm_update()
-                        for name, metric in (("wm_loss", wm_loss), ("wm_err8", wm_error)):
-                            if not torch.isfinite(metric).all():
-                                raise FloatingPointError(
-                                    f"non-finite {name} at iteration {iteration + 1}"
-                                )
+                        wm_finite &= torch.isfinite(torch.stack((wm_loss, wm_error)))
                     aggregate["wm"].append(wm_loss)
                     aggregate["wm8"].append(wm_error)
                     pi_loss: float | None = None
@@ -1468,6 +1470,13 @@ class SuperMimicLearner:
                     # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
                     # handles a non-finite gradient by zeroing it and stepping, so a non-finite
                     # gradient is not a divergence signal on its own.
+                    for name, finite in zip(
+                        ("wm_loss", "wm_err8"), wm_finite.tolist(), strict=True
+                    ):
+                        if not finite:
+                            raise FloatingPointError(
+                                f"non-finite {name} at iteration {iteration + 1}"
+                            )
                     for name, metric in (
                         ("pi_loss", policy_loss),
                         ("v_loss", value_loss),
