@@ -35,6 +35,12 @@ algo:
   critic_epochs: 5
   critic_minibatches: 4
   no_critic: false
+  # Critic minibatch loop of policy_update: eager (Python steps every minibatch, the
+  # original path), graph (the whole loop captured into one CUDA graph and replayed
+  # once per iteration; same eager ops on static buffers, permutations drawn outside the
+  # graph, learning rate read from a device tensor; requires NVIDIA CUDA), or auto
+  # (the default: graph on NVIDIA CUDA, eager anywhere else).
+  critic_update: auto
   lr_decay_iters: 12000
   # BlinkMimic2-style actor-only imagined failure penalty (0 disables; 3.0 is
   # the BlinkMimic2 value). The critic keeps learning the plain reward.
@@ -62,9 +68,27 @@ algo:
   ckpt_every: 2000
   log_every: 50
   log_backend: tensorboard
+  # Collect statistics (sim_rew / ep_len / ep_ret_norm / term_frac) on the device:
+  # no per-step host sync in collect, read back once per log_every period. The CSV
+  # keeps its definitions; those TensorBoard scalars become one point per period.
+  # Tri-state like the switches below (null = on for NVIDIA CUDA, off elsewhere);
+  # true forces it on, false keeps the synced path.
+  stats_on_device: null
   amp: bf16
   compile: true
   test_hidden_dims: null
+  # Host launch-overhead reductions. wm_graph / policy_graph replay the gradient step of
+  # wm_update / of the policy in policy_update (imagination rollout + objective +
+  # backward) from an explicit CUDA graph with persistent input buffers; clipping and the
+  # optimizer step stay eager and the math is unchanged. Tri-state: null (the default)
+  # enables them on NVIDIA CUDA and keeps them off anywhere else, true requires NVIDIA
+  # CUDA, false forces the original path.
+  wm_graph: null
+  policy_graph: null
+  # C++ inductor wrapper: launches the compiled Triton kernels without the Python
+  # launcher. Opt-in, because it costs a slow C++ compile on every cold cache and gains
+  # little once the graphs above are on.
+  inductor_cpp_wrapper: false
 
 training:
   task_name: G1SuperMimic
