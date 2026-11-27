@@ -62,9 +62,10 @@ class SuperMimicConfig:
     # ``eager`` steps every minibatch from Python (the original path). ``graph`` captures
     # the whole loop (forward, backward, gradient clipping, Adam step) into one CUDA graph
     # on the first use and replays it once per iteration; the math is the same eager ops on
-    # static buffers, with the permutations still drawn outside the graph. CUDA graphs
-    # only exist on NVIDIA CUDA, so other devices (CPU, MPS, ROCm) keep ``eager``.
-    critic_update: str = "eager"
+    # static buffers, with the permutations still drawn outside the graph. ``auto`` (the
+    # default) picks ``graph`` on NVIDIA CUDA and ``eager`` anywhere else (CPU, MPS,
+    # ROCm), where CUDA graphs are not available.
+    critic_update: str = "auto"
     lr_decay_iters: int = 250_000
     fail_penalty: float = 0.0
     # BlinkMimic2-style exams, all off by default: ``exam_frac`` 0 disables the
@@ -100,28 +101,30 @@ class SuperMimicConfig:
     amp: str = "bf16"
     compile: bool = True
     test_hidden_dims: tuple[int, ...] | None = None
-    # Host launch-overhead reductions, all off by default (they need CUDA and change
-    # nothing about the update math):
-    # ``inductor_cpp_wrapper`` makes torch.compile emit its wrapper code in C++ instead
-    # of Python, so the Triton kernels of the compiled forward/backward are launched
-    # without going through the Python launcher (slow C++ compile on a cold cache).
+    # Host launch-overhead reductions. None of them changes the update math. The
+    # tri-state switches read ``None`` (the default) as "on for NVIDIA CUDA, off
+    # anywhere else"; ``True`` requires NVIDIA CUDA and ``False`` forces the original
+    # path. The training loop is launch-bound on fast GPUs, so by default the host
+    # work is moved out of the way wherever the device supports it.
     # ``wm_graph`` / ``policy_graph`` replay the gradient step of ``wm_update`` / of
     # the policy in ``policy_update`` (imagination rollout + objective + backward) from
     # an explicit CUDA graph with persistent input buffers. Gradient clipping and the
-    # optimizer step stay eager. CUDA only.
+    # optimizer step stay eager.
+    wm_graph: bool | None = None
+    policy_graph: bool | None = None
+    # ``stats_on_device`` keeps the collect-side logging statistics (sim_rew, ep_len,
+    # ep_ret_norm, term_frac, exam_survival) on the device: the synced path's one
+    # ``float(done.sum())`` per collect step (plus two more when an episode ends)
+    # stalls the host until the env pipeline has drained. On, the statistics accumulate
+    # in float64 on the device and are read back once per ``log_every`` period;
+    # ``train_log.csv`` keeps its definitions, while the matching TensorBoard scalars
+    # get one point per log period instead of per iteration.
+    stats_on_device: bool | None = None
+    # ``inductor_cpp_wrapper`` makes torch.compile emit its wrapper code in C++ instead
+    # of Python, so the Triton kernels of the compiled forward/backward are launched
+    # without going through the Python launcher. Opt-in: it costs a slow C++ compile on
+    # every cold cache, and with the graphs above the gain is small on a fast host.
     inductor_cpp_wrapper: bool = False
-    wm_graph: bool = False
-    policy_graph: bool = False
-    # Collect-side logging statistics (sim_rew, ep_len, ep_ret_norm, term_frac,
-    # exam_survival) without the per-step host sync. Off keeps the synced path:
-    # one ``float(done.sum())`` per collect step (plus two more when an episode
-    # ends) stalls the host until the env pipeline has drained, and the
-    # per-iteration logging reads the lists back one scalar at a time. On, the
-    # statistics accumulate in float64 on the device and are read back once per
-    # ``log_every`` period; ``train_log.csv`` keeps its definitions, while the
-    # matching TensorBoard scalars get one point per log period instead of per
-    # iteration.
-    stats_on_device: bool = False
 
 
 _LOG_FIELDS = (
@@ -205,8 +208,10 @@ class SuperMimicLearner:
             raise ValueError(f"pi_opt must be 'adam' or 'muon', got {cfg.pi_opt!r}")
         if cfg.wm_opt not in ("adam", "muon"):
             raise ValueError(f"wm_opt must be 'adam' or 'muon', got {cfg.wm_opt!r}")
-        if cfg.critic_update not in ("eager", "graph"):
-            raise ValueError(f"critic_update must be 'eager' or 'graph', got {cfg.critic_update!r}")
+        if cfg.critic_update not in ("auto", "eager", "graph"):
+            raise ValueError(
+                f"critic_update must be 'auto', 'eager' or 'graph', got {cfg.critic_update!r}"
+            )
         if cfg.test_hidden_dims is not None and not cfg.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
         exam_rows = 0
@@ -276,11 +281,40 @@ class SuperMimicLearner:
         # the learner works on its own MDP copy and bridges tensors at the env
         # boundary. On CUDA/ROCm the devices always match and nothing changes.
         self._bridged = self.device != self.env_device
-        graphs = cfg.wm_graph or cfg.policy_graph
-        if (cfg.inductor_cpp_wrapper or graphs) and self.device.type != "cuda":
+        # Explicit CUDA graphs only exist on NVIDIA CUDA (not on ROCm's HIP). The
+        # launch-overhead switches default to ``None`` / ``"auto"`` and follow this;
+        # an explicit request on any other device is a configuration error.
+        self._cuda_graphs = (
+            self.device.type == "cuda" and getattr(torch.version, "hip", None) is None
+        )
+
+        def follow_device(requested: bool | None, name: str) -> bool:
+            if requested is None:
+                return self._cuda_graphs
+            if requested and not self._cuda_graphs:
+                raise ValueError(
+                    f"SuperMimicConfig.{name}=True requires a CUDA-graph capable device "
+                    f"(NVIDIA CUDA), got {self.device}"
+                )
+            return requested
+
+        if cfg.critic_update == "graph" and not self._cuda_graphs:
             raise ValueError(
-                "SuperMimicConfig.inductor_cpp_wrapper / wm_graph / policy_graph require a "
-                f"CUDA device, got {self.device}"
+                "SuperMimicConfig.critic_update='graph' requires an NVIDIA CUDA device, "
+                f"got {self.device}"
+            )
+        self._wm_graph_enabled = follow_device(cfg.wm_graph, "wm_graph")
+        self._pi_graph_enabled = follow_device(cfg.policy_graph, "policy_graph")
+        # The device-side statistics run on any device (host bridges move the transition to
+        # the learner device first); ``auto`` follows NVIDIA CUDA, where the per-step sync
+        # they remove actually stalls the host.
+        self._stats_on_device = (
+            self._cuda_graphs if cfg.stats_on_device is None else cfg.stats_on_device
+        )
+        if cfg.inductor_cpp_wrapper and self.device.type != "cuda":
+            raise ValueError(
+                "SuperMimicConfig.inductor_cpp_wrapper=True requires a CUDA device, "
+                f"got {self.device}"
             )
         if cfg.inductor_cpp_wrapper:
             # Process-wide inductor switch; it has to be set before the first compile.
@@ -341,13 +375,11 @@ class SuperMimicLearner:
             )
         self._critic_params = list(self.critic.parameters())
         self._critic_buffers = list(self.critic.buffers())
-        # CUDA graphs only exist on NVIDIA CUDA; anywhere else ``graph`` falls back to the
-        # eager loop, so the training semantics are the same on every device.
+        # CUDA graphs only exist on NVIDIA CUDA; anywhere else ``auto`` / ``graph`` resolve to
+        # the eager loop (``graph`` off CUDA is rejected above), so the training semantics are
+        # the same on every device.
         self._critic_graph_enabled = (
-            cfg.critic_update == "graph"
-            and not cfg.no_critic
-            and self.device.type == "cuda"
-            and getattr(torch.version, "hip", None) is None
+            cfg.critic_update in ("auto", "graph") and not cfg.no_critic and self._cuda_graphs
         )
         self._critic_graph_state: _CriticGraph | None = None
         if self._critic_graph_enabled:
@@ -398,10 +430,10 @@ class SuperMimicLearner:
         self._exam_share = 0.0
         self._exam_fail_ema: float | None = None
         self.stats = _empty_stats()
-        # Device-side collect statistics (``cfg.stats_on_device``), see ``_accumulate_stats``.
+        # Device-side collect statistics (``stats_on_device``), see ``_accumulate_stats``.
         self._dev_stats = None
         self._dev_unit = None
-        if cfg.stats_on_device:
+        if self._stats_on_device:
             self._dev_stats = torch.zeros(
                 len(_DEV_STAT_FIELDS), dtype=torch.float64, device=self.device
             )
@@ -412,10 +444,10 @@ class SuperMimicLearner:
         self._imag_step_fn = self._compile(self._imag_step)
         self._reward_term_fn = self._compile(self._reward_term)
         self._critic_input_fn = self._compile(self._critic_input)
-        # Explicit CUDA graphs over the gradient steps (off by default). The policy
-        # graph clones the outputs the training loop keeps past the next replay.
-        self._wm_graph = CapturedUpdate() if cfg.wm_graph else None
-        self._pi_graph = CapturedUpdate(clone_outputs=(0, 4, 7)) if cfg.policy_graph else None
+        # Explicit CUDA graphs over the gradient steps. The policy graph clones the outputs
+        # the training loop keeps past the next replay.
+        self._wm_graph = CapturedUpdate() if self._wm_graph_enabled else None
+        self._pi_graph = CapturedUpdate(clone_outputs=(0, 4, 7)) if self._pi_graph_enabled else None
 
         with (self.log_dir / "args.json").open("w", encoding="utf-8") as stream:
             json.dump(asdict(cfg), stream, indent=2)
@@ -648,7 +680,7 @@ class SuperMimicLearner:
             else:
                 self.wm.inc_norm.update(target)
             self.sim_steps += self.env.num_envs
-            if self.cfg.stats_on_device:
+            if self._dev_stats is not None:
                 # The same statistics as the appends below, accumulated on the device:
                 # no ``float()`` and no host branch, so the host runs on without
                 # waiting for the env pipeline to drain.
@@ -1461,7 +1493,7 @@ class SuperMimicLearner:
                     iteration_time = time.time() - iteration_start
 
                     period = None
-                    if self.cfg.stats_on_device:
+                    if self._dev_stats is not None:
                         # Nothing is read per iteration: the collect statistics are
                         # read back once, here, when the log period closes, and the
                         # collect tags are logged at that iteration with the period's

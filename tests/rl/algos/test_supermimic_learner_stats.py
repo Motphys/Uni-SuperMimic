@@ -384,11 +384,13 @@ def test_collect_never_reads_the_host_when_statistics_stay_on_device(tmp_path, m
     assert on_device._dev_stats.tolist() == [0.0] * len(sums)
 
 
-def test_stats_on_device_is_off_by_default(tmp_path) -> None:
-    assert SuperMimicConfig().stats_on_device is False
+def test_stats_on_device_is_auto_by_default(tmp_path) -> None:
+    assert SuperMimicConfig().stats_on_device is None
     assert "stats_on_device" in {field.name for field in fields(SuperMimicConfig)}
     learner = SuperMimicLearner(FakeEnv(num_envs=8), _config(), tmp_path)
-    assert learner.cfg.stats_on_device is False
+    # ``auto`` keeps the synced path anywhere but NVIDIA CUDA (this learner is on CPU).
+    assert learner.cfg.stats_on_device is None
+    assert learner._stats_on_device is False
     assert learner._dev_stats is None and learner._dev_unit is None
     with pytest.raises(RuntimeError, match="cfg.stats_on_device"):
         learner._accumulate_stats({})

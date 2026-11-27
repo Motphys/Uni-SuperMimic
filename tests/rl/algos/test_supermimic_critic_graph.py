@@ -15,7 +15,17 @@ LEARNING_RATES = (1e-3, 1e-3, 2e-4, 5e-5)
 
 
 def _config_for(**overrides):
-    values = dict(amp="bf16", critic_epochs=3, critic_minibatches=2, critic_update="graph")
+    # Isolate the critic loop: the other launch-overhead switches stay on their original
+    # (eager / synced) paths whichever device the test runs on.
+    values = dict(
+        amp="bf16",
+        critic_epochs=3,
+        critic_minibatches=2,
+        critic_update="graph",
+        wm_graph=False,
+        policy_graph=False,
+        stats_on_device=False,
+    )
     values.update(overrides)
     return replace(_config(), **values)
 
@@ -46,12 +56,18 @@ def _assert_same_critic(expected: SuperMimicLearner, actual: SuperMimicLearner) 
 
 
 def test_invalid_critic_update_is_rejected(tmp_path) -> None:
-    with pytest.raises(ValueError, match="critic_update must be 'eager' or 'graph'"):
+    with pytest.raises(ValueError, match="critic_update must be 'auto', 'eager' or 'graph'"):
         SuperMimicLearner(FakeEnv(), replace(_config(), critic_update="compiled"), tmp_path)
 
 
-def test_graph_critic_update_falls_back_to_eager_off_cuda(tmp_path) -> None:
-    learner = SuperMimicLearner(FakeEnv(), replace(_config(), critic_update="graph"), tmp_path)
+def test_graph_critic_update_requires_nvidia_cuda(tmp_path) -> None:
+    # An explicit ``graph`` is a hard request; only ``auto`` follows the device.
+    with pytest.raises(ValueError, match="critic_update='graph' requires an NVIDIA CUDA"):
+        SuperMimicLearner(FakeEnv(), _config_for(critic_update="graph"), tmp_path)
+
+
+def test_auto_critic_update_keeps_the_eager_loop_off_cuda(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config_for(critic_update="auto"), tmp_path)
 
     assert learner._critic_graph_enabled is False
     assert learner.opt_v.defaults["capturable"] is False

@@ -12,12 +12,25 @@ from unisupermimic.rl.algos.supermimic.cuda_graph import CapturedUpdate, cumprod
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicLearner
 
 
-def test_launch_overhead_switches_require_cuda(tmp_path) -> None:
-    for switch in ("wm_graph", "policy_graph", "inductor_cpp_wrapper"):
-        with pytest.raises(ValueError, match="require a CUDA device"):
-            SuperMimicLearner(FakeEnv(), replace(_config(), **{switch: True}), tmp_path / switch)
-    # Off by default: the eager path is wired and nothing is captured.
-    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path / "off")
+def _eager(**overrides):
+    """``_config()`` with every launch-overhead switch forced onto its original path.
+
+    The switches default to ``auto`` (on for NVIDIA CUDA), so a test that isolates one of
+    them pins the others to eager / synced whichever device it runs on.
+    """
+    values = dict(critic_update="eager", wm_graph=False, policy_graph=False, stats_on_device=False)
+    values.update(overrides)
+    return replace(_config(), **values)
+
+
+def test_launch_overhead_switches_require_cuda_graphs(tmp_path) -> None:
+    for switch in ("wm_graph", "policy_graph"):
+        with pytest.raises(ValueError, match="requires a CUDA-graph capable device"):
+            SuperMimicLearner(FakeEnv(), _eager(**{switch: True}), tmp_path / switch)
+    with pytest.raises(ValueError, match="inductor_cpp_wrapper=True requires a CUDA device"):
+        SuperMimicLearner(FakeEnv(), _eager(inductor_cpp_wrapper=True), tmp_path / "cpp")
+    # ``auto`` (the default) keeps the eager path off NVIDIA CUDA: nothing is captured.
+    learner = SuperMimicLearner(FakeEnv(), _eager(), tmp_path / "auto")
     assert learner._wm_graph is None
     assert learner._pi_graph is None
 
@@ -66,7 +79,7 @@ def test_captured_update_draws_fresh_noise_and_keeps_the_eager_rng_sequence() ->
 def test_wm_update_graph_matches_eager_gradients_parameters_and_metrics(
     tmp_path, compile, amp, muon
 ) -> None:
-    cfg = replace(_config(), compile=compile, amp=amp, pi_opt="muon" if muon else "adam")
+    cfg = _eager(compile=compile, amp=amp, pi_opt="muon" if muon else "adam")
     eager = SuperMimicLearner(FakeEnv(), cfg, tmp_path / "eager", device="cuda")
     graph = SuperMimicLearner(
         FakeEnv(), replace(cfg, wm_graph=True), tmp_path / "graph", device="cuda"
@@ -100,9 +113,7 @@ def test_wm_update_graph_matches_eager_gradients_parameters_and_metrics(
 def test_wm_update_graph_outputs_are_private_and_gradients_keep_their_address(
     tmp_path,
 ) -> None:
-    learner = SuperMimicLearner(
-        FakeEnv(), replace(_config(), wm_graph=True), tmp_path / "graph", device="cuda"
-    )
+    learner = SuperMimicLearner(FakeEnv(), _eager(wm_graph=True), tmp_path / "graph", device="cuda")
     learner.collect(12)
     for _ in range(4):
         learner.wm_update()
@@ -159,7 +170,7 @@ class _GraphCheckMdp(FakeMdp):
 
 def _policy_pair(tmp_path, noise: bool, **overrides):
     """Eager and policy-graph learners with the same seed and MDP."""
-    cfg = replace(_config(), pi_batch=64, horizon=4, **overrides)
+    cfg = _eager(pi_batch=64, horizon=4, **overrides)
     learners = []
     for name, policy_graph in (("eager", False), ("graph", True)):
         env = FakeEnv()
