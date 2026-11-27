@@ -37,10 +37,13 @@ from unisupermimic.tasks.motion_tracking.g1.supermimic.manager_terms import (
     make_current_info,
     make_transition_info,
     merge_current_info,
+    sample_frontier_frames,
     sample_start_frames,
     start_bin_probabilities,
     supermimic_clip_end,
+    supermimic_termination,
     supermimic_timeout,
+    update_clip_fail_stats,
     update_start_bin_returns,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import MAX_STEP_REWARD
@@ -82,6 +85,7 @@ def _runtime_cfg(
     eval_mode: bool = False,
     backend: str = "mjwarp",
     rotating_clip: bool = False,
+    masked: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
@@ -99,7 +103,7 @@ def _runtime_cfg(
     ):
         owner = compose("config", overrides=[f"task=g1_super_mimic/{backend}"])
     override = EnvConfigAdapter(
-        owner, root_dir=root, algo_name="supermimic"
+        owner, root_dir=root
     ).build_task_env_cfg_override()
     cfg = registry.materialize_env_config("G1SuperMimic")
     assert isinstance(cfg, ManagerBasedRlEnvCfg)
@@ -108,6 +112,13 @@ def _runtime_cfg(
     assert isinstance(command_cfg, SuperMimicCommandCfg)
     command_cfg.motion_files = [str(clip_path)]
     command_cfg.eval_mode = eval_mode
+    # Tests construct envs repeatedly; skip step-path compilation warmup.
+    command_cfg.compile = False
+    # Runtime tests default to the selected-row lifecycle; the fixed-shape
+    # path has its own dedicated tests (it changes RNG draw order). The single
+    # unilab 1.6.0 switch implies masked autoreset, persistent step buffers
+    # and reset-segment graph capture together.
+    cfg.autoreset_cuda_graph = masked
     cfg.validate()
     return cfg
 
@@ -338,8 +349,14 @@ def test_episode_return_update_bootstraps_only_truncation() -> None:
     expected_G = torch.tensor([1.0, 2.0, 3.0]) * 0.8 + 0.2 * expected_returns
     torch.testing.assert_close(bin_G[:3], expected_G)
     assert bin_G[3] == 4.0
-    torch.testing.assert_close(stats["ep_len"], ep_step[:3].float())
-    torch.testing.assert_close(stats["ep_ret_norm"], ep_ret[:3] / (ep_step[:3] * MAX_STEP_REWARD))
+    # Full-width masked statistics: done rows carry the episode values, the
+    # non-done row carries zero, and the done mask reconstructs the means.
+    expected_len = ep_step.float() * done.float()
+    expected_ret_norm = ep_ret / (ep_step.float() * MAX_STEP_REWARD) * done.float()
+    torch.testing.assert_close(stats["ep_len"], expected_len)
+    torch.testing.assert_close(stats["ep_ret_norm"], expected_ret_norm)
+    done_count = done.sum()
+    torch.testing.assert_close(stats["ep_len"].sum() / done_count, ep_step[:3].float().mean())
     assert set(stats) == {"ep_len", "ep_ret_norm"}
 
 
@@ -355,8 +372,11 @@ def test_episode_return_update_without_done_rows_is_a_no_op() -> None:
         torch.zeros(2, dtype=torch.bool),
         0.99,
     )
-    assert stats == {}
+    # No done rows: the EMA is untouched and the masked statistics are zero.
     torch.testing.assert_close(bin_G, torch.tensor([1.0, 2.0]))
+    assert set(stats) == {"ep_len", "ep_ret_norm"}
+    assert bool((stats["ep_len"] == 0).all())
+    assert bool((stats["ep_ret_norm"] == 0).all())
 
 
 def test_eval_command_update_does_not_change_start_bin_statistics() -> None:
@@ -521,6 +541,7 @@ def test_timeout_and_clip_end_are_independent_truncation_terms() -> None:
     command.ep_step = torch.tensor([498, 499, 500])
     command.max_episode_steps = 500
     command.f = torch.tensor([99, 100, 105])
+    command.exam_mask = torch.zeros(3, dtype=torch.bool)
     command.motion = SimpleNamespace(
         clip_end=torch.tensor([101, 108]),
         clip_id=torch.cat((torch.zeros(102, dtype=torch.int64), torch.ones(7, dtype=torch.int64))),
@@ -528,6 +549,181 @@ def test_timeout_and_clip_end_are_independent_truncation_terms() -> None:
     env = SimpleNamespace(command_manager=_CommandManager(command))
     assert supermimic_timeout(env).tolist() == [False, True, True]
     assert supermimic_clip_end(env).tolist() == [False, True, False]
+
+
+def test_exam_rows_terminate_but_ignore_the_episode_cap() -> None:
+    command = object.__new__(SuperMimicCommand)
+    command.ep_step = torch.tensor([600, 600])
+    command.max_episode_steps = 500
+    command.f = torch.tensor([10, 10])
+    command.exam_mask = torch.tensor([False, True])
+
+    def state() -> None:
+        return None
+
+    def termination(state_value: Any, frames: torch.Tensor) -> torch.Tensor:
+        del state_value
+        return frames >= 10
+
+    command.state = state
+    command.mdp = SimpleNamespace(termination=termination)
+    env = SimpleNamespace(command_manager=_CommandManager(command))
+    # Row 0 fails both the hard criterion and the episode cap; row 1 is an
+    # exam world: the hard termination still applies (a fallen exam robot
+    # ends that clip, matching BlinkMimic2) but the wall-clock cap does not.
+    assert supermimic_termination(env).tolist() == [True, True]
+    assert supermimic_timeout(env).tolist() == [True, False]
+    # Without exam worlds the terms are the plain criteria again.
+    command.exam_mask = torch.zeros(2, dtype=torch.bool)
+    assert supermimic_termination(env).tolist() == [True, True]
+    assert supermimic_timeout(env).tolist() == [True, True]
+
+
+def test_exam_worlds_activate_and_round_robin_clip_starts() -> None:
+    command = object.__new__(SuperMimicCommand)
+    command._env = SimpleNamespace(num_envs=4)
+    command._device = torch.device("cpu")
+    command._num_clips = 2
+    command.exam_mask = torch.zeros(4, dtype=torch.bool)
+    command._exam_clip_cursor = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    command._exam_margin = False
+    command.motion = SimpleNamespace(clip_start=torch.tensor([0, 60]))
+
+    frames = command.activate_exam_worlds(2)
+
+    # The last two rows become exam worlds; their cursors advance one clip.
+    assert command.exam_mask.tolist() == [False, False, True, True]
+    assert command._exam_clip_cursor.tolist() == [0, 1, 1, 0]
+    assert frames.tolist() == [0, 60, 60, 0]
+
+    # A masked restart advances only resetting exam rows (row 2 here) and
+    # hands every row the first frame of its cursor clip.
+    exam_frames = command._exam_start_frames(torch.tensor([False, True, True, False]))
+    assert command._exam_clip_cursor.tolist() == [0, 1, 0, 0]
+    assert exam_frames.tolist() == [0, 60, 0, 0]
+
+    with pytest.raises(ValueError, match="exam row count must be in"):
+        command.activate_exam_worlds(4)
+    with pytest.raises(TypeError, match="exam row count must be an int"):
+        command.activate_exam_worlds(True)  # type: ignore[arg-type]
+
+
+def _margin_command(num_envs: int = 6) -> SuperMimicCommand:
+    command = object.__new__(SuperMimicCommand)
+    command._env = SimpleNamespace(num_envs=num_envs)
+    command._device = torch.device("cpu")
+    command._num_clips = 4
+    command.exam_mask = torch.zeros(num_envs, dtype=torch.bool)
+    command._exam_clip_cursor = torch.arange(num_envs, dtype=torch.int64) % 4
+    command._exam_clip_table = torch.arange(num_envs, dtype=torch.int64) % 4
+    command._exam_margin = True
+    command._clip_fail_ema = torch.zeros(4, dtype=torch.float32)
+    command._clip_fail_frame = torch.full((4,), -1, dtype=torch.int64)
+    command.motion = SimpleNamespace(clip_start=torch.tensor([0, 60, 120, 180]))
+    return command
+
+
+def test_margin_exam_clips_select_by_failure_boundary_and_gather_first_frames() -> None:
+    command = _margin_command()
+    command._clip_fail_ema.copy_(torch.tensor([0.0, 0.9, 0.99, 0.2]))
+
+    mean_fail_ema = command.refresh_exam_clips(2)
+
+    # Margins |EMA - 1| are [1.0, 0.1, 0.01, 0.8]: the exam rows take the two
+    # clips closest to the failure boundary, at most one exam per clip, and
+    # the mean failure EMA of the examined clips is reported for logging.
+    assert command._exam_clip_table.tolist() == [0, 1, 2, 3, 2, 1]
+    torch.testing.assert_close(mean_fail_ema, torch.tensor((0.99 + 0.9) / 2))
+    # The captured reset segment gathers the table's clip first frames; the
+    # round-robin cursor never advances in margin mode.
+    exam_frames = command._exam_start_frames(torch.ones(6, dtype=torch.bool))
+    assert exam_frames.tolist() == [0, 60, 120, 180, 120, 60]
+    assert command._exam_clip_cursor.tolist() == [0, 1, 2, 3, 0, 1]
+
+    # Activation goes through the same margin selection: the newly assigned
+    # rows start on the selected clips' first frames.
+    command = _margin_command()
+    command._clip_fail_ema.copy_(torch.tensor([0.0, 0.9, 0.99, 0.2]))
+    frames = command.activate_exam_worlds(2)
+    assert command.exam_mask.tolist() == [False, False, False, False, True, True]
+    assert frames.tolist() == [0, 60, 120, 180, 120, 60]
+
+    with pytest.raises(ValueError, match="exam row count must be in"):
+        command.refresh_exam_clips(6)
+    with pytest.raises(ValueError, match="exceeds the clip count"):
+        _margin_command(num_envs=8).refresh_exam_clips(6)
+
+
+def test_frontier_frames_sample_failed_clip_windows_with_equal_mass() -> None:
+    generator = torch.Generator().manual_seed(11)
+    clip_fail_frame = torch.tensor([95, 140, -1, 355], dtype=torch.int64)
+    clip_start = torch.tensor([0, 100, 200, 300], dtype=torch.int64)
+    clip_end = torch.tensor([99, 199, 299, 399], dtype=torch.int64)
+    draws = 8192
+
+    frames = sample_frontier_frames(
+        clip_fail_frame,
+        clip_start,
+        clip_end,
+        50,
+        torch.rand(draws, generator=generator),
+        torch.rand(draws, generator=generator),
+    )
+
+    assert frames.shape == (draws,)
+    # Only the failed clips (0, 1, 3) carry mass, each uniformly over its
+    # frontier window [failure frame - 50, clip end) clipped into the clip:
+    # [45, 99), [100, 199) (the failure predates the window), [305, 399).
+    windows = {0: (45, 99), 1: (100, 199), 3: (305, 399)}
+    counts = {}
+    for clip, (low, high) in windows.items():
+        selected = (frames >= low) & (frames < high)
+        counts[clip] = int(selected.sum())
+        assert frames[selected].min() >= low
+        assert frames[selected].max() < high
+    assert sum(counts.values()) == draws, "the never-failed clip 2 drew mass"
+    # Equal mass per failed clip: a third of the draws each (binomial sigma
+    # ~47 at 8192 draws; the bound keeps the test deterministic enough).
+    assert all(abs(count - draws / 3) < 300 for count in counts.values())
+    # The window interior is actually covered, not just its endpoints.
+    clip0 = frames[(frames >= 45) & (frames < 99)]
+    assert int(clip0.min()) <= 47
+    assert int(clip0.max()) >= 96
+
+
+def test_update_clip_fail_stats_ema_and_last_failure_frame() -> None:
+    clip_fail_ema = torch.tensor([0.5, 0.5, 0.5])
+    clip_fail_frame = torch.tensor([-1, 20, -1], dtype=torch.int64)
+
+    update_clip_fail_stats(
+        clip_fail_ema,
+        clip_fail_frame,
+        clip_id=torch.tensor([0, 0, 1, 2]),
+        frames=torch.tensor([10, 20, 55, 7]),
+        term=torch.tensor([True, False, True, False]),
+        done=torch.tensor([True, True, True, True]),
+        decay=0.7,
+    )
+
+    # Per-clip mean of the ended episodes' hard-termination verdicts, one EMA
+    # step per touched clip: clip 0 fails half, clip 1 fails, clip 2 passes.
+    torch.testing.assert_close(clip_fail_ema, torch.tensor([0.5, 0.7 * 0.5 + 0.3, 0.7 * 0.5]))
+    # Terminating rows scatter their frame (amax keeps the furthest failure);
+    # passing rows write -1 and never lower an existing entry.
+    assert clip_fail_frame.tolist() == [10, 55, -1]
+
+    # Without episode ends the statistics are untouched.
+    update_clip_fail_stats(
+        clip_fail_ema,
+        clip_fail_frame,
+        clip_id=torch.tensor([0, 1, 2]),
+        frames=torch.tensor([11, 21, 3]),
+        term=torch.tensor([True, True, True]),
+        done=torch.tensor([False, False, False]),
+        decay=0.7,
+    )
+    torch.testing.assert_close(clip_fail_ema, torch.tensor([0.5, 0.7 * 0.5 + 0.3, 0.7 * 0.5]))
+    assert clip_fail_frame.tolist() == [10, 55, -1]
 
 
 def test_context_events_share_command_xi_and_replay_startup_values() -> None:
@@ -700,12 +896,16 @@ def test_training_reset_step_and_pre_reset_transition(tmp_path: Path, backend_na
     try:
         frames = torch.tensor([0, 1], dtype=torch.int64, device=env.device)
         obs, info = env.reset_to_frames(frames)
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
         assert obs["critic"].shape == (2, 730)
         assert all(torch.isfinite(values).all() for values in obs.values())
         current = info[SUPERMIMIC_STATE_KEY]
         assert current["s"].shape == (2, 71)
         assert current["f"].shape == (2,)
+        # The state key is a live fixed-address carrier (the CUDA-graph-safe
+        # reset refreshes it in place), so snapshot compared values before
+        # stepping rather than holding the dict across the step.
+        bootstrap_f = current["f"].clone()
         command = env.command_manager.get_term("motion")
         assert isinstance(command, SuperMimicCommand)
         _assert_runtime_context(env, command, backend_name)
@@ -734,7 +934,7 @@ def test_training_reset_step_and_pre_reset_transition(tmp_path: Path, backend_na
         assert transition["a"].shape == transition["a_prev"].shape == (2, 29)
         assert transition["xi"].shape == (2, 33)
         assert transition["r"].shape == transition["done"].shape == (2,)
-        assert torch.equal(transition["f"], current["f"])
+        assert torch.equal(transition["f"], bootstrap_f)
         assert transition["ep_step"].tolist() == [0, 0]
         assert not bool(transition["done"].any())
         assert state.info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [1, 1]
@@ -778,7 +978,7 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         assert info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [0, 0]
         assert command.xi[:, 0].tolist() == [1.0, 1.0]
         assert torch.count_nonzero(command.xi[:, 1:]) == 0
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
         assert obs["critic"].shape == (2, 730)
         for actual, expected in zip(command.state(), command.motion.ref_state(command.f)):
             torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
@@ -792,7 +992,7 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         )
         assert command.f.tolist() == [1, 51]
         assert info[SUPERMIMIC_STATE_KEY]["ep_step"].tolist() == [1, 0]
-        assert obs["obs"].shape == (2, 99)
+        assert obs["obs"].shape == (2, 93)
     finally:
         env.close()
         env.backend.close()
@@ -853,3 +1053,201 @@ def test_mujoco_poststep_public_root_matches_native_qpos_qvel(tmp_path: Path) ->
     finally:
         env.close()
         backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_masked_autoreset_steps_without_host_sync(tmp_path: Path) -> None:
+    """The fixed-shape autoreset exercises every reset participant sync-free."""
+    _require_backend_runtime("mjwarp")
+    cfg = _runtime_cfg(tmp_path, masked=True)
+    # Poll explicitly far away so every step in the checked window is verified
+    # to be sync-free (the poll itself is an intentional host read).
+    cfg.finite_validation_interval = 10**6
+    env = make_supermimic_env(cfg, num_envs=64, backend_type="mjwarp")
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(1)
+        obs, _ = env.reset_to_frames(torch.zeros(64, dtype=torch.int64, device=env.device))
+        assert obs["obs"].shape == (64, 93)
+        generator = torch.Generator(device=env.device).manual_seed(0)
+
+        def action() -> torch.Tensor:
+            return torch.randn((64, 29), generator=generator, device=env.device) * 0.3
+
+        for _ in range(4):  # warm up every reset participant
+            env.step(action())
+        done_rows = torch.zeros((), dtype=torch.int64, device=env.device)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for _ in range(40):
+                state = env.step(action())
+                done_rows += (state.terminated | state.truncated).sum()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert int(done_rows) > 0, "the masked autoreset was not exercised"
+        assert env.poll_finite_validation(force=True)
+        for value in state.obs.values():
+            assert bool(torch.isfinite(value).all())
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        assert bool((command.ep_step >= 0).all())
+        assert bool(command.f.max() < command.motion.num_frames)
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_masked_autoreset_restores_context_dr(tmp_path: Path) -> None:
+    """Fixed-shape resets re-stage the startup friction/CoM context.
+
+    The backend reset restores default model fields on reset rows, so the
+    masked path must replay xi-derived friction/CoM through full-width
+    masked staging; otherwise the privileged-context observation would lie
+    about the simulated robot. This is the canary for that staging path.
+    """
+    _require_backend_runtime("mjwarp")
+    import warp
+
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, masked=True), num_envs=8, backend_type="mjwarp"
+    )
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(5)
+        env.reset_to_frames(torch.arange(8, dtype=torch.int64, device=env.device))
+        generator = torch.Generator(device=env.device).manual_seed(2)
+        done = 0
+        for _ in range(80):
+            action = torch.randn((8, 29), generator=generator, device=env.device) * 0.3
+            step = env.step(action)
+            done += int(step.info[SUPERMIMIC_TRANSITION_KEY]["done"].sum())
+        assert done > 0, "no autoreset happened; the replay path was not exercised"
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        model = env.backend._device_model
+        friction = warp.to_torch(model.geom_friction)  # (num_envs, ngeom, 3)
+        robot_ids = np.asarray(env.scene["robot"]._geom_ids)
+        torch.testing.assert_close(
+            friction[:, robot_ids, 0],
+            command.xi[:, :1].expand(-1, robot_ids.size),
+            rtol=0,
+            atol=1e-6,
+        )
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_graph_autoreset_publishes_post_reset_state(tmp_path: Path) -> None:
+    """Graph-replayed resets must refresh the published state key on done rows.
+
+    Host-side dict re-assignment inside the captured autoreset body executes
+    only at capture time, so the state key must flow through fixed-address
+    carriers. If it does not, every done row keeps its pre-reset snapshot
+    (``ep_step != 0`` after the reset), and the collector's episode
+    bookkeeping — the fresh-history gate keyed on ``ep_step == 0`` — silently
+    desynchronizes from the simulation. This is the canary for that carrier.
+    """
+    _require_backend_runtime("mjwarp")
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, masked=True), num_envs=64, backend_type="mjwarp"
+    )
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(3)
+        env.reset_to_frames(torch.zeros(64, dtype=torch.int64, device=env.device))
+        generator = torch.Generator(device=env.device).manual_seed(1)
+        checked = 0
+        for _ in range(80):
+            action = torch.randn((64, 29), generator=generator, device=env.device) * 0.5
+            step = env.step(action)
+            done = step.terminated | step.truncated
+            done_count = int(done.sum())
+            if done_count:
+                ep_step = step.info[SUPERMIMIC_STATE_KEY]["ep_step"][done]
+                assert bool((ep_step == 0).all()), (
+                    f"done rows kept their pre-reset snapshot "
+                    f"(ep_step={ep_step[:5].tolist()} at step {checked})"
+                )
+                checked += done_count
+        assert checked > 0, "no autoreset happened; the graph path was not exercised"
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_exam_worlds_run_full_clips_in_masked_autoreset(tmp_path: Path) -> None:
+    """Exam worlds complete whole clips through the captured autoreset.
+
+    Exam activation flips the persistent mask in place after the reset-segment
+    graph may already be captured, and every later replay must honor it without
+    any host synchronization: exam rows restart on the clip's first frame and
+    the episode cap never ends their episodes (only the clip end, or a fall,
+    does — the hard termination still applies to exam rows, matching
+    BlinkMimic2). Zero actions keep the standing keyframe so the rollouts here
+    run to the clip ends. Practice rows keep recycling through the cap.
+    """
+    _require_backend_runtime("mjwarp")
+    cfg = _runtime_cfg(tmp_path, masked=True)
+    cfg.finite_validation_interval = 10**6
+    env = make_supermimic_env(cfg, num_envs=8, backend_type="mjwarp")
+    try:
+        assert env.reset_selection_blockers() == []
+        env.seed(11)
+        env.reset_to_frames(torch.zeros(8, dtype=torch.int64, device=env.device))
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        command.max_episode_steps = 3  # practice rows recycle every three steps
+        clip_end = int(command.motion.clip_end[0].item())
+
+        def action() -> torch.Tensor:
+            # Zero actions hold the standing keyframe so exam rows survive to
+            # their clip ends (random actions fall and hard-terminate).
+            return torch.zeros((8, 29), device=env.device)
+
+        for _ in range(4):  # warm up eager paths and capture the autoreset graph
+            env.step(action())
+        assert env.autoreset_graph is not None and env.autoreset_graph.captured
+
+        # Activate exams AFTER the reset-segment graph is captured: the mask
+        # flips in place and the replayed segment must pick it up.
+        env.enable_supermimic_exams(4)
+
+        assert command.exam_mask.tolist() == [False, False, False, False, True, True, True, True]
+        assert bool((command.f[4:] == 0).all()), "exam rows must start on the clip's first frame"
+        assert command.ep_step[4:].tolist() == [0, 0, 0, 0]
+        dones: list[torch.Tensor] = []
+        frames: list[torch.Tensor] = []
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for _ in range(clip_end + 12):
+                state = env.step(action())
+                dones.append((state.terminated | state.truncated).clone())
+                frames.append(state.info[SUPERMIMIC_STATE_KEY]["f"].clone())
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert env.poll_finite_validation(force=True)
+
+        done = torch.stack(dones)
+        published = torch.stack(frames)
+        exam_done, practice_done = done[:, 4:], done[:, :4]
+        exam_frames = published[:, 4:]
+        # The cap (3) never ends exam episodes: zero actions eventually fall
+        # (the hard termination applies to exam rows), but only far past the
+        # three-step practice cap, and every restart begins on frame 0.
+        assert int(exam_done.sum()) >= 4, "no exam episode ever ended"
+        assert int(exam_frames.max()) >= 20, "exam episodes ended at the cap"
+        assert bool((exam_frames[exam_done] == 0).all())
+        # Practice rows keep recycling through the short episode cap.
+        assert int(practice_done.sum()) > int(exam_done.sum())
+        # Their statistics stay out of the start-bin return EMA: bin_G only
+        # advances through practice episodes (untouched at zero returns here).
+        assert bool((command.f[4:] < command.motion.num_frames).all())
+    finally:
+        env.close()
+        env.backend.close()

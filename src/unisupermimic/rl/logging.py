@@ -138,6 +138,8 @@ class SuperMimicLogger:
         self._ep_len: float | None = None
         self._ep_ret_norm: float | None = None
         self._term_frac: float | None = None
+        self._exam_survival: float | None = None
+        self._exam_fail_ema: float | None = None
         self._collect_time = 0.0
         self._learn_time = 0.0
         self._iteration_time = 0.0
@@ -256,6 +258,8 @@ class SuperMimicLogger:
         ep_len: float | None = None,
         ep_ret_norm: float | None = None,
         term_frac: float | None = None,
+        exam_survival: float | None = None,
+        exam_fail_ema: float | None = None,
         iter_sim_steps: int = 0,
         collect_time: float = 0.0,
         learn_time: float = 0.0,
@@ -283,6 +287,8 @@ class SuperMimicLogger:
             self._ep_ret_norm = ep_ret_norm
         if term_frac is not None:
             self._term_frac = term_frac
+        self._exam_survival = exam_survival
+        self._exam_fail_ema = exam_fail_ema
         self._collect_time = collect_time
         self._learn_time = learn_time
         self._iteration_time = iteration_time
@@ -336,6 +342,10 @@ class SuperMimicLogger:
             scalars["Episode/return_norm"] = ep_ret_norm
         if term_frac is not None:
             scalars["Episode/terminated_frac"] = term_frac
+        if self._exam_survival is not None:
+            scalars["Exam/survival"] = self._exam_survival
+        if self._exam_fail_ema is not None:
+            scalars["Exam/margin_fail_ema"] = self._exam_fail_ema
         self._write_tb_scalars(list(scalars.items()), iteration)
         self._refresh()
 

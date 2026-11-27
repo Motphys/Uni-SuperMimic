@@ -109,3 +109,36 @@ def test_history_does_not_cross_oldest_buffered_transition(
 
     torch.testing.assert_close(start["f"], torch.full((3,), 2))
     torch.testing.assert_close(history["f"], torch.full((3, 4), 2))
+
+
+def test_sample_starts_exam_split_draws_from_the_requested_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = ReplayBuffer(8, 8, "cpu", num_joints=2, context_dim=3)
+    for time in range(8):
+        buffer.add(_transition(time, 8, 2, 3, ep_step=time))
+
+    def latest(low: int, high: int, size: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        del low
+        return torch.full(size, high - 1, dtype=torch.long, device=device)
+
+    monkeypatch.setattr(torch, "randint", latest)
+    monkeypatch.setattr(
+        torch, "rand", lambda size, device=None: torch.full((size,), 0.999, device=device)
+    )
+    # Every randint draw picks its range's top row: practice rows 0..3, exam
+    # rows 4..7. ``s[..., 0]`` carries time*1000 + env*100; the forced age is
+    # the newest row (time 7), so 7700 is exam row 7 and 7300 practice row 3.
+    # The Bernoulli draw at 0.999 picks the exam side only for prob > 0.999.
+    start, _ = buffer.sample_starts(4, 2, exam_rows=4, exam_prob=1.0)
+    torch.testing.assert_close(start["s"][..., 0], torch.full((4,), 7700.0))
+    start, _ = buffer.sample_starts(4, 2, exam_rows=4, exam_prob=0.9)
+    torch.testing.assert_close(start["s"][..., 0], torch.full((4,), 7300.0))
+    # No exam split keeps the uniform draw over all rows.
+    start, _ = buffer.sample_starts(4, 2)
+    torch.testing.assert_close(start["s"][..., 0], torch.full((4,), 7700.0))
+
+    with pytest.raises(ValueError, match="exam_rows must be in"):
+        buffer.sample_starts(4, 2, exam_rows=9, exam_prob=0.5)
+    with pytest.raises(ValueError, match="exam_prob must be in"):
+        buffer.sample_starts(4, 2, exam_rows=4, exam_prob=1.5)

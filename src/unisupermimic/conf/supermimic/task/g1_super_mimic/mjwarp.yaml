@@ -10,3 +10,21 @@ training:
 env:
   mjwarp_nconmax: 128
   mjwarp_njmax: 500
+  # Single public switch since unilab 1.6.0rc1 (#2617): enabling it implies
+  # the whole fixed-shape chain — masked autoreset, persistent step buffers,
+  # deferred finite validation, and reset-segment CUDA graph capture.
+  # RNG note: the reset lifecycle runs every step, so full-width samplers
+  # draw RNG on steps without a done row and same-seed trajectories differ
+  # from the selected-row lifecycle; deterministic evaluation overrides this
+  # back to false.
+  #
+  # History: graph replay poisoned learning at training scale on unilab
+  # 1.5.11 (8k-iter BONES-SEED run crashed at 6061 with non-finite wm_loss;
+  # ep_len stuck at ~21 from iter ~150 vs 108 with the graph off), because
+  # read-plan packet body tensors were reallocated on every refresh and
+  # captured reads fetched reclaimed storage. unilab 1.6.0rc1 fixes both
+  # halves upstream: body-state packets keep fixed tensor storage (#2642)
+  # and public step outputs are cloned caller-owned from the working
+  # carriers (#2640). Re-enabled on top of the task-side fixed-address
+  # publication carriers (env.py).
+  autoreset_cuda_graph: true
