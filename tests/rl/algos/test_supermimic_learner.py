@@ -672,10 +672,30 @@ def test_early_nonfinite_world_model_batch_cannot_be_masked_by_later_batches(tmp
         return torch.tensor(float("nan") if calls == 1 else 0.0), torch.zeros(())
 
     learner.wm_update = wm_update
+    # The verdicts stay on the device until the fail-fast check after the policy update,
+    # so the remaining batches of the iteration do run; the AND keeps the first one's.
     with pytest.raises(FloatingPointError, match="non-finite wm_loss"):
         learner.train()
-    assert calls == 1
+    assert calls == 2
     assert not (tmp_path / "ckpt_000001.pt").exists()
+    assert not (tmp_path / "last.pt").exists()
+
+
+def test_nonfinite_world_model_error_is_reported_after_the_policy_update(tmp_path) -> None:
+    learner = SuperMimicLearner(FakeEnv(), _config(), tmp_path)
+    learner.wm_update = lambda: (torch.zeros(()), torch.tensor(float("inf")))
+    updates = 0
+    policy_update = learner.policy_update
+
+    def counting_update():
+        nonlocal updates
+        updates += 1
+        return policy_update()
+
+    learner.policy_update = counting_update
+    with pytest.raises(FloatingPointError, match="non-finite wm_err8"):
+        learner.train()
+    assert updates == 1
     assert not (tmp_path / "last.pt").exists()
 
 
@@ -777,9 +797,7 @@ def test_exam_starts_flow_into_valid_start_sampling(tmp_path) -> None:
 
 
 def test_exam_survival_is_logged_to_tensorboard(tmp_path) -> None:
-    learner = SuperMimicLearner(
-        ExamFakeEnv(), _exam_config(log_backend="tensorboard"), tmp_path
-    )
+    learner = SuperMimicLearner(ExamFakeEnv(), _exam_config(log_backend="tensorboard"), tmp_path)
     learner.train()
 
     event_files = list(tmp_path.glob("events.out.tfevents.*"))
