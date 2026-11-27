@@ -156,6 +156,38 @@ def _empty_stats() -> dict[str, list[torch.Tensor]]:
     return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": [], "exam_surv": []}
 
 
+@dataclass
+class _PendingIteration:
+    """One iteration of ``train`` whose metrics have not been read on the host yet.
+
+    ``train`` reads them after the *next* iteration's collect has been issued, so everything
+    that collect would move past this iteration (the collect statistics) is fixed here.
+    """
+
+    iteration: int
+    started: float
+    collect_steps: int
+    sim_steps: int
+    learning_rate: float
+    collect_time: float
+    learn_time: float
+    exam_fail_ema: float | None
+    wm_loss: torch.Tensor
+    wm_error: torch.Tensor
+    wm_finite: torch.Tensor
+    pi_loss: torch.Tensor
+    v_loss: torch.Tensor
+    imag_rew: torch.Tensor
+    grad_norm: torch.Tensor
+    survival: torch.Tensor
+    # Device-side statistics: the period's sums, read back when this iteration closes a log
+    # period, else ``None``. Synced statistics: the period-to-date lists, and where in the
+    # reward list this iteration's own steps start.
+    period: dict[str, float] | None
+    stats: dict[str, list[torch.Tensor]] | None
+    stats_mark: int
+
+
 # Slots of the device-side statistics vector (``cfg.stats_on_device``): running
 # float64 sums over the collect steps of the current log period.
 _DEV_STAT_FIELDS = (
@@ -342,6 +374,9 @@ class SuperMimicLearner:
                 self.device
             )
         self.pi_avg = None
+        # Calls made so far to ``_update_ema``; torch's own counter lives on the device and
+        # reading it would synchronize (see ``_update_ema``).
+        self._ema_updates = 0
         if cfg.pi_ema > 0:
             # Polyak average of the policy weights; checkpoints and evaluation use it while the
             # raw ``self.pi`` keeps being trained. Buffers (running normalizers) are averaged too.
@@ -982,7 +1017,7 @@ class SuperMimicLearner:
             elif torch.isfinite(grad_norm):
                 self.opt_pi.step()
             if self.pi_avg is not None:
-                self.pi_avg.update_parameters(self.pi)
+                self._update_ema()
         finally:
             _set_requires_grad(self.wm, True)
             _set_requires_grad(self.critic, True)
@@ -1068,6 +1103,37 @@ class SuperMimicLearner:
             grad_norm.detach(),
             survival.mean().detach(),
         )
+
+    @torch.no_grad()
+    def _update_ema(self) -> None:
+        """Advance the EMA of the policy by one call.
+
+        The update of ``AveragedModel.update_parameters`` with ``use_buffers=True``: the first
+        call copies the live weights and buffers, every later call moves each floating-point
+        tensor towards the live one by ``1 - pi_ema``. torch's version decides between the two
+        by reading its ``n_averaged`` counter, which lives on the device, twice per call; that
+        drains the GPU queue at the end of every iteration. The call count is kept on the host
+        here and the math is unchanged.
+        """
+        assert self.pi_avg is not None
+        averaged = self.pi_avg.module
+        targets = list(averaged.parameters()) + list(averaged.buffers())
+        sources = list(self.pi.parameters()) + list(self.pi.buffers())
+        if self._ema_updates == 0:
+            torch._foreach_copy_(targets, sources)
+        else:
+            decay = self.cfg.pi_ema
+            numeric = [t.is_floating_point() or t.is_complex() for t in targets]
+            torch._foreach_lerp_(
+                [t for t, keep in zip(targets, numeric, strict=True) if keep],
+                [s for s, keep in zip(sources, numeric, strict=True) if keep],
+                1.0 - decay,
+            )
+            for target, source, keep in zip(targets, sources, numeric, strict=True):
+                if not keep:
+                    target.copy_(target * decay + source * (1.0 - decay))
+        self._ema_updates += 1
+        self.pi_avg.n_averaged += 1
 
     def _sync_critic_lr(self) -> None:
         """Push the param group's learning rate into the device tensor the graph reads.
@@ -1416,14 +1482,165 @@ class SuperMimicLearner:
                     key: [] for key in ("wm", "wm8", "pi", "v", "ir", "gn", "surv")
                 }
                 last_metrics: dict[str, float | int] = {}
-                # Collect statistics handed to the logger; ``period`` is the closing
-                # log period's row when this iteration writes one (device-side path).
+                finished_at: float | None = None
+
+                def finish(pending: _PendingIteration) -> None:
+                    """Read an iteration's metrics on the host, then check, log and record it."""
+                    nonlocal aggregate, last_metrics, log_start, finished_at
+                    # Fail fast on divergence instead of checkpointing a diverged model.
+                    # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
+                    # handles a non-finite gradient by zeroing it and stepping, so a non-finite
+                    # gradient is not a divergence signal on its own.
+                    for name, finite in zip(
+                        ("wm_loss", "wm_err8"), pending.wm_finite.tolist(), strict=True
+                    ):
+                        if not finite:
+                            raise FloatingPointError(
+                                f"non-finite {name} at iteration {pending.iteration}"
+                            )
+                    for name, metric in (
+                        ("pi_loss", pending.pi_loss),
+                        ("v_loss", pending.v_loss),
+                        ("imag_rew", pending.imag_rew),
+                    ):
+                        if not torch.isfinite(metric).all():
+                            raise FloatingPointError(
+                                f"non-finite {name} at iteration {pending.iteration}"
+                            )
+                    aggregate["wm"].append(pending.wm_loss)
+                    aggregate["wm8"].append(pending.wm_error)
+                    aggregate["pi"].append(pending.pi_loss)
+                    aggregate["v"].append(pending.v_loss)
+                    aggregate["ir"].append(pending.imag_rew)
+                    aggregate["gn"].append(pending.grad_norm)
+                    aggregate["surv"].append(pending.survival)
+                    now = time.time()
+                    self.wall_time = now - train_start
+                    # The host gets here once per iteration, after the reads above have waited
+                    # for the GPU: the gap to the previous visit is the wall time of one
+                    # iteration (the first one is measured from its own start).
+                    iteration_time = now - (
+                        finished_at if finished_at is not None else pending.started
+                    )
+                    finished_at = now
+
+                    # Collect statistics handed to the logger; ``period`` is the closing
+                    # log period's row when this iteration writes one (device-side path).
+                    period: dict[str, float] | None
+                    mean_reward: float | None
+                    ep_len: float | None
+                    ep_ret_norm: float | None
+                    term_frac: float | None
+                    exam_survival: float | None
+                    if self._dev_stats is not None:
+                        # The collect statistics were read back once, before the next collect
+                        # was issued (see the loop below); one point per log period.
+                        period = pending.period
+                        if period is None:
+                            mean_reward = ep_len = ep_ret_norm = None
+                            term_frac = exam_survival = None
+                        else:
+                            mean_reward = period["sim_rew"]
+                            ep_len = period["ep_len"]
+                            ep_ret_norm = period["ep_ret_norm"]
+                            term_frac = period["term_frac"]
+                            exam_survival = period.get("exam_survival")
+                    else:
+                        assert pending.stats is not None
+                        iter_rewards = pending.stats["r"][pending.stats_mark :]
+                        mean_reward = self._mean(iter_rewards) if iter_rewards else None
+                        ep_len = (
+                            self._mean(pending.stats["ep_len"]) if pending.stats["ep_len"] else None
+                        )
+                        ep_ret_norm = (
+                            self._mean(pending.stats["ep_ret"]) if pending.stats["ep_ret"] else None
+                        )
+                        total_done = sum(float(value) for value in pending.stats["done"])
+                        term_frac = (
+                            sum(float(value) for value in pending.stats["term"]) / total_done
+                            if total_done > 0
+                            else None
+                        )
+                        exam_survival = (
+                            self._mean(pending.stats["exam_surv"])
+                            if pending.stats["exam_surv"]
+                            else None
+                        )
+                    logger.log_step(
+                        pending.iteration,
+                        wm_loss=float(pending.wm_loss),
+                        wm_err8=float(pending.wm_error),
+                        pi_loss=float(pending.pi_loss),
+                        v_loss=float(pending.v_loss),
+                        imag_rew=float(pending.imag_rew),
+                        imag_survival=float(pending.survival),
+                        pi_gradnorm=float(pending.grad_norm),
+                        lr=pending.learning_rate,
+                        sim_rew=mean_reward,
+                        ep_len=ep_len,
+                        ep_ret_norm=ep_ret_norm,
+                        term_frac=term_frac,
+                        exam_survival=exam_survival,
+                        exam_fail_ema=pending.exam_fail_ema,
+                        iter_sim_steps=pending.collect_steps * self.env.num_envs,
+                        collect_time=pending.collect_time,
+                        learn_time=pending.learn_time,
+                        iteration_time=iteration_time,
+                    )
+
+                    if pending.iteration % self.cfg.log_every == 0:
+                        iterations_per_second = self.cfg.log_every / (now - log_start)
+                        log_start = now
+                        stats = pending.stats
+                        if self._dev_stats is not None:
+                            # Device-side statistics: already read back once for this row.
+                            assert period is not None
+                            collect_row = (
+                                period["sim_rew"],
+                                period["ep_len"],
+                                period["ep_ret_norm"],
+                                period["term_frac"],
+                            )
+                        else:
+                            assert stats is not None
+                            collect_row = (
+                                self._mean(stats["r"]),
+                                self._mean(stats["ep_len"]),
+                                self._mean(stats["ep_ret"]),
+                                float(
+                                    sum(float(value) for value in stats["term"])
+                                    / max(sum(float(value) for value in stats["done"]), 1)
+                                ),
+                            )
+                        row = [
+                            pending.iteration,
+                            self.wall_time / 3600,
+                            pending.sim_steps,
+                            self._mean(aggregate["wm"]),
+                            self._mean(aggregate["wm8"]),
+                            self._mean(aggregate["pi"]),
+                            self._mean(aggregate["v"]),
+                            self._mean(aggregate["ir"]),
+                            self._mean(aggregate["gn"]),
+                            self._mean(aggregate["surv"]),
+                            *collect_row,
+                            iterations_per_second,
+                            pending.learning_rate,
+                        ]
+                        log_file.write(
+                            ",".join(
+                                f"{value:.6g}" if isinstance(value, float) else str(value)
+                                for value in row
+                            )
+                            + "\n"
+                        )
+                        log_file.flush()
+                        last_metrics = dict(zip(_LOG_FIELDS, row, strict=True))
+                        aggregate = {key: [] for key in aggregate}
+
+                pending: _PendingIteration | None = None
                 period: dict[str, float] | None
-                mean_reward: float | None
-                ep_len: float | None
-                ep_ret_norm: float | None
-                term_frac: float | None
-                exam_survival: float | None
+                stats: dict[str, list[torch.Tensor]] | None
                 for iteration in range(start_iteration, self.cfg.iterations):
                     if self.cfg.compile and iteration == start_iteration:
                         logger.log_status("Compiling world model (one-off, slow on first run)")
@@ -1444,177 +1661,86 @@ class SuperMimicLearner:
                     step_accumulator -= collect_steps
                     stats_mark = len(self.stats["r"])
                     self.collect(collect_steps)
+                    if pending is not None:
+                        # The first host read of the previous iteration. Its train phase and
+                        # this collect were issued without waiting, so the GPU had queued work
+                        # the whole time the host spent in ``collect``. Reading right after
+                        # ``policy_update`` instead drained the queue there, and the GPU then
+                        # sat idle through the eager part of the next env step.
+                        finish(pending)
+                        pending = None
                     train_phase_start = time.time()
                     wm_loss = torch.zeros((), device=self.device)
                     wm_error = torch.zeros((), device=self.device)
                     # The finite verdicts stay on the device: reading each batch's metrics
                     # here would drain the GPU queue after every batch and leave the GPU
-                    # waiting for the host. The first host read is the fail-fast check after
-                    # the policy update, which syncs anyway. A non-finite batch cannot be
-                    # masked by a later finite one, because the flags are only ever cleared.
+                    # waiting for the host. The first host read is the fail-fast check in
+                    # ``finish``. A non-finite batch cannot be masked by a later finite one,
+                    # because the flags are only ever cleared.
                     wm_finite = torch.ones(2, dtype=torch.bool, device=self.device)
                     for _ in range(self.cfg.wm_batches):
                         wm_loss, wm_error = self.wm_update()
                         wm_finite &= torch.isfinite(torch.stack((wm_loss, wm_error)))
-                    aggregate["wm"].append(wm_loss)
-                    aggregate["wm8"].append(wm_error)
-                    pi_loss: float | None = None
-                    v_loss: float | None = None
-                    imag_rew: float | None = None
-                    pi_gradnorm: float | None = None
-                    imag_survival: float | None = None
                     policy_loss, value_loss, imagined_reward, grad_norm, survival = (
                         self.policy_update()
                     )
-                    # Fail fast on divergence instead of checkpointing a diverged model.
-                    # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
-                    # handles a non-finite gradient by zeroing it and stepping, so a non-finite
-                    # gradient is not a divergence signal on its own.
-                    for name, finite in zip(
-                        ("wm_loss", "wm_err8"), wm_finite.tolist(), strict=True
-                    ):
-                        if not finite:
-                            raise FloatingPointError(
-                                f"non-finite {name} at iteration {iteration + 1}"
-                            )
-                    for name, metric in (
-                        ("pi_loss", policy_loss),
-                        ("v_loss", value_loss),
-                        ("imag_rew", imagined_reward),
-                    ):
-                        if not torch.isfinite(metric).all():
-                            raise FloatingPointError(
-                                f"non-finite {name} at iteration {iteration + 1}"
-                            )
-                    aggregate["pi"].append(policy_loss)
-                    aggregate["v"].append(value_loss)
-                    aggregate["ir"].append(imagined_reward)
-                    aggregate["gn"].append(grad_norm)
-                    aggregate["surv"].append(survival)
-                    pi_loss = float(policy_loss)
-                    v_loss = float(value_loss)
-                    imag_rew = float(imagined_reward)
-                    pi_gradnorm = float(grad_norm)
-                    imag_survival = float(survival)
-                    train_time = time.time() - train_phase_start
                     self.iteration = iteration + 1
-                    self.wall_time = time.time() - train_start
-                    iteration_time = time.time() - iteration_start
-
+                    # Nothing below reads the device. The statistics that the next collect
+                    # would move past this iteration are fixed here instead.
                     period = None
+                    stats = None
                     if self._dev_stats is not None:
-                        # Nothing is read per iteration: the collect statistics are
-                        # read back once, here, when the log period closes, and the
-                        # collect tags are logged at that iteration with the period's
-                        # value (one point per log period instead of per iteration).
+                        # Nothing is read per iteration: the collect statistics are read back
+                        # once, here, when the log period closes, and the collect tags are
+                        # logged at that iteration with the period's value (one point per log
+                        # period instead of per iteration).
                         if self.iteration % self.cfg.log_every == 0:
                             period = self._read_dev_stats()
-                        if period is None:
-                            mean_reward = ep_len = ep_ret_norm = None
-                            term_frac = exam_survival = None
-                        else:
-                            mean_reward = period["sim_rew"]
-                            ep_len = period["ep_len"]
-                            ep_ret_norm = period["ep_ret_norm"]
-                            term_frac = period["term_frac"]
-                            exam_survival = period.get("exam_survival")
                     else:
-                        iter_rewards = self.stats["r"][stats_mark:]
-                        mean_reward = self._mean(iter_rewards) if iter_rewards else None
-                        ep_len = self._mean(self.stats["ep_len"]) if self.stats["ep_len"] else None
-                        ep_ret_norm = (
-                            self._mean(self.stats["ep_ret"]) if self.stats["ep_ret"] else None
-                        )
-                        total_done = sum(float(value) for value in self.stats["done"])
-                        term_frac = (
-                            sum(float(value) for value in self.stats["term"]) / total_done
-                            if total_done > 0
-                            else None
-                        )
-                        exam_survival = (
-                            self._mean(self.stats["exam_surv"]) if self.stats["exam_surv"] else None
-                        )
-                    logger.log_step(
-                        self.iteration,
-                        wm_loss=float(wm_loss),
-                        wm_err8=float(wm_error),
-                        pi_loss=pi_loss,
-                        v_loss=v_loss,
-                        imag_rew=imag_rew,
-                        imag_survival=imag_survival,
-                        pi_gradnorm=pi_gradnorm,
-                        lr=learning_rate,
-                        sim_rew=mean_reward,
-                        ep_len=ep_len,
-                        ep_ret_norm=ep_ret_norm,
-                        term_frac=term_frac,
-                        exam_survival=exam_survival,
-                        exam_fail_ema=self._exam_fail_ema,
-                        iter_sim_steps=collect_steps * self.env.num_envs,
+                        # Period-to-date copy: ``collect`` keeps appending to ``self.stats``.
+                        # A log period ends here, so the next one starts from an empty dict.
+                        stats = {key: list(values) for key, values in self.stats.items()}
+                        if self.iteration % self.cfg.log_every == 0:
+                            self.stats = _empty_stats()
+                    pending = _PendingIteration(
+                        iteration=self.iteration,
+                        started=iteration_start,
+                        collect_steps=collect_steps,
+                        sim_steps=self.sim_steps,
+                        learning_rate=learning_rate,
                         collect_time=train_phase_start - iteration_start,
-                        learn_time=train_time,
-                        iteration_time=iteration_time,
+                        learn_time=time.time() - train_phase_start,
+                        exam_fail_ema=self._exam_fail_ema,
+                        wm_loss=wm_loss,
+                        wm_error=wm_error,
+                        wm_finite=wm_finite,
+                        pi_loss=policy_loss,
+                        v_loss=value_loss,
+                        imag_rew=imagined_reward,
+                        grad_norm=grad_norm,
+                        survival=survival,
+                        period=period,
+                        stats=stats,
+                        stats_mark=stats_mark,
                     )
-
-                    if self.iteration % self.cfg.log_every == 0:
-                        iterations_per_second = self.cfg.log_every / (time.time() - log_start)
-                        log_start = time.time()
-                        if period is not None:
-                            # Device-side statistics: already read back once for this row.
-                            collect_row = (
-                                period["sim_rew"],
-                                period["ep_len"],
-                                period["ep_ret_norm"],
-                                period["term_frac"],
-                            )
-                        else:
-                            collect_row = (
-                                self._mean(self.stats["r"]),
-                                self._mean(self.stats["ep_len"]),
-                                self._mean(self.stats["ep_ret"]),
-                                float(
-                                    sum(float(value) for value in self.stats["term"])
-                                    / max(sum(float(value) for value in self.stats["done"]), 1)
-                                ),
-                            )
-                        row = [
-                            self.iteration,
-                            self.wall_time / 3600,
-                            self.sim_steps,
-                            self._mean(aggregate["wm"]),
-                            self._mean(aggregate["wm8"]),
-                            self._mean(aggregate["pi"]),
-                            self._mean(aggregate["v"]),
-                            self._mean(aggregate["ir"]),
-                            self._mean(aggregate["gn"]),
-                            self._mean(aggregate["surv"]),
-                            *collect_row,
-                            iterations_per_second,
-                            learning_rate,
-                        ]
-                        log_file.write(
-                            ",".join(
-                                f"{value:.6g}" if isinstance(value, float) else str(value)
-                                for value in row
-                            )
-                            + "\n"
-                        )
-                        log_file.flush()
-                        last_metrics = dict(zip(_LOG_FIELDS, row, strict=True))
-                        self.stats = _empty_stats()
-                        aggregate = {key: [] for key in aggregate}
-
                     if (
                         self.iteration % self.cfg.ckpt_every == 0
                         or self.iteration == self.cfg.iterations
                     ):
-                        self.wall_time = time.time() - train_start
+                        # A checkpoint holds exactly this iteration's state and is never
+                        # written for a diverged one: check the metrics now, before the next
+                        # collect moves the normalizers, then save.
+                        finish(pending)
+                        pending = None
                         self.save()
                         numbered = self.save(
                             self.log_dir / f"ckpt_{self.iteration:06d}.pt",
                             include_optimizers=False,
                         )
                         logger.log_save(str(numbered))
+
+                if pending is not None:
+                    finish(pending)
 
             self.wall_time = time.time() - train_start
             logger.finish()
