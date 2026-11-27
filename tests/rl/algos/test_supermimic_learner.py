@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import csv
+import warnings
 from dataclasses import dataclass, replace
 
 import pytest
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
 from unisupermimic.rl.algos.supermimic.optim import MuonAdam
@@ -451,6 +453,44 @@ def test_ema_policy_averages_weights(tmp_path) -> None:
         torch.testing.assert_close(learner.pi_avg.module.state_dict()[name], expected)
 
 
+def test_ema_update_matches_torch_averaged_model_without_host_reads(tmp_path) -> None:
+    decay = 0.995
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    learner = SuperMimicLearner(
+        FakeEnv(), replace(_config(), pi_ema=decay), tmp_path, device=device
+    )
+    # The torch implementation this replaces, driven on the same live policy.
+    reference = AveragedModel(
+        learner.pi, multi_avg_fn=get_ema_multi_avg_fn(decay), use_buffers=True
+    )
+    for _ in range(3):
+        learner.collect(2)
+        learner.policy_update()
+        reference.update_parameters(learner.pi)
+
+    actual = learner.pi_avg.module.state_dict()
+    expected = reference.module.state_dict()
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    assert learner.pi_avg.n_averaged.item() == reference.n_averaged.item() == 3
+
+    if device == "cuda":
+        # torch's version reads its device-side counter on the host twice per call; the
+        # replacement issues its kernels without a synchronizing operation.
+        torch.cuda.synchronize()
+        with warnings.catch_warnings():
+            # The mode is a prototype; its warning is not what this test is about.
+            warnings.simplefilter("ignore", UserWarning)
+            torch.cuda.set_sync_debug_mode(2)  # any synchronizing CUDA operation raises
+            try:
+                learner._update_ema()
+                with pytest.raises(RuntimeError, match="synchronizing"):
+                    reference.update_parameters(learner.pi)
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+
+
 def test_ema_policy_checkpoint_and_resume(tmp_path) -> None:
     cfg = replace(_config(), pi_ema=0.995)
     learner = SuperMimicLearner(FakeEnv(), cfg, tmp_path)
@@ -672,8 +712,9 @@ def test_early_nonfinite_world_model_batch_cannot_be_masked_by_later_batches(tmp
         return torch.tensor(float("nan") if calls == 1 else 0.0), torch.zeros(())
 
     learner.wm_update = wm_update
-    # The verdicts stay on the device until the fail-fast check after the policy update,
-    # so the remaining batches of the iteration do run; the AND keeps the first one's.
+    # The verdicts stay on the device until ``train`` reads them (right away here: the only
+    # iteration writes a checkpoint), so the remaining batches of the iteration do run; the
+    # AND keeps the first one's.
     with pytest.raises(FloatingPointError, match="non-finite wm_loss"):
         learner.train()
     assert calls == 2
@@ -697,6 +738,60 @@ def test_nonfinite_world_model_error_is_reported_after_the_policy_update(tmp_pat
         learner.train()
     assert updates == 1
     assert not (tmp_path / "last.pt").exists()
+
+
+def test_iteration_metrics_are_read_after_the_next_collect_and_before_its_updates(
+    tmp_path,
+) -> None:
+    learner = SuperMimicLearner(
+        FakeEnv(), replace(_config(), iterations=6, ckpt_every=100), tmp_path
+    )
+    events: list[str] = []
+    collect, policy_update = learner.collect, learner.policy_update
+    updates = 0
+
+    def collecting(steps: int) -> None:
+        collect(steps)
+        events.append("collect")
+
+    def updating() -> tuple[torch.Tensor, ...]:
+        nonlocal updates
+        updates += 1
+        events.append("update")
+        metrics = policy_update()
+        if updates == 3:
+            return (torch.tensor(float("nan")), *metrics[1:])
+        return metrics
+
+    learner.collect, learner.policy_update = collecting, updating
+    with pytest.raises(FloatingPointError, match="non-finite pi_loss at iteration 3"):
+        learner.train()
+
+    # The third iteration's verdict was read once the fourth iteration's collect had been
+    # issued, and before any further update: no update runs on a diverged model.
+    assert updates == 3
+    assert events[-2:] == ["update", "collect"]
+    assert events.count("collect") == 5  # the buffer warm-up and four iterations
+    assert not (tmp_path / "last.pt").exists()
+
+
+def test_deferred_iteration_reads_log_the_same_rows_as_immediate_ones(tmp_path) -> None:
+    def table(name: str, ckpt_every: int) -> list[list[str]]:
+        config = replace(_config(), iterations=6, log_every=2, ckpt_every=ckpt_every, pi_ema=0.995)
+        SuperMimicLearner(FakeEnv(), config, tmp_path / name).train()
+        with (tmp_path / name / "train_log.csv").open(encoding="utf-8", newline="") as stream:
+            return list(csv.reader(stream))
+
+    # A checkpoint iteration reads its metrics right away, so with a checkpoint every
+    # iteration nothing is deferred: the deferred log must match it column for column.
+    deferred, immediate = table("deferred", 100), table("immediate", 1)
+    assert deferred[0] == immediate[0]
+    assert [row[0] for row in deferred[1:]] == [row[0] for row in immediate[1:]] == ["2", "4", "6"]
+    volatile = [deferred[0].index("wall_h"), deferred[0].index("it_per_s")]
+    for deferred_row, immediate_row in zip(deferred[1:], immediate[1:], strict=True):
+        assert [c for i, c in enumerate(deferred_row) if i not in volatile] == [
+            c for i, c in enumerate(immediate_row) if i not in volatile
+        ]
 
 
 def test_exam_default_config_keeps_exams_fully_off(tmp_path) -> None:
