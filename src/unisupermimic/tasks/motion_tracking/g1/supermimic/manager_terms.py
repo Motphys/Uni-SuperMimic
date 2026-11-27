@@ -20,7 +20,7 @@ from unilab.managers import (
     ManagerTermBase,
     SceneEntityCfg,
 )
-from unisim.dr.types import RESET_TERM_BODY_IPOS, RESET_TERM_GEOM_FRICTION
+from unisim.dr.types import RESET_TERM_GEOM_FRICTION
 
 from unisupermimic.rl.algos.supermimic.geometry import (
     flatten_state,
@@ -390,10 +390,9 @@ class SuperMimicCommand(CommandTerm):
         # a value no-op.
         self.exam_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
         self._num_clips = int(self.motion.clip_start.numel())
-        self._exam_clip_cursor = (
-            torch.arange(self.num_envs, dtype=torch.int64, device=device)
-            % max(self._num_clips, 1)
-        )
+        self._exam_clip_cursor = torch.arange(
+            self.num_envs, dtype=torch.int64, device=device
+        ) % max(self._num_clips, 1)
         # exams-v2 margin mode (learner-configured through
         # ``configure_exam_margin``; default off keeps the round-robin exam
         # behavior above bit-identical). The failure statistics and the exam
@@ -1018,16 +1017,25 @@ def supermimic_clip_end(env: ManagerBasedRlEnv, command_name: str = "motion") ->
 
 
 class SuperMimicContextEvent(ManagerTermBase):
-    """Sample startup friction/CoM or replay those values on later resets."""
+    """Sample the startup friction/CoM; later resets replay only the friction.
+
+    The torso CoM offset is a per-world constant. The startup term records it, which also
+    promotes it into the reset baseline: a reset that does not stage ``body_ipos`` leaves it
+    in place. So no reset writes it again. Writing it again would store the same values and
+    only make the backend recompute the derived inertia constants with ``set_const`` for
+    *every* world (one Cholesky solve per DOF and per body): on every step of a training
+    run with masked autoreset, and on every evaluation step that recycles clips, which cost
+    more than the physics step itself.
+    """
 
     uses_startup_rows = True
 
-    # The backend reset restores default model fields on reset rows, so the
-    # replay is required. Under a ResetSelection the row-index write facades
-    # cannot be used (they need host row indices), so the fixed-shape path
-    # stages full-width final tables through the packed transaction's public
-    # mask-based writer instead. Unilab 1.5.11 exposes that writer only on the
-    # transaction object, so backend column IDs are captured here once.
+    # On row-indexed resets the friction is written back explicitly. Under a
+    # ResetSelection the row-index write facades cannot be used (they need host
+    # row indices), so the fixed-shape path stages full-width final tables
+    # through the packed transaction's public mask-based writer instead. Unilab
+    # 1.5.11 exposes that writer only on the transaction object, so backend
+    # column IDs are captured here once.
     supports_reset_selection: ClassVar[bool] = True
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -1082,13 +1090,11 @@ class SuperMimicContextEvent(ManagerTermBase):
         # never stages a host-to-device copy.
         self._backend_geom_ids: np.ndarray | None = None
         self._backend_geom_ids_ready = False
-        self._backend_torso_ids: np.ndarray | None = None
         self._device_friction_defaults = (
             None
             if self._friction_defaults is None
             else self._friction_defaults.to(device=env.device, dtype=torch.float32)
         )
-        self._device_ipos_defaults = self._ipos_defaults.to(device=env.device, dtype=torch.float32)
         self._device_ground_friction_defaults = (
             None
             if self._ground_friction_defaults is None
@@ -1141,17 +1147,11 @@ class SuperMimicContextEvent(ManagerTermBase):
                 env_ids=ids,
                 term_name="supermimic_context",
             )
-        ipos = _selected_defaults(self._ipos_defaults, ids)
-        ipos += command.xi[ids, 30:33].unsqueeze(1)
         if self._startup:
+            # The only write of the CoM offset (see the class docstring).
+            ipos = _selected_defaults(self._ipos_defaults, ids)
+            ipos += command.xi[ids, 30:33].unsqueeze(1)
             self._robot.record_startup_body_ipos_to_sim(
-                ipos,
-                body_ids=self._torso_ids,
-                env_ids=ids,
-                term_name="supermimic_context",
-            )
-        else:
-            self._robot.write_body_ipos_to_sim(
                 ipos,
                 body_ids=self._torso_ids,
                 env_ids=ids,
@@ -1169,7 +1169,7 @@ class SuperMimicContextEvent(ManagerTermBase):
             )
 
     def _replay_fixed_shape(self, env: ManagerBasedRlEnv, selection: ResetSelection) -> None:
-        """Replay the startup friction/CoM through full-width masked staging."""
+        """Replay the startup friction through full-width masked staging."""
         reset_state = getattr(env, "_reset_state", None)
         packed = (
             None
@@ -1193,10 +1193,6 @@ class SuperMimicContextEvent(ManagerTermBase):
                 if self._geom_ids is None
                 else np.asarray(self._robot._geom_ids)[np.asarray(self._geom_ids)]
             )
-            _, _, self._backend_torso_ids = self._robot._bind_body_randomization(
-                self._torso_ids,
-                capability="reset body-ipos write",
-            )
             if self._ground is not None and self._ground_geom_ids is not None:
                 self._ground_backend_geom_ids = np.asarray(self._ground._geom_ids)[
                     np.asarray(self._ground_geom_ids)
@@ -1210,6 +1206,8 @@ class SuperMimicContextEvent(ManagerTermBase):
                 return defaults.unsqueeze(0).expand(env.num_envs, *defaults.shape).clone()
             return defaults[: env.num_envs].clone()
 
+        # Friction only: the torso CoM offset stays what the startup term recorded
+        # (see the class docstring).
         if self._randomize_friction:
             assert self._backend_geom_ids is not None
             friction = full_width(self._device_friction_defaults)
@@ -1217,11 +1215,6 @@ class SuperMimicContextEvent(ManagerTermBase):
             packed.write_model_field_mask(
                 RESET_TERM_GEOM_FRICTION, reset_mask, friction, columns=self._backend_geom_ids
             )
-        ipos = full_width(self._device_ipos_defaults)
-        ipos += command.xi[:, 30:33].unsqueeze(1)
-        packed.write_model_field_mask(
-            RESET_TERM_BODY_IPOS, reset_mask, ipos, columns=self._backend_torso_ids
-        )
         if self._ground is not None:
             assert self._ground_backend_geom_ids is not None
             ground_friction = full_width(self._device_ground_friction_defaults)
