@@ -102,9 +102,7 @@ def _runtime_cfg(
         config_dir=str(root / "src" / "unisupermimic" / "conf" / "supermimic"), version_base="1.3"
     ):
         owner = compose("config", overrides=[f"task=g1_super_mimic/{backend}"])
-    override = EnvConfigAdapter(
-        owner, root_dir=root
-    ).build_task_env_cfg_override()
+    override = EnvConfigAdapter(owner, root_dir=root).build_task_env_cfg_override()
     cfg = registry.materialize_env_config("G1SuperMimic")
     assert isinstance(cfg, ManagerBasedRlEnvCfg)
     apply_cfg_overrides(cfg, override)
@@ -760,10 +758,9 @@ def test_context_events_share_command_xi_and_replay_startup_values() -> None:
     torch.testing.assert_close(
         entity.friction_writes[-1][..., 0], command.xi[[0, 2], :1].expand(-1, 2)
     )
-    torch.testing.assert_close(
-        entity.reset_ipos_writes[-1][:, 0],
-        torch.tensor([0.01, 0.02, 0.03]) + command.xi[[0, 2], 30:33],
-    )
+    # The CoM offset is written once, at startup; a reset never stages it again.
+    assert len(entity.startup_ipos_writes) == 1
+    assert entity.reset_ipos_writes == []
 
 
 def test_context_events_can_keep_default_friction(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -791,9 +788,57 @@ def test_context_events_can_keep_default_friction(monkeypatch: pytest.MonkeyPatc
     assert entity.friction_writes == []
     torch.testing.assert_close(command.xi[:, 30:33], sampled[:, 30:33])
     torch.testing.assert_close(
-        entity.reset_ipos_writes[-1][:, 0],
-        torch.tensor([0.01, 0.02, 0.03]) + command.xi[[0, 2], 30:33],
+        entity.startup_ipos_writes[-1][:, 0],
+        torch.tensor([0.01, 0.02, 0.03]) + command.xi[:, 30:33],
     )
+    assert entity.reset_ipos_writes == []
+
+
+def test_fixed_shape_context_replay_stages_friction_only() -> None:
+    """Masked resets replay the friction and never re-stage the CoM offset.
+
+    The CoM offset is a per-world constant that the startup term recorded, which also made
+    it the reset baseline. Re-staging it would write the same values and only make the
+    backend recompute the derived inertia constants for every world on every step.
+    """
+    from unilab.base.reset_selection import ResetSelection
+    from unisim.dr.types import RESET_TERM_GEOM_FRICTION
+
+    command = _command_with_context(3, eval_mode=False)
+    command.xi.zero_()
+    entity = _ContextEntity()
+    entity._geom_ids = np.array([10, 11, 12])  # backend ids; geoms 0 and 1 are ours
+    env = _context_env(command, entity, 3)
+    startup = SuperMimicContextEvent(_context_event("startup"), env)
+    reset = SuperMimicContextEvent(_context_event("reset"), env)
+    startup(env, None)
+    staged: list[tuple[str, torch.Tensor, torch.Tensor, object]] = []
+
+    class Packed:
+        def write_model_field_mask(
+            self,
+            field: str,
+            reset_mask: torch.Tensor,
+            values: torch.Tensor,
+            *,
+            columns: object = None,
+        ) -> None:
+            staged.append((field, reset_mask.clone(), values.clone(), columns))
+
+    selection = ResetSelection.allocate(3, torch.device("cpu"))
+    selection.mask[:] = torch.tensor([True, False, True])
+    env._reset_state = SimpleNamespace(_require_packed_transaction=lambda: Packed())
+    env.event_term_mask_buffer = SimpleNamespace(scatter=lambda selected: selected.mask)
+
+    reset(env, selection)
+
+    assert [field for field, *_ in staged] == [RESET_TERM_GEOM_FRICTION]
+    field, mask, friction, columns = staged[0]
+    assert mask.tolist() == [True, False, True]
+    assert columns.tolist() == [10, 11]
+    assert friction.shape == (3, 2, 3)
+    torch.testing.assert_close(friction[..., 0], command.xi[:, :1].expand(-1, 2))
+    torch.testing.assert_close(friction[..., 1:], torch.zeros(3, 2, 2), rtol=0, atol=0)
 
 
 def test_eval_context_events_set_unit_friction_and_zero_offsets() -> None:
@@ -1100,12 +1145,12 @@ def test_mjwarp_masked_autoreset_steps_without_host_sync(tmp_path: Path) -> None
 
 @pytest.mark.slow
 def test_mjwarp_masked_autoreset_restores_context_dr(tmp_path: Path) -> None:
-    """Fixed-shape resets re-stage the startup friction/CoM context.
+    """Fixed-shape resets keep the startup friction/CoM context in the simulation.
 
-    The backend reset restores default model fields on reset rows, so the
-    masked path must replay xi-derived friction/CoM through full-width
-    masked staging; otherwise the privileged-context observation would lie
-    about the simulated robot. This is the canary for that staging path.
+    The friction is re-staged through full-width masked staging. The CoM offset is not: it
+    is the reset baseline the startup term promoted, so the masked reset has to leave it in
+    place. Otherwise the privileged-context observation would lie about the simulated
+    robot. This is the canary for both.
     """
     _require_backend_runtime("mjwarp")
     import warp
@@ -1132,6 +1177,59 @@ def test_mjwarp_masked_autoreset_restores_context_dr(tmp_path: Path) -> None:
         torch.testing.assert_close(
             friction[:, robot_ids, 0],
             command.xi[:, :1].expand(-1, robot_ids.size),
+            rtol=0,
+            atol=1e-6,
+        )
+        torso = env.backend.get_body_id("torso_link")
+        np.testing.assert_allclose(
+            env.backend.get_body_ipos(env_ids=np.arange(env.num_envs))[:, torso],
+            env.backend.get_body_ipos()[torso] + command.xi[:, 30:33].cpu().numpy(),
+            rtol=0,
+            atol=1e-6,
+        )
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_mjwarp_row_resets_keep_context_dr(tmp_path: Path) -> None:
+    """Row-indexed autoresets keep the startup friction/CoM context without restaging the CoM.
+
+    The eager reset path re-writes the friction only; the CoM offset has to stay what the
+    startup term recorded, because a reset no longer writes it (that write made the backend
+    recompute the derived inertia constants for every world on every reset).
+    """
+    _require_backend_runtime("mjwarp")
+    import warp
+
+    env = make_supermimic_env(
+        _runtime_cfg(tmp_path, masked=False), num_envs=8, backend_type="mjwarp"
+    )
+    try:
+        env.seed(5)
+        env.reset_to_frames(torch.arange(8, dtype=torch.int64, device=env.device))
+        generator = torch.Generator(device=env.device).manual_seed(2)
+        done = 0
+        for _ in range(80):
+            action = torch.randn((8, 29), generator=generator, device=env.device) * 0.3
+            step = env.step(action)
+            done += int(step.info[SUPERMIMIC_TRANSITION_KEY]["done"].sum())
+        assert done > 0, "no autoreset happened; the eager reset path was not exercised"
+        command = env.command_manager.get_term("motion")
+        assert isinstance(command, SuperMimicCommand)
+        friction = warp.to_torch(env.backend._device_model.geom_friction)
+        robot_ids = np.asarray(env.scene["robot"]._geom_ids)
+        torch.testing.assert_close(
+            friction[:, robot_ids, 0],
+            command.xi[:, :1].expand(-1, robot_ids.size),
+            rtol=0,
+            atol=1e-6,
+        )
+        torso = env.backend.get_body_id("torso_link")
+        np.testing.assert_allclose(
+            env.backend.get_body_ipos(env_ids=np.arange(env.num_envs))[:, torso],
+            env.backend.get_body_ipos()[torso] + command.xi[:, 30:33].cpu().numpy(),
             rtol=0,
             atol=1e-6,
         )
