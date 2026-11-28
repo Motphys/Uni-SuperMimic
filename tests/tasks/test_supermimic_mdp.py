@@ -304,6 +304,54 @@ def test_mdp_to_copies_tensors_without_touching_original(library) -> None:
     torch.testing.assert_close(reward.cpu(), torch.full((4,), 0.1), rtol=0, atol=2e-6)
 
 
+def test_compiled_step_path_follows_a_device_copy(library) -> None:
+    """A compiled MDP copied to another device reads the copy's own tensors.
+
+    The compiled wrappers are stored per instance and close over the instance
+    they were built from. A copy that kept the original's wrappers would pair
+    its own inputs with the original's constants, which torch.compile rejects
+    as soon as the two live on different devices.
+    """
+    kin, motion, _ = library
+    mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list()))
+    mdp.compile_step_path(backend="eager")
+    frames = torch.tensor([0, 51])
+    state = motion.ref_state(frames)
+    previous_action = torch.zeros(2, 29)
+    context = torch.zeros(2, 33)
+    original = mdp.obs(state, previous_action, context, frames)
+
+    moved = mdp._copy_on(torch.device("cpu"))
+    moved.default_q = moved.default_q + 0.25
+
+    copied = moved.obs(state, previous_action, context, frames)
+    torch.testing.assert_close(copied[:, 6:35], original[:, 6:35] - 0.25, rtol=0, atol=1e-6)
+    torch.testing.assert_close(copied[:, :6], original[:, :6], rtol=0, atol=0)
+    torch.testing.assert_close(copied[:, 64:93], original[:, 64:93], rtol=0, atol=0)
+    torch.testing.assert_close(mdp.obs(state, previous_action, context, frames), original)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_compiled_step_path_copy_runs_on_mps(library) -> None:
+    """The learner's MPS copy of a compiled CPU MDP compiles and matches the original."""
+    kin, motion, _ = library
+    mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list()))
+    mdp.compile_step_path(backend="eager")
+    moved = mdp.to("mps")
+
+    frames = torch.tensor([0, 51, 102, 108], device="mps")
+    state = moved.motion.ref_state(frames)
+    previous_action = torch.full((4, 29), 0.5, device="mps")
+    context = torch.full((4, 33), 0.25, device="mps")
+    expected = mdp.obs(
+        motion.ref_state(frames.cpu()), previous_action.cpu(), context.cpu(), frames.cpu()
+    )
+    copied = moved.obs(state, previous_action, context, frames)
+
+    assert copied.device.type == "mps"
+    torch.testing.assert_close(copied.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+
 def test_perfect_tracking_reward_and_termination(library) -> None:
     _, motion, mdp = library
     frames = torch.tensor([0, 51, 102, 108])

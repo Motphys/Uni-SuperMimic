@@ -73,12 +73,32 @@ class RewardCfg:
     term_tilt: float = 0.8
 
 
+def step_path_compile_backend(device: torch.device) -> str | None:
+    """torch.compile backend for the step-path functions running on ``device``.
+
+    Same policy as the learner: torch.compile's default everywhere except MPS,
+    which keeps AOTAutograd without kernel generation because Inductor's Metal
+    codegen is not usable there.
+    """
+    return "aot_eager" if device.type == "mps" else None
+
+
 class MDP:
     num_joints = NUM_J
     context_dim = XI_DIM
     obs_dim = OBS_DIM
     goal_frame_dim = GOAL_FRAME_DIM
     max_step_reward = MAX_STEP_REWARD
+    # Hot per-step functions that ``compile_step_path`` wraps. Listed here so a
+    # device copy (``to``) can rebuild the wrappers bound to the copy.
+    STEP_PATH_FUNCTIONS = (
+        "obs",
+        "goal",
+        "reward",
+        "termination",
+        "add_noise",
+        "normalize_context",
+    )
 
     def __init__(
         self,
@@ -105,17 +125,45 @@ class MDP:
         self.soft_hi = middle + half_range * self.cfg.soft_limit_factor
         device = default_q.device
         self.obs_noise = OBS_NOISE.to(device)
+        self._compile_backend: str | None = None
+
+    def compile_step_path(self, backend: str | None = None) -> None:
+        """torch.compile the hot per-step functions on this instance.
+
+        ``backend=None`` selects per device (``step_path_compile_backend``). The
+        wrappers are stored per instance, so an MDP that is never compiled keeps
+        the plain functions.
+        """
+        self._compile_backend = backend
+        type(self)._wrap_step_path(self, backend)
+
+    @classmethod
+    def _wrap_step_path(cls, instance: "MDP", backend: str | None) -> None:
+        if backend is None:
+            backend = step_path_compile_backend(instance.default_q.device)
+        for name in cls.STEP_PATH_FUNCTIONS:
+            function = getattr(cls, name).__get__(instance)
+            setattr(instance, name, torch.compile(function, backend=backend))
 
     def to(self, device: str | torch.device) -> MDP:
         """Return a copy on ``device``; the original instance is left untouched."""
         device = torch.device(device)
         if device == self.default_q.device:
             return self
+        return self._copy_on(device)
+
+    def _copy_on(self, device: torch.device) -> MDP:
         new = copy.copy(self)
         new.kin = self.kin.to(device)
         new.motion = self.motion.to(device)
         for name in ("default_q", "soft_lo", "soft_hi", "obs_noise"):
             setattr(new, name, getattr(self, name).to(device))
+        # Compiled step-path wrappers close over the instance they were built
+        # from. A shallow copy would pair its own (moved) inputs with the
+        # original's tensors, which breaks under torch.compile as soon as the
+        # two live on different devices (the MPS learner copy of a CPU env MDP).
+        if any(name in vars(self) for name in self.STEP_PATH_FUNCTIONS):
+            type(self)._wrap_step_path(new, self._compile_backend)
         return new
 
     def obs(
