@@ -69,6 +69,23 @@ def cumprod_without_host_sync(values: torch.Tensor) -> torch.Tensor:
     return _CumprodNoHostSync.apply(values, torch.cumprod(values, 0))
 
 
+def snapshot_tensors(tensors: list[torch.Tensor]) -> Callable[[], None]:
+    """Copy ``tensors`` now; return what writes the copies back.
+
+    The ``snapshot`` of a ``CapturedUpdate`` whose body only mutates tensors at fixed
+    addresses (normalizers, histories, optimizer state). Call it at the capture, so the
+    copies are of the state right before the capture's warm-ups run the body for real.
+    """
+    saved = [tensor.detach().clone() for tensor in tensors]
+
+    def restore() -> None:
+        with torch.no_grad():
+            for tensor, copy in zip(tensors, saved, strict=True):
+                tensor.copy_(copy)
+
+    return restore
+
+
 class CapturedUpdate:
     """Run a fixed-shape learner update step, replayed from a CUDA graph after a warmup.
 
@@ -202,4 +219,4 @@ class CapturedUpdate:
         self.graph = graph
 
 
-__all__ = ["CapturedUpdate"]
+__all__ = ["CapturedUpdate", "snapshot_tensors"]

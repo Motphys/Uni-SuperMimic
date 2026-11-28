@@ -93,15 +93,16 @@ class FakeState:
 
 
 class FakeEnv:
-    def __init__(self, num_envs: int = 2):
+    def __init__(self, num_envs: int = 2, device: str | torch.device = "cpu"):
         self.num_envs = num_envs
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
         self.mdp = FakeMdp()
         self.state: FakeState | None = None
-        self.initial_state = torch.zeros(num_envs, 13 + 2 * self.mdp.num_joints)
+        device = self.device
+        self.initial_state = torch.zeros(num_envs, 13 + 2 * self.mdp.num_joints, device=device)
         self.initial_state[:, 3] = 1.0
-        self.initial_frames = torch.arange(num_envs, dtype=torch.long)
-        self.context = torch.full((num_envs, self.mdp.context_dim), 0.2)
+        self.initial_frames = torch.arange(num_envs, dtype=torch.long, device=device)
+        self.context = torch.full((num_envs, self.mdp.context_dim), 0.2, device=device)
 
     @property
     def supermimic_mdp(self) -> FakeMdp:
@@ -112,14 +113,14 @@ class FakeEnv:
             "s": self.initial_state.clone(),
             "f": self.initial_frames.clone(),
             "xi": self.context.clone(),
-            "a_prev": torch.zeros(self.num_envs, self.mdp.num_joints),
-            "ep_step": torch.zeros(self.num_envs, dtype=torch.int32),
+            "a_prev": torch.zeros(self.num_envs, self.mdp.num_joints, device=self.device),
+            "ep_step": torch.zeros(self.num_envs, dtype=torch.int32, device=self.device),
         }
         self.state = FakeState(
             obs={},
-            reward=torch.zeros(self.num_envs),
-            terminated=torch.zeros(self.num_envs, dtype=torch.bool),
-            truncated=torch.zeros(self.num_envs, dtype=torch.bool),
+            reward=torch.zeros(self.num_envs, device=self.device),
+            terminated=torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            truncated=torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
             info={SUPERMIMIC_STATE_KEY: info},
         )
         return self.state
@@ -215,8 +216,8 @@ def _config() -> SuperMimicConfig:
 class ExamFakeEnv(FakeEnv):
     """FakeEnv with the exam activation hook the learner drives."""
 
-    def __init__(self, num_envs: int = 8):
-        super().__init__(num_envs)
+    def __init__(self, num_envs: int = 8, device: str | torch.device = "cpu"):
+        super().__init__(num_envs, device)
         self.exam_activations: list[int] = []
 
     def enable_supermimic_exams(self, num_rows: int) -> None:
@@ -232,8 +233,8 @@ class ExamFakeEnv(FakeEnv):
 class MarginFakeEnv(ExamFakeEnv):
     """ExamFakeEnv with the exams-v2 margin hooks the learner drives."""
 
-    def __init__(self, num_envs: int = 8):
-        super().__init__(num_envs)
+    def __init__(self, num_envs: int = 8, device: str | torch.device = "cpu"):
+        super().__init__(num_envs, device)
         self.margin_config: tuple[float, float] | None = None
         self.exam_refreshes: list[int] = []
 

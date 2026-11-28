@@ -26,7 +26,7 @@ from unisupermimic.rl.contracts.supermimic import (
 from unisupermimic.rl.logging import SuperMimicLogger
 
 from . import networks
-from .cuda_graph import CapturedUpdate, cumprod_without_host_sync
+from .cuda_graph import CapturedUpdate, cumprod_without_host_sync, snapshot_tensors
 from .geometry import unflatten_state
 from .networks import Critic, Policy, WorldModel, mlp
 from .optim import MuonAdam
@@ -122,6 +122,13 @@ class SuperMimicConfig:
     # the policy, ``no_sync`` (a step skipped on the host is a host branch); wherever
     # those are missing that step stays eager.
     optimizer_graph: bool | None = None
+    # ``collect_graph`` replays the learner's own work around each env step of ``collect``
+    # as well: before the step the observation, history, goal, policy normalizers and
+    # policy forward; after it the world-model normalizer updates and the statistics.
+    # ``env.step`` itself is untouched. It needs ``no_sync`` (the normalizers' freeze test
+    # would otherwise be a host read), the device-side statistics for the second graph,
+    # and the env on the learner's device. ``auto`` uses each graph where that holds.
+    collect_graph: bool | None = None
     # ``stats_on_device`` keeps the collect-side logging statistics (sim_rew, ep_len,
     # ep_ret_norm, term_frac, exam_survival) on the device: the synced path's one
     # ``float(done.sum())`` per collect step (plus two more when an episode ends)
@@ -155,6 +162,9 @@ _LOG_FIELDS = (
     "it_per_s",
     "lr",
 )
+
+# What the post-step collect graph reads of a transition (``collect_graph``).
+_POST_STEP_KEYS = ("s", "s1", "a", "xi", "r", "f", "done", "term", "ep_len", "ep_ret_norm")
 
 # ROCm's flattened small-matrix bmm path is numerically unreliable above a batch
 # boundary (~32x4096 rollout); chunk the geometry-heavy reward/critic inputs
@@ -388,6 +398,12 @@ class SuperMimicLearner:
         self._stats_on_device = (
             self._cuda_graphs if cfg.stats_on_device is None else cfg.stats_on_device
         )
+        self._collect_graph_enabled = follow_device(cfg.collect_graph, "collect_graph")
+        if cfg.collect_graph and (self._bridged or not cfg.no_sync or not self._stats_on_device):
+            raise ValueError(
+                "SuperMimicConfig.collect_graph=True requires the env on the learner's NVIDIA "
+                "CUDA device, no_sync and the device-side statistics (stats_on_device)"
+            )
         if cfg.inductor_cpp_wrapper and self.device.type != "cuda":
             raise ValueError(
                 "SuperMimicConfig.inductor_cpp_wrapper=True requires a CUDA device, "
@@ -553,6 +569,26 @@ class SuperMimicLearner:
             if self._pi_step_graph_enabled
             else None
         )
+
+        # The learner's own work around each env step. Both bodies advance normalizers
+        # (and the first one the observation history) in place, which the capture's
+        # warm-ups do for real three times: the snapshots put that back.
+        self._collect_act_graph = (
+            CapturedUpdate(snapshot=partial(snapshot_tensors, [self.obs_hist, *self.pi.buffers()]))
+            if self._collect_graph_enabled and not self._bridged and cfg.no_sync
+            else None
+        )
+        self._collect_post_graph = None
+        if (
+            self._collect_graph_enabled
+            and not self._bridged
+            and cfg.no_sync
+            and self._stats_on_device
+        ):
+            assert self._dev_stats is not None  # created with the device-side statistics
+            self._collect_post_graph = CapturedUpdate(
+                snapshot=partial(snapshot_tensors, [*self.wm.buffers(), self._dev_stats])
+            )
 
         with (self.log_dir / "args.json").open("w", encoding="utf-8") as stream:
             json.dump(asdict(cfg), stream, indent=2)
@@ -740,27 +776,13 @@ class SuperMimicLearner:
     def collect(self, n_steps: int) -> None:
         for _ in range(n_steps):
             info = self._state_info()
-            state = unflatten_state(info["s"])
-            obs = self.mdp.add_noise(self.mdp.obs(state, info["a_prev"], info["xi"], info["f"]))
-            fresh = info["ep_step"] == 0
-            shifted = torch.cat((self.obs_hist[:, 1:], obs.unsqueeze(1)), 1)
-            self.obs_hist = torch.where(
-                fresh[:, None, None], obs.unsqueeze(1).expand_as(self.obs_hist), shifted
-            )
-            goal = self.mdp.goal(state, info["f"], self.cfg.goal_frames)
-            self.pi.obs_norm.update(obs)
-            self.pi.goal_norm.update(goal)
-            action = self.pi(self.obs_hist, goal)
-            action = torch.clamp(action, -20, 20)
-            if self._exam_rows:
-                # Exam worlds act with the deployed (EMA) policy, as the
-                # evaluation would; their transitions still feed the replay
-                # buffer and the world-model normalizers below.
-                assert self.pi_avg is not None
-                exam_action = self.pi_avg.module(
-                    self.obs_hist[-self._exam_rows :], goal[-self._exam_rows :]
-                )
-                action[-self._exam_rows :] = torch.clamp(exam_action, -20, 20).to(action.dtype)
+            if self._bridged:
+                info = {key: value.to(self.device) for key, value in info.items()}
+            act_graph = self._collect_act_graph
+            if act_graph is None:
+                (action,) = self._act_body(info)
+            else:
+                (action,) = act_graph.step(self._act_body, info)
             if self._bridged:
                 step_state = self.env.step(action.to(self.env_device))
             else:
@@ -769,54 +791,93 @@ class SuperMimicLearner:
             if self._bridged:
                 transition = {key: value.to(self.device) for key, value in transition.items()}
             self.buffer.add(transition)
-            initial = unflatten_state(transition["s"])
-            next_state = unflatten_state(transition["s1"])
-            self.wm.in_norm.update(
-                self.wm.inputs(
-                    initial,
-                    transition["a"],
-                    self.mdp.normalize_context(transition["xi"]),
+            post_graph = self._collect_post_graph
+            if post_graph is not None and all(key in transition for key in _POST_STEP_KEYS):
+                post_graph.step(
+                    self._post_step_body, {key: transition[key] for key in _POST_STEP_KEYS}
                 )
-            )
-            target = self.wm.targets(initial, next_state)
-            self.wm.out_norm.update(target)
-            if self.cfg.wm_structured:
-                self.wm.inc_norm.update(self.wm.increments(initial, next_state))
             else:
-                self.wm.inc_norm.update(target)
+                self._post_step(transition)
             self.sim_steps += self.env.num_envs
-            if self._dev_stats is not None:
-                # The same statistics as the appends below, accumulated on the device:
-                # no ``float()`` and no host branch, so the host runs on without
-                # waiting for the env pipeline to drain.
-                self._accumulate_stats(transition)
-                continue
-            self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+
+    def _act_body(self, info: dict[str, torch.Tensor]) -> tuple[torch.Tensor]:
+        """The learner's work before an env step: observation, goal, policy, action.
+
+        The eager step of ``collect`` and the body its ``collect_graph`` records, so the
+        history is refreshed in place rather than re-bound. Exam worlds (when active) act
+        with the deployed (EMA) policy, as the evaluation would; their transitions still
+        feed the replay buffer and the world-model normalizers.
+        """
+        state = unflatten_state(info["s"])
+        obs = self.mdp.add_noise(self.mdp.obs(state, info["a_prev"], info["xi"], info["f"]))
+        fresh = info["ep_step"] == 0
+        shifted = torch.cat((self.obs_hist[:, 1:], obs.unsqueeze(1)), 1)
+        self.obs_hist.copy_(
+            torch.where(fresh[:, None, None], obs.unsqueeze(1).expand_as(self.obs_hist), shifted)
+        )
+        goal = self.mdp.goal(state, info["f"], self.cfg.goal_frames)
+        self.pi.obs_norm.update(obs)
+        self.pi.goal_norm.update(goal)
+        action = torch.clamp(self.pi(self.obs_hist, goal), -20, 20)
+        if self._exam_rows:
+            assert self.pi_avg is not None
+            exam_action = self.pi_avg.module(
+                self.obs_hist[-self._exam_rows :], goal[-self._exam_rows :]
+            )
+            action[-self._exam_rows :] = torch.clamp(exam_action, -20, 20).to(action.dtype)
+        return (action,)
+
+    def _post_step(self, transition: dict[str, torch.Tensor]) -> None:
+        """The learner's work after an env step: world-model normalizers, then statistics."""
+        initial = unflatten_state(transition["s"])
+        next_state = unflatten_state(transition["s1"])
+        self.wm.in_norm.update(
+            self.wm.inputs(initial, transition["a"], self.mdp.normalize_context(transition["xi"]))
+        )
+        target = self.wm.targets(initial, next_state)
+        self.wm.out_norm.update(target)
+        if self.cfg.wm_structured:
+            self.wm.inc_norm.update(self.wm.increments(initial, next_state))
+        else:
+            self.wm.inc_norm.update(target)
+        if self._dev_stats is not None:
+            # The same statistics as the appends below, accumulated on the device: no
+            # ``float()`` and no host branch, so the host runs on without waiting for the
+            # env pipeline to drain.
+            self._accumulate_stats(transition)
+            return
+        self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+        if self._exam_rows:
+            # Per-step survival of the exam worlds: the share whose danger
+            # probability stays under the termination band. These episodes
+            # never hard-terminate, so this is the observable for whether
+            # the exams are improving.
+            rows = slice(self.env.num_envs - self._exam_rows, None)
+            danger = self.mdp.soft_termination(
+                unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
+            )
+            self.stats["exam_surv"].append((danger < 0.5).float().mean())
+        if "ep_len" in transition:
+            # Episode statistics are full-width and masked (non-done rows
+            # carry zero), so aggregate with the done count. Exam episodes
+            # stay out of them: their only end is the clip end.
+            done = transition["done"]
+            term = transition["term"]
             if self._exam_rows:
-                # Per-step survival of the exam worlds: the share whose danger
-                # probability stays under the termination band. These episodes
-                # never hard-terminate, so this is the observable for whether
-                # the exams are improving.
-                rows = slice(self.env.num_envs - self._exam_rows, None)
-                danger = self.mdp.soft_termination(
-                    unflatten_state(transition["s1"][rows]), transition["f"][rows] + 1
-                )
-                self.stats["exam_surv"].append((danger < 0.5).float().mean())
-            if "ep_len" in transition:
-                # Episode statistics are full-width and masked (non-done rows
-                # carry zero), so aggregate with the done count. Exam episodes
-                # stay out of them: their only end is the clip end.
-                done = transition["done"]
-                term = transition["term"]
-                if self._exam_rows:
-                    done = done[: self.env.num_envs - self._exam_rows]
-                    term = term[: self.env.num_envs - self._exam_rows]
-                done_count = float(done.sum())
-                if done_count > 0.0:
-                    self.stats["ep_len"].append(float(transition["ep_len"].sum()) / done_count)
-                    self.stats["ep_ret"].append(float(transition["ep_ret_norm"].sum()) / done_count)
-                self.stats["term"].append(term.float().sum())
-                self.stats["done"].append(done.float().sum())
+                done = done[: self.env.num_envs - self._exam_rows]
+                term = term[: self.env.num_envs - self._exam_rows]
+            done_count = float(done.sum())
+            if done_count > 0.0:
+                self.stats["ep_len"].append(float(transition["ep_len"].sum()) / done_count)
+                self.stats["ep_ret"].append(float(transition["ep_ret_norm"].sum()) / done_count)
+            self.stats["term"].append(term.float().sum())
+            self.stats["done"].append(done.float().sum())
+
+    def _post_step_body(self, inputs: dict[str, torch.Tensor]) -> tuple:
+        # The ``collect_graph`` body: ``_post_step`` on the device-side statistics path
+        # (the synced appends of the other path are host work by construction).
+        self._post_step(inputs)
+        return ()
 
     def _wm_loss_grads(self, window: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward, loss and backward of one window (eager and graph-replayed alike)."""
@@ -868,14 +929,12 @@ class SuperMimicLearner:
             tensors += [parameter.grad for parameter in parameters if parameter.grad is not None]
             tensors += list(module.buffers())
         tensors += optimizer.state_tensors()
-        saved = [tensor.detach().clone() for tensor in tensors]
+        restore_tensors = snapshot_tensors(tensors)
         ema_updates = self._ema_updates
         averaged = int(self.pi_avg.n_averaged) if self.pi_avg is not None else 0
 
         def restore() -> None:
-            with torch.no_grad():
-                for tensor, snapshot in zip(tensors, saved, strict=True):
-                    tensor.copy_(snapshot)
+            restore_tensors()
             self._ema_updates = ema_updates
             if self.pi_avg is not None:
                 self.pi_avg.n_averaged.fill_(averaged)
@@ -901,6 +960,11 @@ class SuperMimicLearner:
                 return
             self.env.enable_supermimic_exams(self._exam_rows_planned)
             self._exam_rows = self._exam_rows_planned
+            # Both collect graphs recorded a Python branch on the exam rows; they warm
+            # up and are recorded again on their next use.
+            for graph in (self._collect_act_graph, self._collect_post_graph):
+                if graph is not None:
+                    graph.reset()
             self._exam_share = self.cfg.exam_frac
         if self.cfg.exam_share_ramp > 0.0:
             progress = (iteration - self.cfg.exam_start_iter) / self.cfg.exam_ramp_iters

@@ -1,4 +1,4 @@
-"""Explicit CUDA-graph replay of the SuperMimic world-model gradient step."""
+"""Explicit CUDA-graph replay of the SuperMimic training-loop steps."""
 
 from __future__ import annotations
 
@@ -7,10 +7,17 @@ from dataclasses import replace
 
 import pytest
 import torch
-from tests.rl.algos.test_supermimic_learner import FakeEnv, FakeMdp, _config
+from tests.rl.algos.test_supermimic_learner import (
+    ExamFakeEnv,
+    FakeEnv,
+    FakeMdp,
+    FakeState,
+    _config,
+)
 
 from unisupermimic.rl.algos.supermimic.cuda_graph import CapturedUpdate, cumprod_without_host_sync
-from unisupermimic.rl.algos.supermimic.learner import SuperMimicLearner
+from unisupermimic.rl.algos.supermimic.learner import _POST_STEP_KEYS, SuperMimicLearner
+from unisupermimic.rl.contracts.supermimic import SUPERMIMIC_STATE_KEY, SUPERMIMIC_TRANSITION_KEY
 
 
 def _eager(**overrides):
@@ -24,6 +31,7 @@ def _eager(**overrides):
         wm_graph=False,
         policy_graph=False,
         optimizer_graph=False,
+        collect_graph=False,
         stats_on_device=False,
     )
     values.update(overrides)
@@ -509,5 +517,163 @@ def test_optimizer_step_graph_replay_never_synchronizes(tmp_path) -> None:
         try:
             graph._wm_step_graph.step(graph._wm_step_body, {})
             graph._pi_step_graph.step(graph._pi_step_body, {})
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+
+
+class _FullStatsFakeEnv(FakeEnv):
+    """FakeEnv whose transitions always carry the episode statistics.
+
+    Masked to zero on rows without an end, as the real env publishes them; FakeEnv adds
+    the keys only on steps where some episode ended.
+    """
+
+    def step(self, actions: torch.Tensor) -> FakeState:
+        steps = self.state.info[SUPERMIMIC_STATE_KEY]["ep_step"] + 1
+        state = super().step(actions)
+        transition = state.info[SUPERMIMIC_TRANSITION_KEY]
+        done = transition["done"]
+        length = torch.where(done, steps, torch.zeros_like(steps)).float()
+        transition["ep_len"] = length
+        transition["ep_ret_norm"] = torch.where(
+            done,
+            transition["r"] / (length * self.mdp.max_step_reward),
+            torch.zeros_like(length),
+        )
+        return state
+
+
+class _FullStatsExamEnv(ExamFakeEnv, _FullStatsFakeEnv):
+    """The exam env, on transitions that always carry the episode statistics."""
+
+
+def _collect_pair(tmp_path, env_type, **overrides):
+    """Learners that differ only in ``collect_graph``, on an env that lives on their device.
+
+    The MDP draws the real MDP's uniform observation noise, so the comparison covers the
+    generator as well: a replay has to consume what the eager step consumes.
+    """
+    cfg = _eager(stats_on_device=True, pi_ema=0.995, **overrides)
+    learners = []
+    for name, collect_graph in (("eager", False), ("graph", True)):
+        env = env_type(device="cuda")
+        env.mdp = _GraphCheckMdp()
+        env.mdp.noise = 0.05
+        env.mdp.to("cuda")
+        learner = SuperMimicLearner(
+            env, replace(cfg, collect_graph=collect_graph), tmp_path / name, device="cuda"
+        )
+        learners.append(learner)
+    return learners
+
+
+def _assert_same_collect_state(expected: SuperMimicLearner, actual: SuperMimicLearner) -> None:
+    """Everything a collect step moves, bit for bit: history, normalizers, buffer,
+    statistics, and the env itself (so the actions taken were the same)."""
+    for name in ("obs_hist", "_dev_stats"):
+        torch.testing.assert_close(getattr(actual, name), getattr(expected, name), rtol=0, atol=0)
+    for name in ("pi", "pi_avg", "wm"):
+        for reference, value in zip(
+            getattr(expected, name).state_dict().values(),
+            getattr(actual, name).state_dict().values(),
+            strict=True,
+        ):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    assert actual.buffer.ptr == expected.buffer.ptr
+    assert actual.buffer.size == expected.buffer.size
+    assert actual.sim_steps == expected.sim_steps
+    for key, reference in expected.buffer.data.items():
+        torch.testing.assert_close(actual.buffer.data[key], reference, rtol=0, atol=0)
+    expected_info = expected.env.state.info[SUPERMIMIC_STATE_KEY]
+    actual_info = actual.env.state.info[SUPERMIMIC_STATE_KEY]
+    for (name, reference), (other, value) in zip(
+        expected_info.items(), actual_info.items(), strict=True
+    ):
+        assert name == other
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("env_type", [_FullStatsFakeEnv, FakeEnv])
+def test_collect_graph_matches_the_eager_step_bitwise(tmp_path, env_type) -> None:
+    eager, graph = _collect_pair(tmp_path, env_type)
+    for step in range(14):
+        # One step each from the same generator state.
+        for learner in (eager, graph):
+            state = torch.cuda.get_rng_state()
+            learner.collect(1)
+            if learner is eager:
+                torch.cuda.set_rng_state(state)
+        if env_type is _FullStatsFakeEnv:
+            # Every step has what the post-step graph reads: 3 eager warmups, the capture
+            # call, then pure replays.
+            assert graph._collect_post_graph.replaying == (step >= 3)
+        else:
+            # FakeEnv reports episode statistics on every third step only; a step without
+            # them takes the eager path, and the fourth step with them is the capture.
+            assert graph._collect_post_graph.replaying == (step >= 11)
+        assert graph._collect_act_graph.replaying == (step >= 3)
+        _assert_same_collect_state(eager, graph)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_collect_graph_records_the_exam_branch_when_exams_activate(tmp_path) -> None:
+    cfg = _eager(
+        stats_on_device=True,
+        pi_ema=0.995,
+        iterations=6,  # one collect step per iteration: the re-warm-up after the activation completes
+        log_every=1,
+        ckpt_every=1000,
+        exam_start_iter=1,
+        exam_frac=0.5,
+        exam_share_ramp=0.9,
+        exam_ramp_iters=4,
+    )
+    eager, graph = (
+        SuperMimicLearner(
+            _FullStatsExamEnv(device="cuda"),
+            replace(cfg, collect_graph=on),
+            tmp_path / name,
+            device="cuda",
+        )
+        for name, on in (("eager", False), ("graph", True))
+    )
+    # Each ``train`` from the generator state the constructor seeds (they run one after
+    # the other, and the first one consumes the stream).
+    assert eager.train()["completed"]
+    torch.manual_seed(cfg.seed)
+    assert graph.train()["completed"]
+    # The graphs were recorded before the exams and again, with the exam branch, after.
+    assert graph._exam_rows == eager._exam_rows == 4
+    assert graph._collect_act_graph.replaying and graph._collect_post_graph.replaying
+    for name in ("pi", "pi_avg", "wm", "critic"):
+        for reference, value in zip(
+            getattr(eager, name).state_dict().values(),
+            getattr(graph, name).state_dict().values(),
+            strict=True,
+        ):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    for key, reference in eager.buffer.data.items():
+        torch.testing.assert_close(graph.buffer.data[key], reference, rtol=0, atol=0)
+    assert eager._exam_share == graph._exam_share
+    assert graph._exam_fail_ema == eager._exam_fail_ema
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_collect_graph_replay_never_synchronizes(tmp_path) -> None:
+    _, graph = _collect_pair(tmp_path, _FullStatsFakeEnv)
+    graph.collect(6)
+    assert graph._collect_act_graph.replaying and graph._collect_post_graph.replaying
+    info = graph._state_info()
+    # The env's last transition still is the one its state carries.
+    keys = {key: graph.env.state.info[SUPERMIMIC_TRANSITION_KEY][key] for key in _POST_STEP_KEYS}
+    torch.cuda.synchronize()
+    with warnings.catch_warnings():
+        # The mode is a prototype; its warning is not what this test is about.
+        warnings.simplefilter("ignore", UserWarning)
+        torch.cuda.set_sync_debug_mode(2)  # any synchronizing CUDA operation raises
+        try:
+            graph._collect_act_graph.step(graph._act_body, info)
+            graph._collect_post_graph.step(graph._post_step_body, keys)
         finally:
             torch.cuda.set_sync_debug_mode(0)

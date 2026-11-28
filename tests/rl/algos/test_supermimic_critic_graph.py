@@ -25,6 +25,7 @@ def _config_for(**overrides):
         wm_graph=False,
         policy_graph=False,
         optimizer_graph=False,
+        collect_graph=False,
         stats_on_device=False,
     )
     values.update(overrides)
