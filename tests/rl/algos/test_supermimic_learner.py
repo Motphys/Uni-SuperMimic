@@ -740,9 +740,15 @@ def test_nonfinite_world_model_error_is_reported_after_the_policy_update(tmp_pat
     assert not (tmp_path / "last.pt").exists()
 
 
-def test_iteration_metrics_are_read_after_the_next_collect_and_before_its_updates(
-    tmp_path,
-) -> None:
+def test_iteration_metrics_are_read_after_the_next_train_phase_is_issued(tmp_path) -> None:
+    """The verdict of iteration k is read once iteration k+1's collect and train phase are queued.
+
+    That keeps the GPU busy while the host waits, and busy through the next collect, which is
+    issued next. The cost: the update of iteration k+1 is issued before iteration k's verdict
+    is known. It must not go further than that: the read happens before iteration k+2 issues
+    anything, and nothing is checkpointed for a diverged model.
+    """
+
     learner = SuperMimicLearner(
         FakeEnv(), replace(_config(), iterations=6, ckpt_every=100), tmp_path
     )
@@ -767,10 +773,10 @@ def test_iteration_metrics_are_read_after_the_next_collect_and_before_its_update
     with pytest.raises(FloatingPointError, match="non-finite pi_loss at iteration 3"):
         learner.train()
 
-    # The third iteration's verdict was read once the fourth iteration's collect had been
-    # issued, and before any further update: no update runs on a diverged model.
-    assert updates == 3
-    assert events[-2:] == ["update", "collect"]
+    # The third iteration's verdict was read after the fourth iteration's collect and train
+    # phase had been issued, and before the fifth iteration's collect.
+    assert updates == 4
+    assert events[-3:] == ["update", "collect", "update"]
     assert events.count("collect") == 5  # the buffer warm-up and four iterations
     assert not (tmp_path / "last.pt").exists()
 

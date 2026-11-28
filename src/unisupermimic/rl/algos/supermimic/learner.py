@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -156,12 +157,38 @@ def _empty_stats() -> dict[str, list[torch.Tensor]]:
     return {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": [], "exam_surv": []}
 
 
+_AGGREGATE_KEYS = ("wm", "wm8", "pi", "v", "ir", "gn", "surv")
+
+
+@dataclass
+class _Reads:
+    """Host-side copies of one iteration's metrics.
+
+    ``train`` queues the device-to-host copies right after the iteration's train phase was
+    issued and before anything else, so they only wait for the work they depend on.
+    ``event`` is recorded after the last copy: once it has completed, the pinned buffers hold
+    the values. For an iteration that writes a log row, ``aggregate`` holds the period's
+    per-iteration metrics including this one (``[key, iteration]``, ``_AGGREGATE_KEYS``
+    order) and ``dev_sums`` / ``stats`` the period's collect statistics.
+    """
+
+    event: torch.cuda.Event | None
+    wm_finite: torch.Tensor
+    policy_finite: torch.Tensor
+    scalars: torch.Tensor
+    aggregate: torch.Tensor | None
+    dev_sums: torch.Tensor | None
+    # Synced statistics: per key the period's device scalars, or its Python floats.
+    stats: dict[str, torch.Tensor | list[float] | None] | None
+
+
 @dataclass
 class _PendingIteration:
     """One iteration of ``train`` whose metrics have not been read on the host yet.
 
-    ``train`` reads them after the *next* iteration's collect has been issued, so everything
-    that collect would move past this iteration (the collect statistics) is fixed here.
+    Its reads are staged (``_Reads``) as soon as its train phase has been issued, so the
+    statistics the next collect would move past this iteration are fixed by then. The next
+    iteration issues its own collect and train phase before ``train`` waits for them.
     """
 
     iteration: int
@@ -172,19 +199,7 @@ class _PendingIteration:
     collect_time: float
     learn_time: float
     exam_fail_ema: float | None
-    wm_loss: torch.Tensor
-    wm_error: torch.Tensor
-    wm_finite: torch.Tensor
-    pi_loss: torch.Tensor
-    v_loss: torch.Tensor
-    imag_rew: torch.Tensor
-    grad_norm: torch.Tensor
-    survival: torch.Tensor
-    # Device-side statistics: the period's sums, read back when this iteration closes a log
-    # period, else ``None``. Synced statistics: the period-to-date lists, and where in the
-    # reward list this iteration's own steps start.
-    period: dict[str, float] | None
-    stats: dict[str, list[torch.Tensor]] | None
+    reads: _Reads
     stats_mark: int
 
 
@@ -1367,7 +1382,7 @@ class SuperMimicLearner:
         self.sim_steps = checkpoint["sim_steps"]
 
     @staticmethod
-    def _mean(values: list[torch.Tensor]) -> float:
+    def _mean(values: Sequence[torch.Tensor | float]) -> float:
         return float(sum(float(value) for value in values) / max(len(values), 1))
 
     def _accumulate_stats(self, transition: dict[str, torch.Tensor]) -> None:
@@ -1432,8 +1447,14 @@ class SuperMimicLearner:
         """
         if self._dev_stats is None:
             raise RuntimeError("device-side statistics require cfg.stats_on_device")
-        sums = dict(zip(_DEV_STAT_FIELDS, self._dev_stats.tolist(), strict=True))
+        sums = self._dev_stats.tolist()
         self._dev_stats.zero_()
+        return self._period_from(sums)
+
+    @staticmethod
+    def _period_from(values: list[float]) -> dict[str, float]:
+        """The log row's collect statistics from the period's device-side sums."""
+        sums = dict(zip(_DEV_STAT_FIELDS, values, strict=True))
         stats = {
             "sim_rew": sums["r_sum"] / max(sums["steps"], 1),
             "ep_len": sums["ep_len_sum"] / max(sums["ep_steps"], 1),
@@ -1478,47 +1499,126 @@ class SuperMimicLearner:
                 train_start = time.time() - self.wall_time
                 log_start = time.time()
                 step_accumulator = 0.0
-                aggregate: dict[str, list[torch.Tensor]] = {
-                    key: [] for key in ("wm", "wm8", "pi", "v", "ir", "gn", "surv")
-                }
+                aggregate: dict[str, list[torch.Tensor]] = {key: [] for key in _AGGREGATE_KEYS}
                 last_metrics: dict[str, float | int] = {}
                 finished_at: float | None = None
 
+                def stage(
+                    metrics: tuple[torch.Tensor, ...], wm_finite: torch.Tensor, log_row: bool
+                ) -> _Reads:
+                    """Queue the host copies of one iteration's metrics without waiting."""
+                    cuda = self.device.type == "cuda"
+                    event = torch.cuda.Event() if cuda else None
+
+                    def host(value: torch.Tensor) -> torch.Tensor:
+                        if not cuda:
+                            return value.detach().clone()
+                        # Pinned memory, so the copy is asynchronous and the event covers it.
+                        out = torch.empty(value.shape, dtype=value.dtype, pin_memory=True)
+                        out.copy_(value, non_blocking=True)
+                        return out
+
+                    def host_stats(values: list[torch.Tensor]) -> torch.Tensor | list[float] | None:
+                        """One key's period-to-date statistics on the host: nothing, the
+                        device scalars, or the Python floats of the episode statistics."""
+                        if not values:
+                            return None
+                        if isinstance(values[0], torch.Tensor):
+                            return host(torch.stack(values))
+                        return cast(list[float], values)
+
+                    reads = _Reads(
+                        event=event,
+                        wm_finite=host(wm_finite),
+                        policy_finite=host(
+                            torch.stack([torch.isfinite(metric).all() for metric in metrics[2:5]])
+                        ),
+                        scalars=host(torch.stack(metrics)),
+                        aggregate=None,
+                        dev_sums=None,
+                        stats=None,
+                    )
+                    if log_row:
+                        # The log row averages this period: the entries so far plus this one.
+                        reads.aggregate = host(
+                            torch.stack(
+                                [
+                                    (
+                                        torch.cat((torch.stack(aggregate[key]), metric.reshape(1)))
+                                        if aggregate[key]
+                                        else metric.reshape(1)
+                                    )
+                                    for key, metric in zip(_AGGREGATE_KEYS, metrics, strict=True)
+                                ]
+                            )
+                        )
+                    if self._dev_stats is not None:
+                        if log_row:
+                            # The collect statistics are read back once per log period; the
+                            # next one starts from zeroed sums.
+                            reads.dev_sums = host(self._dev_stats)
+                            self._dev_stats.zero_()
+                    else:
+                        # Period-to-date copies, every iteration (the per-iteration tags use
+                        # them): ``collect`` keeps appending to ``self.stats``, and a log period
+                        # ends here, so the next one starts from an empty dict. ``r`` holds
+                        # device scalars, the episode statistics Python floats.
+                        reads.stats = {
+                            key: host_stats(values) for key, values in self.stats.items()
+                        }
+                        if log_row:
+                            self.stats = _empty_stats()
+                    if event is not None:
+                        event.record()
+                    return reads
+
+                def _host_list(values: torch.Tensor | list[float] | None) -> list[float]:
+                    if values is None:
+                        return []
+                    return values.tolist() if isinstance(values, torch.Tensor) else list(values)
+
                 def finish(pending: _PendingIteration) -> None:
-                    """Read an iteration's metrics on the host, then check, log and record it."""
-                    nonlocal aggregate, last_metrics, log_start, finished_at
+                    """Read an iteration's staged metrics, then check, log and record it."""
+                    nonlocal last_metrics, log_start, finished_at
+                    reads = pending.reads
+                    if reads.event is not None:
+                        # The one wait of the loop: everything staged for this iteration is on
+                        # the host once its event has completed.
+                        reads.event.synchronize()
                     # Fail fast on divergence instead of checkpointing a diverged model.
                     # ``grad_norm`` is deliberately excluded: ``no_sync`` training already
                     # handles a non-finite gradient by zeroing it and stepping, so a non-finite
                     # gradient is not a divergence signal on its own.
                     for name, finite in zip(
-                        ("wm_loss", "wm_err8"), pending.wm_finite.tolist(), strict=True
+                        ("wm_loss", "wm_err8"), reads.wm_finite.tolist(), strict=True
                     ):
                         if not finite:
                             raise FloatingPointError(
                                 f"non-finite {name} at iteration {pending.iteration}"
                             )
-                    for name, metric in (
-                        ("pi_loss", pending.pi_loss),
-                        ("v_loss", pending.v_loss),
-                        ("imag_rew", pending.imag_rew),
+                    for name, finite in zip(
+                        ("pi_loss", "v_loss", "imag_rew"),
+                        reads.policy_finite.tolist(),
+                        strict=True,
                     ):
-                        if not torch.isfinite(metric).all():
+                        if not finite:
                             raise FloatingPointError(
                                 f"non-finite {name} at iteration {pending.iteration}"
                             )
-                    aggregate["wm"].append(pending.wm_loss)
-                    aggregate["wm8"].append(pending.wm_error)
-                    aggregate["pi"].append(pending.pi_loss)
-                    aggregate["v"].append(pending.v_loss)
-                    aggregate["ir"].append(pending.imag_rew)
-                    aggregate["gn"].append(pending.grad_norm)
-                    aggregate["surv"].append(pending.survival)
+                    (
+                        wm_loss,
+                        wm_error,
+                        pi_loss,
+                        v_loss,
+                        imag_rew,
+                        pi_gradnorm,
+                        imag_survival,
+                    ) = reads.scalars.tolist()
                     now = time.time()
                     self.wall_time = now - train_start
-                    # The host gets here once per iteration, after the reads above have waited
-                    # for the GPU: the gap to the previous visit is the wall time of one
-                    # iteration (the first one is measured from its own start).
+                    # The host gets here once per iteration, when the GPU has finished this
+                    # iteration's train phase: the gap to the previous visit is the wall time
+                    # of one iteration (the first one is measured from its own start).
                     iteration_time = now - (
                         finished_at if finished_at is not None else pending.started
                     )
@@ -1533,9 +1633,13 @@ class SuperMimicLearner:
                     term_frac: float | None
                     exam_survival: float | None
                     if self._dev_stats is not None:
-                        # The collect statistics were read back once, before the next collect
-                        # was issued (see the loop below); one point per log period.
-                        period = pending.period
+                        # The collect statistics were copied out once, before the next collect
+                        # was issued (see ``stage``); one point per log period.
+                        period = (
+                            self._period_from(reads.dev_sums.tolist())
+                            if reads.dev_sums is not None
+                            else None
+                        )
                         if period is None:
                             mean_reward = ep_len = ep_ret_norm = None
                             term_frac = exam_survival = None
@@ -1546,35 +1650,30 @@ class SuperMimicLearner:
                             term_frac = period["term_frac"]
                             exam_survival = period.get("exam_survival")
                     else:
-                        assert pending.stats is not None
-                        iter_rewards = pending.stats["r"][pending.stats_mark :]
+                        assert reads.stats is not None
+                        stats = {key: _host_list(values) for key, values in reads.stats.items()}
+                        iter_rewards = stats["r"][pending.stats_mark :]
                         mean_reward = self._mean(iter_rewards) if iter_rewards else None
-                        ep_len = (
-                            self._mean(pending.stats["ep_len"]) if pending.stats["ep_len"] else None
-                        )
-                        ep_ret_norm = (
-                            self._mean(pending.stats["ep_ret"]) if pending.stats["ep_ret"] else None
-                        )
-                        total_done = sum(float(value) for value in pending.stats["done"])
+                        ep_len = self._mean(stats["ep_len"]) if stats["ep_len"] else None
+                        ep_ret_norm = self._mean(stats["ep_ret"]) if stats["ep_ret"] else None
+                        total_done = sum(float(value) for value in stats["done"])
                         term_frac = (
-                            sum(float(value) for value in pending.stats["term"]) / total_done
+                            sum(float(value) for value in stats["term"]) / total_done
                             if total_done > 0
                             else None
                         )
                         exam_survival = (
-                            self._mean(pending.stats["exam_surv"])
-                            if pending.stats["exam_surv"]
-                            else None
+                            self._mean(stats["exam_surv"]) if stats["exam_surv"] else None
                         )
                     logger.log_step(
                         pending.iteration,
-                        wm_loss=float(pending.wm_loss),
-                        wm_err8=float(pending.wm_error),
-                        pi_loss=float(pending.pi_loss),
-                        v_loss=float(pending.v_loss),
-                        imag_rew=float(pending.imag_rew),
-                        imag_survival=float(pending.survival),
-                        pi_gradnorm=float(pending.grad_norm),
+                        wm_loss=wm_loss,
+                        wm_err8=wm_error,
+                        pi_loss=pi_loss,
+                        v_loss=v_loss,
+                        imag_rew=imag_rew,
+                        imag_survival=imag_survival,
+                        pi_gradnorm=pi_gradnorm,
                         lr=pending.learning_rate,
                         sim_rew=mean_reward,
                         ep_len=ep_len,
@@ -1591,9 +1690,10 @@ class SuperMimicLearner:
                     if pending.iteration % self.cfg.log_every == 0:
                         iterations_per_second = self.cfg.log_every / (now - log_start)
                         log_start = now
-                        stats = pending.stats
+                        assert reads.aggregate is not None
+                        means = [self._mean(values) for values in reads.aggregate.tolist()]
                         if self._dev_stats is not None:
-                            # Device-side statistics: already read back once for this row.
+                            # Device-side statistics: already copied out once for this row.
                             assert period is not None
                             collect_row = (
                                 period["sim_rew"],
@@ -1602,7 +1702,8 @@ class SuperMimicLearner:
                                 period["term_frac"],
                             )
                         else:
-                            assert stats is not None
+                            assert reads.stats is not None
+                            stats = {key: _host_list(values) for key, values in reads.stats.items()}
                             collect_row = (
                                 self._mean(stats["r"]),
                                 self._mean(stats["ep_len"]),
@@ -1616,13 +1717,7 @@ class SuperMimicLearner:
                             pending.iteration,
                             self.wall_time / 3600,
                             pending.sim_steps,
-                            self._mean(aggregate["wm"]),
-                            self._mean(aggregate["wm8"]),
-                            self._mean(aggregate["pi"]),
-                            self._mean(aggregate["v"]),
-                            self._mean(aggregate["ir"]),
-                            self._mean(aggregate["gn"]),
-                            self._mean(aggregate["surv"]),
+                            *means,
                             *collect_row,
                             iterations_per_second,
                             pending.learning_rate,
@@ -1636,11 +1731,8 @@ class SuperMimicLearner:
                         )
                         log_file.flush()
                         last_metrics = dict(zip(_LOG_FIELDS, row, strict=True))
-                        aggregate = {key: [] for key in aggregate}
 
                 pending: _PendingIteration | None = None
-                period: dict[str, float] | None
-                stats: dict[str, list[torch.Tensor]] | None
                 for iteration in range(start_iteration, self.cfg.iterations):
                     if self.cfg.compile and iteration == start_iteration:
                         logger.log_status("Compiling world model (one-off, slow on first run)")
@@ -1661,22 +1753,14 @@ class SuperMimicLearner:
                     step_accumulator -= collect_steps
                     stats_mark = len(self.stats["r"])
                     self.collect(collect_steps)
-                    if pending is not None:
-                        # The first host read of the previous iteration. Its train phase and
-                        # this collect were issued without waiting, so the GPU had queued work
-                        # the whole time the host spent in ``collect``. Reading right after
-                        # ``policy_update`` instead drained the queue there, and the GPU then
-                        # sat idle through the eager part of the next env step.
-                        finish(pending)
-                        pending = None
                     train_phase_start = time.time()
                     wm_loss = torch.zeros((), device=self.device)
                     wm_error = torch.zeros((), device=self.device)
                     # The finite verdicts stay on the device: reading each batch's metrics
                     # here would drain the GPU queue after every batch and leave the GPU
-                    # waiting for the host. The first host read is the fail-fast check in
-                    # ``finish``. A non-finite batch cannot be masked by a later finite one,
-                    # because the flags are only ever cleared.
+                    # waiting for the host. The host reads them once per iteration, from the
+                    # staged copies (see ``stage``). A non-finite batch cannot be masked by a
+                    # later finite one, because the flags are only ever cleared.
                     wm_finite = torch.ones(2, dtype=torch.bool, device=self.device)
                     for _ in range(self.cfg.wm_batches):
                         wm_loss, wm_error = self.wm_update()
@@ -1685,24 +1769,26 @@ class SuperMimicLearner:
                         self.policy_update()
                     )
                     self.iteration = iteration + 1
-                    # Nothing below reads the device. The statistics that the next collect
-                    # would move past this iteration are fixed here instead.
-                    period = None
-                    stats = None
-                    if self._dev_stats is not None:
-                        # Nothing is read per iteration: the collect statistics are read back
-                        # once, here, when the log period closes, and the collect tags are
-                        # logged at that iteration with the period's value (one point per log
-                        # period instead of per iteration).
-                        if self.iteration % self.cfg.log_every == 0:
-                            period = self._read_dev_stats()
-                    else:
-                        # Period-to-date copy: ``collect`` keeps appending to ``self.stats``.
-                        # A log period ends here, so the next one starts from an empty dict.
-                        stats = {key: list(values) for key, values in self.stats.items()}
-                        if self.iteration % self.cfg.log_every == 0:
-                            self.stats = _empty_stats()
-                    pending = _PendingIteration(
+                    # Stage this iteration's host reads right behind its train phase: nothing
+                    # else has been issued since, so the copies, and the event after them, only
+                    # wait for this train phase. The statistics the next collect would move
+                    # past this iteration are copied out here as well.
+                    metrics = (
+                        wm_loss,
+                        wm_error,
+                        policy_loss,
+                        value_loss,
+                        imagined_reward,
+                        grad_norm,
+                        survival,
+                    )
+                    log_row = self.iteration % self.cfg.log_every == 0
+                    reads = stage(metrics, wm_finite, log_row)
+                    for key, metric in zip(_AGGREGATE_KEYS, metrics, strict=True):
+                        aggregate[key].append(metric)
+                    if log_row:
+                        aggregate = {key: [] for key in _AGGREGATE_KEYS}
+                    current = _PendingIteration(
                         iteration=self.iteration,
                         started=iteration_start,
                         collect_steps=collect_steps,
@@ -1711,25 +1797,28 @@ class SuperMimicLearner:
                         collect_time=train_phase_start - iteration_start,
                         learn_time=time.time() - train_phase_start,
                         exam_fail_ema=self._exam_fail_ema,
-                        wm_loss=wm_loss,
-                        wm_error=wm_error,
-                        wm_finite=wm_finite,
-                        pi_loss=policy_loss,
-                        v_loss=value_loss,
-                        imag_rew=imagined_reward,
-                        grad_norm=grad_norm,
-                        survival=survival,
-                        period=period,
-                        stats=stats,
+                        reads=reads,
                         stats_mark=stats_mark,
                     )
+                    if pending is not None:
+                        # Read the previous iteration now, with this iteration's collect and
+                        # train phase already queued. The wait ends when the GPU has finished
+                        # the previous train phase; the GPU then runs straight on through this
+                        # iteration's work while the host issues the next collect. Waiting
+                        # before issuing this train phase left the GPU with an empty queue at
+                        # every iteration boundary, and it then followed the host launch by
+                        # launch through the eager part of the next collect.
+                        finish(pending)
+                        pending = None
+                    pending = current
                     if (
                         self.iteration % self.cfg.ckpt_every == 0
                         or self.iteration == self.cfg.iterations
                     ):
                         # A checkpoint holds exactly this iteration's state and is never
-                        # written for a diverged one: check the metrics now, before the next
-                        # collect moves the normalizers, then save.
+                        # written for a diverged one: the staged reads of this iteration are
+                        # behind its train phase, so waiting for them here (and saving before
+                        # the next collect moves the normalizers) keeps both properties.
                         finish(pending)
                         pending = None
                         self.save()
