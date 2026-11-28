@@ -24,6 +24,8 @@ def _config_for(**overrides):
         critic_update="graph",
         wm_graph=False,
         policy_graph=False,
+        optimizer_graph=False,
+        collect_graph=False,
         stats_on_device=False,
     )
     values.update(overrides)
@@ -207,5 +209,36 @@ def test_graph_critic_recaptures_after_resume(tmp_path) -> None:
     eager_out = _update(reference, 42)
 
     assert resumed._critic_graph_state is not captured
+    assert torch.equal(graph_out[1], eager_out[1])
+    _assert_same_critic(reference, resumed)
+
+
+@needs_cuda
+def test_graph_critic_resumes_from_an_eager_loop_checkpoint(tmp_path) -> None:
+    # The other direction: the eager loop's checkpoint carries ``capturable=False`` and a
+    # float learning rate on the saved param groups, which ``load_state_dict`` installs
+    # as is. The captured loop cannot be recorded against that (torch refuses).
+    source = SuperMimicLearner(
+        FakeEnv(), _config_for(critic_update="eager"), tmp_path / "source", device="cuda"
+    )
+    source.collect(3)
+    _set_lr(source, 1e-3)
+    _update(source, 1)
+    source.save()
+
+    resumed = SuperMimicLearner(FakeEnv(), _config_for(), tmp_path / "resumed", device="cuda")
+    resumed.collect(3)
+    resumed.load(tmp_path / "source" / "last.pt")
+    assert resumed.opt_v.param_groups[0]["capturable"] is True
+    graph_out = _update(resumed, 42)
+
+    reference = SuperMimicLearner(
+        FakeEnv(), _config_for(critic_update="eager"), tmp_path / "reference", device="cuda"
+    )
+    reference.collect(3)
+    reference.load(tmp_path / "source" / "last.pt")
+    eager_out = _update(reference, 42)
+
+    assert resumed._critic_graph_state is not None
     assert torch.equal(graph_out[1], eager_out[1])
     _assert_same_critic(reference, resumed)

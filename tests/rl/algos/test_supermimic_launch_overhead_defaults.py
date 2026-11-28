@@ -20,6 +20,8 @@ AUTO = {
     "critic_update": "auto",
     "wm_graph": None,
     "policy_graph": None,
+    "optimizer_graph": None,
+    "collect_graph": None,
     "stats_on_device": None,
     "inductor_cpp_wrapper": False,
 }
@@ -27,6 +29,8 @@ ORIGINAL = {
     "critic_update": "eager",
     "wm_graph": False,
     "policy_graph": False,
+    "optimizer_graph": False,
+    "collect_graph": False,
     "stats_on_device": False,
     "inductor_cpp_wrapper": False,
 }
@@ -39,6 +43,8 @@ def _original(**overrides) -> SuperMimicConfig:
 def _assert_original_paths(learner: SuperMimicLearner) -> None:
     assert learner._critic_graph_enabled is False
     assert learner._wm_graph is None and learner._pi_graph is None
+    assert learner._wm_step_graph is None and learner._pi_step_graph is None
+    assert learner._collect_act_graph is None and learner._collect_post_graph is None
     assert learner._stats_on_device is False
     assert learner._dev_stats is None
 
@@ -67,7 +73,13 @@ def test_auto_keeps_every_original_path_off_cuda(tmp_path) -> None:
 
 
 def test_explicit_switches_need_nvidia_cuda(tmp_path) -> None:
-    for name, value in (("wm_graph", True), ("policy_graph", True), ("critic_update", "graph")):
+    for name, value in (
+        ("wm_graph", True),
+        ("policy_graph", True),
+        ("optimizer_graph", True),
+        ("collect_graph", True),
+        ("critic_update", "graph"),
+    ):
         with pytest.raises(ValueError, match=f"{name}=?.?'?{value}'? requires"):
             SuperMimicLearner(FakeEnv(), replace(_config(), **{name: value}), tmp_path / name)
 
@@ -84,6 +96,10 @@ def test_auto_enables_every_switch_on_nvidia_cuda(tmp_path) -> None:
     assert learner._cuda_graphs
     assert learner._critic_graph_enabled
     assert learner._wm_graph is not None and learner._pi_graph is not None
+    assert learner._wm_step_graph is not None and learner._pi_step_graph is not None
+    # FakeEnv lives on the CPU, so the learner bridges tensors to its device and the
+    # collect graphs stay off (see ``test_collect_graph_...`` below).
+    assert learner._collect_act_graph is None and learner._collect_post_graph is None
     assert learner._stats_on_device and learner._dev_stats is not None
 
     learner.collect(12)
@@ -94,9 +110,70 @@ def test_auto_enables_every_switch_on_nvidia_cuda(tmp_path) -> None:
     for _ in range(4):
         learner.policy_update()
     # Past their warm-up calls, every update replays from its CUDA graph.
-    assert learner._wm_graph.replaying
-    assert learner._pi_graph.replaying
+    assert learner._wm_graph.replaying and learner._wm_step_graph.replaying
+    assert learner._pi_graph.replaying and learner._pi_step_graph.replaying
     assert learner._critic_graph_state is not None
+
+
+@needs_cuda
+def test_optimizer_step_graph_stays_eager_without_what_it_needs(tmp_path) -> None:
+    # ``auto`` applies the step graph where its prerequisites hold and leaves the other
+    # step eager; an explicit request is a configuration error instead.
+    config = replace(_config(), no_sync=False)
+    learner = SuperMimicLearner(FakeEnv(), config, tmp_path / "synced", device="cuda")
+    assert learner._wm_step_graph is not None
+    assert learner._pi_step_graph is None  # a step skipped on the host is a host branch
+    learner = SuperMimicLearner(
+        FakeEnv(), replace(_config(), pi_opt="adam"), tmp_path / "adam", device="cuda"
+    )
+    assert learner._wm_step_graph is not None
+    assert learner._pi_step_graph is None  # the stock Adam keeps its float learning rate
+    assert learner.opt_pi.defaults["capturable"] is False
+
+    for overrides in ({"no_sync": False}, {"wm_graph": False}, {"pi_opt": "adam"}):
+        with pytest.raises(ValueError, match="optimizer_graph=True requires"):
+            SuperMimicLearner(
+                FakeEnv(),
+                replace(_config(), optimizer_graph=True, **overrides),
+                tmp_path / "-".join(overrides),
+                device="cuda",
+            )
+
+
+@needs_cuda
+def test_collect_graph_needs_its_prerequisites(tmp_path) -> None:
+    # With the env on the learner's device, ``auto`` records both graphs; the second one
+    # needs the device-side statistics, both need ``no_sync``; an explicit request is a
+    # configuration error instead.
+    learner = SuperMimicLearner(FakeEnv(device="cuda"), _config(), tmp_path / "auto", device="cuda")
+    assert learner._collect_act_graph is not None and learner._collect_post_graph is not None
+    learner = SuperMimicLearner(
+        FakeEnv(device="cuda"),
+        replace(_config(), stats_on_device=False),
+        tmp_path / "synced-stats",
+        device="cuda",
+    )
+    assert learner._collect_act_graph is not None and learner._collect_post_graph is None
+    learner = SuperMimicLearner(
+        FakeEnv(device="cuda"),
+        replace(_config(), no_sync=False),
+        tmp_path / "synced",
+        device="cuda",
+    )
+    assert learner._collect_act_graph is None and learner._collect_post_graph is None
+
+    for env, overrides in (
+        (FakeEnv(), {}),  # bridged: the env is not on the learner's device
+        (FakeEnv(device="cuda"), {"no_sync": False}),
+        (FakeEnv(device="cuda"), {"stats_on_device": False}),
+    ):
+        with pytest.raises(ValueError, match="collect_graph=True requires"):
+            SuperMimicLearner(
+                env,
+                replace(_config(), collect_graph=True, **overrides),
+                tmp_path / "x",
+                device="cuda",
+            )
 
 
 @needs_cuda

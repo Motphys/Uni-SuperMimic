@@ -69,6 +69,23 @@ def cumprod_without_host_sync(values: torch.Tensor) -> torch.Tensor:
     return _CumprodNoHostSync.apply(values, torch.cumprod(values, 0))
 
 
+def snapshot_tensors(tensors: list[torch.Tensor]) -> Callable[[], None]:
+    """Copy ``tensors`` now; return what writes the copies back.
+
+    The ``snapshot`` of a ``CapturedUpdate`` whose body only mutates tensors at fixed
+    addresses (normalizers, histories, optimizer state). Call it at the capture, so the
+    copies are of the state right before the capture's warm-ups run the body for real.
+    """
+    saved = [tensor.detach().clone() for tensor in tensors]
+
+    def restore() -> None:
+        with torch.no_grad():
+            for tensor, copy in zip(tensors, saved, strict=True):
+                tensor.copy_(copy)
+
+    return restore
+
+
 class CapturedUpdate:
     """Run a fixed-shape learner update step, replayed from a CUDA graph after a warmup.
 
@@ -91,13 +108,24 @@ class CapturedUpdate:
     The returned tensors live in the graph's private memory pool and are overwritten by
     the next replay, so they may only be consumed before it. Positions listed in
     ``clone_outputs`` are cloned after every replay for tensors that outlive the call.
+
+    ``snapshot`` is for bodies that mutate state (an optimizer step): it is called before
+    the capture, because the capture runs the body three times on a side stream for real,
+    and what it returns is called once the graph exists, so that the replay below is the
+    single update this call performs.
     """
 
-    def __init__(self, warmup: int = 3, clone_outputs: tuple[int, ...] = ()) -> None:
+    def __init__(
+        self,
+        warmup: int = 3,
+        clone_outputs: tuple[int, ...] = (),
+        snapshot: Callable[[], Callable[[], None]] | None = None,
+    ) -> None:
         if warmup < 1:
             raise ValueError(f"CapturedUpdate warmup must be positive, got {warmup}")
         self.warmup = warmup
         self.clone_outputs = clone_outputs
+        self.snapshot = snapshot
         self.calls = 0
         self.inputs: dict[str, Any] | None = None
         self.body: Callable[[Any], Any] | None = None
@@ -107,6 +135,26 @@ class CapturedUpdate:
     @property
     def replaying(self) -> bool:
         return self.graph is not None
+
+    @property
+    def warming_up(self) -> bool:
+        """Whether the next call still runs ``body`` in Python (before the capture).
+
+        A body may keep host-side state of its own (a call counter); that advances only
+        while the Python runs, never on a replay.
+        """
+        return self.graph is None and self.calls < self.warmup
+
+    def reset(self) -> None:
+        """Drop the graph; the next call runs ``warmup`` eager steps and captures again.
+
+        For a body bound to optimizer state that ``load_state_dict`` may have moved.
+        """
+        self.calls = 0
+        self.inputs = None
+        self.body = None
+        self.graph = None
+        self.outputs = None
 
     def step(self, body: Callable[[Any], Any], inputs: Inputs) -> Any:
         if self.inputs is None:
@@ -140,27 +188,35 @@ class CapturedUpdate:
 
     def _capture(self) -> None:
         assert self.inputs is not None and self.body is not None
-        device = _flatten(self.inputs)[0].device
+        flattened = _flatten(self.inputs)
+        device = (
+            flattened[0].device if flattened else torch.device("cuda", torch.cuda.current_device())
+        )
         rng_state = torch.cuda.get_rng_state(device)
-        side = torch.cuda.Stream(device)
-        side.wait_stream(torch.cuda.current_stream(device))
-        # Drop the previous outputs first: their autograd graph keeps the parameters'
-        # AccumulateGrad nodes bound to the default stream, which the backward below
-        # runs on other streams (PyTorch warns and inserts stream synchronizations).
-        self.outputs = None
-        with torch.cuda.stream(side):
-            for _ in range(3):
-                self.outputs = None
-                self.outputs = self.body(self.inputs)
+        restore = self.snapshot() if self.snapshot is not None else None
+        try:
+            side = torch.cuda.Stream(device)
+            side.wait_stream(torch.cuda.current_stream(device))
+            # Drop the previous outputs first: their autograd graph keeps the parameters'
+            # AccumulateGrad nodes bound to the default stream, which the backward below
+            # runs on other streams (PyTorch warns and inserts stream synchronizations).
             self.outputs = None
-        torch.cuda.current_stream(device).wait_stream(side)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self.outputs = self.body(self.inputs)
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self.outputs = None
+                    self.outputs = self.body(self.inputs)
+                self.outputs = None
+            torch.cuda.current_stream(device).wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self.outputs = self.body(self.inputs)
+        finally:
+            if restore is not None:
+                restore()
         # The side-stream warmup and the capture consumed random numbers for steps that
         # the replay below redoes: rewind so the replayed update sees the eager sequence.
         torch.cuda.set_rng_state(rng_state, device)
         self.graph = graph
 
 
-__all__ = ["CapturedUpdate"]
+__all__ = ["CapturedUpdate", "snapshot_tensors"]
