@@ -71,4 +71,14 @@ A seed-0 comparison on one RTX 6000D (mjwarp, 4096 environments, the complete 12
 
 The new defaults already pass the previous 8000-iteration return at iteration 4000 (0.9122, 391 failed clips). Attribution from existing runs and logs, without additional training: Muon plus the structured world model reproduce +0.044 training reward over Adam plus the unstructured model at 8000 iterations; the 1024-wide structured world model matches the 2048-wide one at that horizon (training reward 0.891 vs 0.890) and, together with the halved update batches, raises throughput from 2.85 to 4.09 it/s; the budget-aligned schedule anneals the policy by iteration 8000 (lr 1.09e-4 versus 3.99e-4 unannealed), and two 150k runs kept on the old 250k decay peaked near 0.91 around iteration 60000 before degrading to 0.25-0.64, so the shorter decay also removes a long-run instability. The recovered failures spread across motion families (jump 24, crawl 22, sit 15, dance 9, stand 9, push 8, kick 8); flips and rolls remain the hardest residual failures.
 
+## Graph-captured default recipe on unilab 1.6.0 (8000 iterations)
+
+The first results with `env.autoreset_cuda_graph` enabled, measured on unilab 1.6.0 before the learner launch-overhead reductions (#68–#70). Three seeds (mjwarp, 4096 environments, one RTX 4090 per seed, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. Training time is the learner wall time with the one-off compilation still included.
+
+| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | learner wall |
+|---|---:|---:|---:|---:|---:|
+| default recipe with `env.autoreset_cuda_graph` | 0.9322 | 0.9281 | 228 | 99.82% | 0.372 h (22.3 min) |
+
+Steady-state learner throughput was ~6.2 it/s.
+
 [`perf/unilab-115-masked-autoreset-compile`]: https://github.com/Motphys/Uni-SuperMimic/pull/61

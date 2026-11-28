@@ -8,7 +8,7 @@
   <a href="https://arxiv.org/abs/2610.28480"><img src="https://img.shields.io/badge/paper-arXiv--2610.28480-red" alt="论文"></a>
   <a href="https://pypi.org/project/unilab/"><img src="https://img.shields.io/pypi/v/unilab" alt="UniLab PyPI"></a>
   <a href="#结果"><img src="https://img.shields.io/badge/BONES--SEED-129%2C487%20clips-blue" alt="BONES-SEED：129,487 段动作"></a>
-  <a href="#结果"><img src="https://img.shields.io/badge/%E5%8D%95%E5%8D%A1-%E7%BA%A622%20%E5%88%86%E9%92%9F-green" alt="单卡：约 22 分钟"></a>
+  <a href="#结果"><img src="https://img.shields.io/badge/%E5%8D%95%E5%8D%A1-%E7%BA%A615%20%E5%88%86%E9%92%9F-green" alt="单卡：约 15 分钟"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 许可"></a>
 </p>
 
@@ -17,8 +17,8 @@ UniSuperMimic 是 [SuperMimic](https://supermimic.github.io) 在 **UniLab** 上�
 ### 特性亮点
 
 - **大规模 BONES-SEED**：在同一个仓库内完成 129,487 段、4730 万帧动作库的下载、转换、过滤、打包、训练和确定性评估。
-- **图捕获的固定形态 autoreset**：unilab 1.6.0 在 reset 间固定 body-packet 存储并发布调用方所有的 step 输出，reset 段因此以 CUDA 图重放运行——默认 8000 轮 BONES-SEED 配方在**单张 RTX 4090 上约 22 分钟**完成训练（3 seeds 均值：全库 norm_return 0.9322、clip 成功率 99.82%）。
-- **单卡高效**：mjwarp、MuJoCo 和 Motrix 三个后端都支持高效单卡工作流；图捕获 autoreset 链下 learner 吞吐约 6 it/s。
+- **图捕获的固定形态 autoreset**：unilab 1.6.4 在 reset 间固定 body-packet 存储并发布调用方所有的 step 输出，reset 段因此以 CUDA 图重放运行——默认 8000 轮 BONES-SEED 配方在**单张 RTX 4090 上约 15 分钟**完成训练，不含一次性编译（3 seeds 均值：全库 norm_return 0.9314、clip 成功率 99.83%）。
+- **单卡高效**：mjwarp、MuJoCo 和 Motrix 三个后端都支持高效单卡工作流；图捕获 autoreset 链下 learner 吞吐约 8.7 it/s。
 - **三种仿真后端**：策略和数据集配置不变，可在 mjwarp、MuJoCo、Motrix 之间切换。
 
 <p align="center">
@@ -31,7 +31,7 @@ UniSuperMimic 是 [SuperMimic](https://supermimic.github.io) 在 **UniLab** 上�
   <img src="docs/assets/time_comparison.png" alt="各 SuperMimic 项目的训练墙钟时间与报告的跟踪分数对比" width="95%">
 </p>
 
-<p align="center"><em>达到报告结果所需的训练墙钟时间（对数时间轴），右侧为各项目报告的跟踪分数。UniSuperMimic 的各行是同一默认配方在不同硬件与仿真后端上的结果（单 seed；RTX 4090 一行为 3 seeds 均值），其中 MuJoCo 与 Motrix 在 CPU 上仿真、learner 在 GPU 上。历史 run 与消融存档见 <a href="docs/results_history.md">docs/results_history.md</a>（英文）。</em></p>
+<p align="center"><em>达到报告结果所需的训练墙钟时间（对数时间轴），右侧为各项目报告的跟踪分数。UniSuperMimic 的各行是同一默认配方在不同硬件与仿真后端上的结果（单 seed；RTX 4090 一行为 3 seeds 均值），其中 MuJoCo 与 Motrix 在 CPU 上仿真、learner 在 GPU 上；UniSuperMimic 的训练时间不含一次性编译。历史 run 与消融存档见 <a href="docs/results_history.md">docs/results_history.md</a>（英文）。</em></p>
 
 论文：[*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480)，Qiayuan Liao 等。实现参考 `supermimic_vibed`，上游依赖为 PyPI `unilab`。
 
@@ -263,15 +263,15 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
 
 历史结果表与消融（LAFAN1、12000 轮 BONES-SEED、EMA/no-sync、Muon 以及开图前的默认配方）存档于 [docs/results_history.md](docs/results_history.md)（英文）。
 
-默认配方通过单一开关 `env.autoreset_cuda_graph` 启用 unilab 1.6.0 的固定形态 autoreset 全链：masked autoreset、持久 step 载体、延迟有限值校验，以及叠加在任务侧固定地址状态发布载体之上的 reset 段 CUDA 图捕获。确定性评估保持逐行 reset 生命周期，评估契约不变。
+默认配方通过单一开关 `env.autoreset_cuda_graph` 启用 unilab 1.6.4 的固定形态 autoreset 全链：masked autoreset、持久 step 载体、延迟有限值校验，以及叠加在任务侧固定地址状态发布载体之上的 reset 段 CUDA 图捕获。确定性评估保持逐行 reset 生命周期，评估契约不变。
 
-三个 seed（mjwarp、4096 环境、单张 RTX 4090、完整 129,487 段库）；16,384 环境从首帧起无噪声的确定性全库评估。失败段指回放在片段结束前硬终止（摔倒）——即 SuperMimic 家族协议。以下数字为 3 seeds 均值：
+三个 seed（mjwarp、4096 环境、每个 seed 一张 RTX 4090、完整 129,487 段库）；16,384 环境从首帧起无噪声的确定性全库评估。失败段指回放在片段结束前硬终止（摔倒）——即 SuperMimic 家族协议。以下数字为 3 seeds 均值。训练时间是 8000 轮的 learner 墙钟时间去掉一次性编译：首轮 `torch.compile` 的停顿（这几次 run 中为 6–94 秒，取决于编译缓存）被扣除，因此该数字不受缓存冷热影响。
 
-| 策略（8000 轮） | norm return | 帧加权 | 失败段 | 成功率 | 训练墙钟 |
+| 策略（8000 轮） | norm return | 帧加权 | 失败段 | 成功率 | 训练时间（不含一次性编译） |
 |---|---:|---:|---:|---:|---:|
-| 默认配方 + `env.autoreset_cuda_graph` | **0.9322** | **0.9281** | **228** | **99.82%** | **0.372 h（22.3 分钟）** |
+| 默认配方 + `env.autoreset_cuda_graph` | **0.9314** | **0.9271** | **226** | **99.83%** | **15.3 分钟** |
 
-稳态 learner 吞吐约 6.2 it/s；8000 轮全库训练在单张 RTX 4090 上约 22 分钟完成。
+稳态 learner 吞吐约 8.7 it/s（第 1000–8000 轮）；8000 轮在单张 RTX 4090 上约 15 分钟完成。
 
 ![训练曲线（3 seeds 均值）](docs/assets/graph8k_curves.png)
 
