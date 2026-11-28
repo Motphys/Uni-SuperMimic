@@ -31,7 +31,7 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
   <img src="docs/assets/time_comparison.png" alt="Training wall-clock time versus reported tracking score across SuperMimic projects" width="95%">
 </p>
 
-<p align="center"><em>Training wall-clock time to the reported result, with each project's reported tracking score (log-scale time axis). Historical runs and ablations are archived in <a href="docs/results_history.md">docs/results_history.md</a>.</em></p>
+<p align="center"><em>Training wall-clock time to the reported result, with each project's reported tracking score (log-scale time axis). The UniSuperMimic rows run the same default recipe on different hardware and simulation backends (single seed; the RTX 4090 row is a 3-seed mean); MuJoCo and Motrix simulate on the CPU with the learner on the GPU. Historical runs and ablations are archived in <a href="docs/results_history.md">docs/results_history.md</a>.</em></p>
 
 Paper: [*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480), Qiayuan Liao et al. The implementation references `supermimic_vibed` and depends on PyPI `unilab`.
 

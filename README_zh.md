@@ -31,7 +31,7 @@ UniSuperMimic 是 [SuperMimic](https://supermimic.github.io) 在 **UniLab** 上�
   <img src="docs/assets/time_comparison.png" alt="各 SuperMimic 项目的训练墙钟时间与报告的跟踪分数对比" width="95%">
 </p>
 
-<p align="center"><em>达到报告结果所需的训练墙钟时间（对数时间轴），右侧为各项目报告的跟踪分数。历史 run 与消融存档见 <a href="docs/results_history.md">docs/results_history.md</a>（英文）。</em></p>
+<p align="center"><em>达到报告结果所需的训练墙钟时间（对数时间轴），右侧为各项目报告的跟踪分数。UniSuperMimic 的各行是同一默认配方在不同硬件与仿真后端上的结果（单 seed；RTX 4090 一行为 3 seeds 均值），其中 MuJoCo 与 Motrix 在 CPU 上仿真、learner 在 GPU 上。历史 run 与消融存档见 <a href="docs/results_history.md">docs/results_history.md</a>（英文）。</em></p>
 
 论文：[*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480)，Qiayuan Liao 等。实现参考 `supermimic_vibed`，上游依赖为 PyPI `unilab`。
 
