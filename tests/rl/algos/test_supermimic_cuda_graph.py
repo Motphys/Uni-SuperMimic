@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 
 import pytest
@@ -18,7 +19,13 @@ def _eager(**overrides):
     The switches default to ``auto`` (on for NVIDIA CUDA), so a test that isolates one of
     them pins the others to eager / synced whichever device it runs on.
     """
-    values = dict(critic_update="eager", wm_graph=False, policy_graph=False, stats_on_device=False)
+    values = dict(
+        critic_update="eager",
+        wm_graph=False,
+        policy_graph=False,
+        optimizer_graph=False,
+        stats_on_device=False,
+    )
     values.update(overrides)
     return replace(_config(), **values)
 
@@ -324,3 +331,183 @@ def test_policy_update_graph_outputs_outlive_the_next_replay(tmp_path) -> None:
         torch.testing.assert_close(metric, saved, rtol=0, atol=0)
     # The eager clip and optimizer keep reading the gradients the graph writes to.
     assert addresses == [parameter.grad.data_ptr() for parameter in graph.pi.parameters()]
+
+
+def _step_pair(tmp_path, **overrides):
+    """Learners that differ only in ``optimizer_graph``.
+
+    ``optimizer_graph`` replays what follows the gradient graphs, so the eager side keeps
+    those graphs too: both then receive bit-identical gradients and any difference after
+    a step is the step's.
+    """
+    values = dict(pi_batch=64, horizon=4, pi_opt="muon", wm_opt="muon", pi_ema=0.995)
+    values.update(overrides)
+    cfg = _eager(wm_graph=True, policy_graph=True, **values)
+    learners = []
+    for name, optimizer_graph in (("eager", False), ("graph", True)):
+        learner = SuperMimicLearner(
+            FakeEnv(), replace(cfg, optimizer_graph=optimizer_graph), tmp_path / name, device="cuda"
+        )
+        learner.collect(12)
+        learners.append(learner)
+    return learners
+
+
+def _on_the_same_draws(update, *learners):
+    """``update(learner)`` for each learner from the same CUDA RNG state.
+
+    The updates sample replay windows and imagination starts; without the reset the
+    second learner would train on other draws and the comparison would be about those.
+    """
+    results = []
+    for learner in learners:
+        state = torch.cuda.get_rng_state()
+        results.append(update(learner))
+        torch.cuda.set_rng_state(state)
+    return results
+
+
+def _assert_same_step_state(expected: SuperMimicLearner, actual: SuperMimicLearner) -> None:
+    """Parameters, EMA, gradients and optimizer state, bit for bit."""
+    for name in ("wm", "pi", "pi_avg", "critic"):
+        for reference, value in zip(
+            getattr(expected, name).state_dict().values(),
+            getattr(actual, name).state_dict().values(),
+            strict=True,
+        ):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    for name in ("wm", "pi"):
+        for reference, value in zip(
+            getattr(expected, name).parameters(), getattr(actual, name).parameters(), strict=True
+        ):
+            assert (reference.grad is None) == (value.grad is None)
+            if reference.grad is not None:
+                torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+    for name in ("opt_wm", "opt_pi"):
+        for kind in ("muon", "adam"):
+            reference = getattr(getattr(expected, name), kind).state
+            value = getattr(getattr(actual, name), kind).state
+            assert len(reference) == len(value)
+            for (_, reference_state), (_, value_state) in zip(
+                reference.items(), value.items(), strict=True
+            ):
+                assert reference_state.keys() == value_state.keys()
+                for key in reference_state:
+                    torch.testing.assert_close(
+                        value_state[key], reference_state[key], rtol=0, atol=0
+                    )
+    assert expected._ema_updates == actual._ema_updates
+
+
+def _assert_reads_the_iteration_rate(
+    learner: SuperMimicLearner, opt_wm_rate: float, opt_pi_rate: float
+) -> None:
+    """The device rates the step graphs read carry the iteration's learning rate."""
+    for optimizer, rate in ((learner.opt_wm, opt_wm_rate), (learner.opt_pi, opt_pi_rate)):
+        muon_lr, adam_lr = optimizer.learning_rates
+        assert muon_lr.dtype == torch.float64 and muon_lr.item() == rate
+        assert adam_lr.dtype == torch.float32 and adam_lr.item() == pytest.approx(rate)
+        assert optimizer.muon.param_groups[0]["lr"] is muon_lr
+        assert optimizer.adam.param_groups[0]["lr"] is adam_lr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_optimizer_step_graph_matches_the_eager_step_bitwise(tmp_path) -> None:
+    eager, graph = _step_pair(tmp_path)
+    assert not graph._wm_step_graph.replaying and not graph._pi_step_graph.replaying
+
+    for step in range(7):  # 3 eager warmups, the capture call, then pure replays
+        expected, actual = _on_the_same_draws(SuperMimicLearner.wm_update, eager, graph)
+        assert graph._wm_graph.replaying == (step >= 3)
+        assert graph._wm_step_graph.replaying == (step >= 3)
+        for reference, value in zip(expected, actual, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        _assert_same_step_state(eager, graph)
+
+        expected, actual = _on_the_same_draws(SuperMimicLearner.policy_update, eager, graph)
+        assert graph._pi_graph.replaying == (step >= 3)
+        assert graph._pi_step_graph.replaying == (step >= 3)
+        for reference, value in zip(expected, actual, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        _assert_same_step_state(eager, graph)
+        # The EMA advanced once per replay, host-side counter included.
+        assert graph.pi_avg.n_averaged.item() == step + 1 == graph._ema_updates
+
+    # The cosine schedule of ``train`` reaches the graph through the device rates.
+    for learner in (eager, graph):
+        learner.opt_wm.set_lr(3e-4)
+        learner.opt_pi.set_lr(7.5e-5)
+    _assert_reads_the_iteration_rate(graph, 3e-4, 7.5e-5)
+    for _ in range(3):
+        _on_the_same_draws(SuperMimicLearner.wm_update, eager, graph)
+        _on_the_same_draws(SuperMimicLearner.policy_update, eager, graph)
+        _assert_same_step_state(eager, graph)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_optimizer_step_graph_zeroes_a_non_finite_gradient_like_eager(tmp_path) -> None:
+    eager, graph = _step_pair(tmp_path)
+    for _ in range(5):  # past the capture call
+        _on_the_same_draws(SuperMimicLearner.policy_update, eager, graph)
+    assert graph._pi_step_graph.replaying
+    _assert_same_step_state(eager, graph)
+    for learner in (eager, graph):
+        # Directly onto the gradients, past the gradient graph that would overwrite them.
+        for parameter in learner.pi.parameters():
+            parameter.grad.fill_(float("nan"))
+    expected = eager._pi_step()
+    actual = graph._pi_step_replayed()
+    assert torch.isnan(expected) and torch.isnan(actual)
+    # ``no_sync`` training steps with the gradients zeroed instead of skipping.
+    _assert_same_step_state(eager, graph)
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in graph.pi.parameters())
+    assert any(
+        torch.count_nonzero(value)
+        for state in graph.opt_pi.muon.state.values()
+        for value in state.values()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_optimizer_step_graph_resumes_from_an_eager_checkpoint_bitwise(tmp_path) -> None:
+    teacher, _ = _step_pair(tmp_path / "teacher")
+    for _ in range(6):
+        teacher.wm_update()
+        teacher.policy_update()
+    teacher.save()
+    checkpoint = tmp_path / "teacher" / "eager" / "last.pt"
+
+    # Fresh learners: eager, and with the step graphs warming up again after ``load``.
+    eager, graph = _step_pair(tmp_path / "resumed")
+    for learner in (eager, graph):
+        learner.load(checkpoint)
+    assert not graph._wm_step_graph.replaying and not graph._pi_step_graph.replaying
+    for step in range(7):
+        expected, actual = _on_the_same_draws(SuperMimicLearner.wm_update, eager, graph)
+        for reference, value in zip(expected, actual, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        expected, actual = _on_the_same_draws(SuperMimicLearner.policy_update, eager, graph)
+        assert graph._wm_step_graph.replaying == (step >= 3)
+        assert graph._pi_step_graph.replaying == (step >= 3)
+        for reference, value in zip(expected, actual, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        _assert_same_step_state(eager, graph)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_optimizer_step_graph_replay_never_synchronizes(tmp_path) -> None:
+    _, graph = _step_pair(tmp_path)
+    for _ in range(4):
+        graph.wm_update()
+        graph.policy_update()
+    assert graph._wm_step_graph.replaying and graph._pi_step_graph.replaying
+    torch.cuda.synchronize()
+    with warnings.catch_warnings():
+        # The mode is a prototype; its warning is not what this test is about.
+        warnings.simplefilter("ignore", UserWarning)
+        torch.cuda.set_sync_debug_mode(2)  # any synchronizing CUDA operation raises
+        try:
+            graph._wm_step_graph.step(graph._wm_step_body, {})
+            graph._pi_step_graph.step(graph._pi_step_body, {})
+        finally:
+            torch.cuda.set_sync_debug_mode(0)

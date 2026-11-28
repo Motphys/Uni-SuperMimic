@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import warnings
 from dataclasses import dataclass, replace
 
 import pytest
 import torch
+import torch.nn as nn
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
@@ -971,3 +973,68 @@ def test_margin_fail_ema_is_logged_to_tensorboard(tmp_path) -> None:
     # refresh yet); every later window-1 iteration carries the refreshed mean.
     assert [event.step for event in events] == [2, 3]
     assert all(event.value == pytest.approx(0.42) for event in events)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capturable_muon_adam_is_the_stock_step_bitwise_and_swaps_checkpoints() -> None:
+    """``capturable`` only moves the learning rates into device tensors for a CUDA graph:
+    every update is the stock one bit for bit, and either kind of checkpoint loads into
+    either kind of optimizer."""
+    torch.manual_seed(0)
+    stock_net = nn.Sequential(
+        nn.Linear(16, 24),
+        nn.Linear(24, 24),
+        nn.Linear(24, 24),
+        nn.Linear(24, 4),
+    ).cuda()
+    capturable_net = copy.deepcopy(stock_net)
+    stock = MuonAdam(stock_net, [stock_net], lr=1e-3, fused=True)
+    capturable = MuonAdam(capturable_net, [capturable_net], lr=1e-3, fused=True, capturable=True)
+    assert stock.learning_rates is None
+
+    def step(seed: int, rate: float) -> None:
+        for net, optimizer in ((stock_net, stock), (capturable_net, capturable)):
+            optimizer.set_lr(rate)
+            torch.manual_seed(seed)
+            for parameter in net.parameters():
+                parameter.grad = torch.randn_like(parameter)
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            optimizer.step()
+
+    def assert_bitwise() -> None:
+        for reference, value in zip(
+            stock_net.parameters(), capturable_net.parameters(), strict=True
+        ):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        for kind in ("muon", "adam"):
+            reference_states = getattr(stock, kind).state
+            value_states = getattr(capturable, kind).state
+            for (_, reference_state), (_, value_state) in zip(
+                reference_states.items(), value_states.items(), strict=True
+            ):
+                for key in reference_state:
+                    torch.testing.assert_close(
+                        value_state[key], reference_state[key], rtol=0, atol=0
+                    )
+
+    for seed in range(200):  # Adam's bias correction changes at every one of these steps
+        step(seed, 1e-3 if seed < 150 else 5e-4)
+        assert_bitwise()
+    muon_lr, adam_lr = capturable.learning_rates
+    assert muon_lr.dtype == torch.float64 and muon_lr.item() == 5e-4
+    assert adam_lr.dtype == torch.float32 and adam_lr.item() == pytest.approx(5e-4)
+    assert stock.muon.param_groups[0]["lr"] == 5e-4
+
+    stock_checkpoint, capturable_checkpoint = stock.state_dict(), capturable.state_dict()
+    stock.load_state_dict(capturable_checkpoint)
+    capturable.load_state_dict(stock_checkpoint)
+    # The stock optimizer is back on a float rate (Adam's came through float32, Muon's
+    # through float64 exactly); the capturable one on its own tensors.
+    assert isinstance(stock.muon.param_groups[0]["lr"], float)
+    assert stock.muon.param_groups[0]["lr"] == 5e-4
+    assert stock.adam.param_groups[0]["lr"] == pytest.approx(5e-4)
+    assert capturable.muon.param_groups[0]["lr"] is muon_lr
+    assert capturable.adam.param_groups[0]["lr"] is adam_lr
+    for seed in range(200, 220):
+        step(seed, 2e-4)
+        assert_bitwise()

@@ -6,8 +6,9 @@ import json
 import math
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -110,9 +111,17 @@ class SuperMimicConfig:
     # ``wm_graph`` / ``policy_graph`` replay the gradient step of ``wm_update`` / of
     # the policy in ``policy_update`` (imagination rollout + objective + backward) from
     # an explicit CUDA graph with persistent input buffers. Gradient clipping and the
-    # optimizer step stay eager.
+    # optimizer step stay eager unless ``optimizer_graph`` replays them too.
     wm_graph: bool | None = None
     policy_graph: bool | None = None
+    # ``optimizer_graph`` replays the optimizer step that follows each gradient graph
+    # as well: ``wm_update``'s gradient clipping and step, and the policy's clipping,
+    # gated step and EMA. The learning rate then lives in device tensors and the step
+    # is the stock one bit for bit. It needs the gradient graph of the same update
+    # (the gradients have to stay at the address the step was recorded with) and, for
+    # the policy, ``no_sync`` (a step skipped on the host is a host branch); wherever
+    # those are missing that step stays eager.
+    optimizer_graph: bool | None = None
     # ``stats_on_device`` keeps the collect-side logging statistics (sim_rew, ep_len,
     # ep_ret_norm, term_frac, exam_survival) on the device: the synced path's one
     # ``float(done.sum())`` per collect step (plus two more when an episode ends)
@@ -352,6 +361,27 @@ class SuperMimicLearner:
             )
         self._wm_graph_enabled = follow_device(cfg.wm_graph, "wm_graph")
         self._pi_graph_enabled = follow_device(cfg.policy_graph, "policy_graph")
+        self._opt_graph_enabled = follow_device(cfg.optimizer_graph, "optimizer_graph")
+        if cfg.optimizer_graph and (
+            cfg.wm_opt != "muon"
+            or cfg.pi_opt != "muon"
+            or not self._wm_graph_enabled
+            or not self._pi_graph_enabled
+            or not cfg.no_sync
+        ):
+            raise ValueError(
+                "SuperMimicConfig.optimizer_graph=True requires wm_opt='muon' and "
+                "pi_opt='muon', wm_graph and policy_graph on NVIDIA CUDA, and no_sync"
+            )
+        self._wm_step_graph_enabled = (
+            self._opt_graph_enabled and self._wm_graph_enabled and cfg.wm_opt == "muon"
+        )
+        self._pi_step_graph_enabled = (
+            self._opt_graph_enabled
+            and self._pi_graph_enabled
+            and cfg.pi_opt == "muon"
+            and cfg.no_sync
+        )
         # The device-side statistics run on any device (host bridges move the transition to
         # the learner device first); ``auto`` follows NVIDIA CUDA, where the per-step sync
         # they remove actually stalls the host.
@@ -408,6 +438,7 @@ class SuperMimicLearner:
                 lr=cfg.lr,
                 betas=(0.9, 0.999),
                 fused=fused_adam,
+                capturable=self._wm_step_graph_enabled,
             )
         else:
             self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr, fused=fused_adam)
@@ -418,6 +449,7 @@ class SuperMimicLearner:
                 lr=cfg.lr,
                 betas=(0.9, 0.95),
                 fused=fused_adam,
+                capturable=self._pi_step_graph_enabled,
             )
         else:
             self.opt_pi = torch.optim.Adam(
@@ -498,6 +530,29 @@ class SuperMimicLearner:
         # the training loop keeps past the next replay.
         self._wm_graph = CapturedUpdate() if self._wm_graph_enabled else None
         self._pi_graph = CapturedUpdate(clone_outputs=(0, 4, 7)) if self._pi_graph_enabled else None
+        # ... and over the optimizer steps that follow them. Both graphs warm up for the
+        # same number of calls and the gradient step precedes its optimizer step, so by the
+        # time a step graph is recorded the gradient graph is already replaying and the
+        # gradients sit at the address they keep from then on.
+        self._wm_step_graph = (
+            CapturedUpdate(
+                snapshot=partial(self._snapshot_step, [self.wm], cast(MuonAdam, self.opt_wm))
+            )
+            if self._wm_step_graph_enabled
+            else None
+        )
+        self._pi_step_graph = (
+            CapturedUpdate(
+                clone_outputs=(0,),
+                snapshot=partial(
+                    self._snapshot_step,
+                    [self.pi] + ([self.pi_avg.module] if self.pi_avg is not None else []),
+                    cast(MuonAdam, self.opt_pi),
+                ),
+            )
+            if self._pi_step_graph_enabled
+            else None
+        )
 
         with (self.log_dir / "args.json").open("w", encoding="utf-8") as stream:
             json.dump(asdict(cfg), stream, indent=2)
@@ -778,11 +833,54 @@ class SuperMimicLearner:
             loss, last_error = self._wm_loss_grads(window)
         else:
             loss, last_error = graph.step(self._wm_loss_grads, window)
-        nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
-        self.opt_wm.step()
+        step_graph = self._wm_step_graph
+        if step_graph is None:
+            self._wm_step()
+        else:
+            step_graph.step(self._wm_step_body, {})
         mask = window["mask"][:, -1]
         mean_last_error = (last_error.detach() * mask).sum() / mask.sum().clamp(min=1)
         return loss.detach() / self.cfg.wm_window, mean_last_error
+
+    def _wm_step(self) -> None:
+        """Clip the world-model gradients and apply one optimizer step."""
+        nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
+        self.opt_wm.step()
+
+    def _wm_step_body(self, _inputs: dict[str, Any]) -> tuple:
+        # The ``optimizer_graph`` body: the eager step above, read by the graph.
+        self._wm_step()
+        return ()
+
+    def _snapshot_step(self, modules: list[nn.Module], optimizer: MuonAdam) -> Callable[[], None]:
+        """Snapshot what an optimizer step mutates; return what restores it.
+
+        ``CapturedUpdate`` runs its body for real three times on a side stream before
+        recording it. A step moves the parameters, their gradients (the clipping), the
+        optimizer state and, for the policy, the EMA together with the call counters
+        ``_update_ema`` keeps on the host, so all of it is put back once the graph
+        exists; the replay is then the single update the call performs.
+        """
+        tensors: list[torch.Tensor] = []
+        for module in modules:
+            parameters = list(module.parameters())
+            tensors += parameters
+            tensors += [parameter.grad for parameter in parameters if parameter.grad is not None]
+            tensors += list(module.buffers())
+        tensors += optimizer.state_tensors()
+        saved = [tensor.detach().clone() for tensor in tensors]
+        ema_updates = self._ema_updates
+        averaged = int(self.pi_avg.n_averaged) if self.pi_avg is not None else 0
+
+        def restore() -> None:
+            with torch.no_grad():
+                for tensor, snapshot in zip(tensors, saved, strict=True):
+                    tensor.copy_(snapshot)
+            self._ema_updates = ema_updates
+            if self.pi_avg is not None:
+                self.pi_avg.n_averaged.fill_(averaged)
+
+        return restore
 
     def _advance_exam_schedule(self, iteration: int) -> None:
         """Activate exams at ``exam_start_iter`` and ramp the imagination share.
@@ -967,6 +1065,45 @@ class SuperMimicLearner:
             capturable=True,
         )
 
+    def _pi_step(self) -> torch.Tensor:
+        """Clip the policy gradients, apply the optimizer step and advance the EMA.
+
+        Returns the total gradient norm before clipping. With ``no_sync`` a non-finite
+        gradient zeroes the step on the device instead of skipping it on the host.
+        """
+        grad_norm = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
+        nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
+        if self.cfg.no_sync:
+            # Skip a non-finite update without reading the norm on the host: zero the
+            # gradients on-device instead of branching on ``torch.isfinite``.
+            finite = torch.isfinite(grad_norm)
+            for parameter in self.pi.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.copy_(torch.where(finite, parameter.grad, 0.0))
+            self.opt_pi.step()
+        elif torch.isfinite(grad_norm):
+            self.opt_pi.step()
+        if self.pi_avg is not None:
+            self._update_ema()
+        return grad_norm
+
+    def _pi_step_body(self, _inputs: dict[str, Any]) -> tuple[torch.Tensor]:
+        # The ``optimizer_graph`` body: ``_pi_step``, which reads nothing on the host
+        # in its ``no_sync`` form (``optimizer_graph`` requires that setting).
+        return (self._pi_step(),)
+
+    def _pi_step_replayed(self) -> torch.Tensor:
+        """``_pi_step`` through the ``optimizer_graph`` graph."""
+        step_graph = self._pi_step_graph
+        assert step_graph is not None
+        python_ran = step_graph.warming_up
+        grad_norm = step_graph.step(self._pi_step_body, {})[0]
+        if self.pi_avg is not None and not python_ran:
+            # The EMA's call counters are host state, which a replay cannot advance.
+            self._ema_updates += 1
+            self.pi_avg.n_averaged += 1
+        return grad_norm
+
     def policy_update(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1019,20 +1156,8 @@ class SuperMimicLearner:
                         "v_std": self._v_std,
                     },
                 )
-            grad_norm = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
-            nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
-            if self.cfg.no_sync:
-                # Skip a non-finite update without reading the norm on the host: zero the
-                # gradients on-device instead of branching on ``torch.isfinite``.
-                finite = torch.isfinite(grad_norm)
-                for parameter in self.pi.parameters():
-                    if parameter.grad is not None:
-                        parameter.grad.copy_(torch.where(finite, parameter.grad, 0.0))
-                self.opt_pi.step()
-            elif torch.isfinite(grad_norm):
-                self.opt_pi.step()
-            if self.pi_avg is not None:
-                self._update_ema()
+            step_graph = self._pi_step_graph
+            grad_norm = self._pi_step() if step_graph is None else self._pi_step_replayed()
         finally:
             _set_requires_grad(self.wm, True)
             _set_requires_grad(self.critic, True)
@@ -1377,6 +1502,20 @@ class SuperMimicLearner:
         self.opt_wm.load_state_dict(checkpoint["opt_wm"])
         self.opt_pi.load_state_dict(checkpoint["opt_pi"])
         self.opt_v.load_state_dict(checkpoint["opt_v"])
+        if self._critic_graph_enabled:
+            # ``Optimizer.load_state_dict`` installs the saved param groups wholesale. A
+            # checkpoint from the eager critic loop (or from before the graph existed)
+            # carries ``capturable=False`` and a float learning rate; the captured loop
+            # needs the capturable fused kernel, and torch refuses to record anything
+            # else. ``_sync_critic_lr`` puts its device rate back before the capture.
+            for group in self.opt_v.param_groups:
+                group["capturable"] = True
+                group["fused"] = True
+        # The step graphs are bound to optimizer state that the loads above may have moved:
+        # they warm up and are recorded again on their next use.
+        for graph in (self._wm_step_graph, self._pi_step_graph):
+            if graph is not None:
+                graph.reset()
         self.iteration = checkpoint["iteration"]
         self.wall_time = checkpoint["wall_time"]
         self.sim_steps = checkpoint["sim_steps"]
@@ -1746,8 +1885,11 @@ class SuperMimicLearner:
                     iteration_start = time.time()
                     learning_rate = self.lr_at(iteration)
                     for optimizer in (self.opt_wm, self.opt_pi, self.opt_v):
-                        for group in optimizer.param_groups:
-                            group["lr"] = learning_rate
+                        if isinstance(optimizer, MuonAdam):
+                            optimizer.set_lr(learning_rate)
+                        else:
+                            for group in optimizer.param_groups:
+                                group["lr"] = learning_rate
                     step_accumulator += 1.0 / self.cfg.utd
                     collect_steps = int(step_accumulator)
                     step_accumulator -= collect_steps

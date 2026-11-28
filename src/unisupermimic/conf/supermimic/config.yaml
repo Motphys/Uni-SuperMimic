@@ -79,12 +79,17 @@ algo:
   test_hidden_dims: null
   # Host launch-overhead reductions. wm_graph / policy_graph replay the gradient step of
   # wm_update / of the policy in policy_update (imagination rollout + objective +
-  # backward) from an explicit CUDA graph with persistent input buffers; clipping and the
-  # optimizer step stay eager and the math is unchanged. Tri-state: null (the default)
-  # enables them on NVIDIA CUDA and keeps them off anywhere else, true requires NVIDIA
-  # CUDA, false forces the original path.
+  # backward) from an explicit CUDA graph with persistent input buffers; the math is
+  # unchanged. Tri-state: null (the default) enables them on NVIDIA CUDA and keeps them
+  # off anywhere else, true requires NVIDIA CUDA, false forces the original path.
   wm_graph: null
   policy_graph: null
+  # optimizer_graph replays the optimizer step after each of those graphs as well
+  # (gradient clipping, Muon/Adam step, policy EMA) from a CUDA graph, bit-identical to
+  # the eager step, with the learning rate read from device tensors. It needs the
+  # gradient graph of the same update and no_sync; otherwise that step stays eager.
+  # Tri-state the same way.
+  optimizer_graph: null
   # C++ inductor wrapper: launches the compiled Triton kernels without the Python
   # launcher. Opt-in, because it costs a slow C++ compile on every cold cache and gains
   # little once the graphs above are on.
