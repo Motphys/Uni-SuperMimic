@@ -17,8 +17,8 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
 ### Highlights
 
 - **BONES-SEED at scale**: download, convert, filter, pack, train on, and deterministically evaluate a 129,487-clip / 47.3M-frame motion library from one repository.
-- **Graph-captured fixed-shape autoreset**: unilab 1.6.4 pins body-packet storage across resets and publishes caller-owned step outputs, so the reset segment runs as a replayed CUDA graph — the default 8,000-iteration BONES-SEED recipe trains in **about 15 minutes on one RTX 4090**, one-off compilation excluded (mean of 3 seeds: 0.9314 full-library norm return, 99.83% clip success rate).
-- **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow; learner throughput reaches ~8.7 it/s with the graph-captured autoreset chain.
+- **Graph-captured fixed-shape autoreset**: unilab 1.6.4 pins body-packet storage across resets and publishes caller-owned step outputs, so the reset segment runs as a replayed CUDA graph — the default 8,000-iteration BONES-SEED recipe trains in **about 15 minutes on one RTX 4090** or **about 14 minutes on one RTX 5090**, one-off compilation excluded (mean of 3 seeds per GPU: 0.9313 and 0.9300 full-library norm return, 99.8% clip success rate).
+- **Single-GPU efficiency**: mjwarp, MuJoCo, and Motrix all support an efficient one-GPU workflow; learner throughput reaches ~8.8 it/s on one RTX 4090 and ~9.7 it/s on one RTX 5090 with the graph-captured autoreset chain and the learner-side CUDA graphs.
 - **Three simulation backends**: switch between mjwarp, MuJoCo, and Motrix without changing the policy or dataset configuration.
 
 <p align="center">
@@ -31,7 +31,7 @@ UniSuperMimic is an independent downstream reproduction of [SuperMimic](https://
   <img src="docs/assets/time_comparison.png" alt="Training wall-clock time versus reported tracking score across SuperMimic projects" width="95%">
 </p>
 
-<p align="center"><em>Training wall-clock time to the reported result, with each project's reported tracking score (log-scale time axis). The UniSuperMimic rows run the same default recipe on different hardware and simulation backends (single seed; the RTX 4090 row is a 3-seed mean); MuJoCo and Motrix simulate on the CPU with the learner on the GPU; UniSuperMimic training times exclude one-off compilation. Historical runs and ablations are archived in <a href="docs/results_history.md">docs/results_history.md</a>.</em></p>
+<p align="center"><em>Training wall-clock time to the reported result, with each project's reported tracking score (log-scale time axis). The UniSuperMimic rows run the same default recipe on different hardware and simulation backends (the RTX 4090 and RTX 5090 rows are 3-seed means, the others single seed); MuJoCo and Motrix simulate on the CPU with the learner on the GPU; UniSuperMimic training times exclude one-off compilation. Historical runs and ablations are archived in <a href="docs/results_history.md">docs/results_history.md</a>.</em></p>
 
 Paper: [*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480), Qiayuan Liao et al. The implementation references `supermimic_vibed` and depends on PyPI `unilab`.
 
@@ -263,17 +263,18 @@ By default, the reference root XY is aligned with the policy to highlight whole-
 
 Previous result tables and ablations (LAFAN1, the 12000-iteration BONES-SEED run, EMA/no-sync, Muon, and the pre-graph default recipe) are archived in [docs/results_history.md](docs/results_history.md).
 
-The default recipe trains with unilab 1.6.4's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged.
+The default recipe trains with unilab 1.6.4's fixed-shape autoreset chain enabled through the single `env.autoreset_cuda_graph` switch: masked autoreset, persistent step buffers, deferred finite validation, and reset-segment CUDA graph capture on top of the task-side fixed-address state-publication carriers. Deterministic evaluation keeps the selected-row reset lifecycle, so the evaluation contract is unchanged. On NVIDIA CUDA the learner also replays its fixed-shape work from CUDA graphs, on by default: the critic loop and the world-model and policy gradient steps (`algo.critic_update`, `algo.wm_graph`, `algo.policy_graph`), their optimizer steps (`algo.optimizer_graph`), and the learner's own work around each `env.step` of a collect step (`algo.collect_graph`). Each replay is bit-identical to the eager computation, and each switch takes the eager path on other devices.
 
-Three seeds (mjwarp, 4096 environments, one RTX 4090 per seed, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol. Reported numbers are the mean of the three seeds. Training time is the learner wall time of the 8,000 iterations with one-off compilation removed: the first-iteration `torch.compile` stall (6–94 s in these runs, depending on the compile cache) is subtracted, so the number does not depend on the cache state.
+Three seeds per GPU (mjwarp, 4096 environments, one RTX 4090 or one RTX 5090 per seed, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. A failed clip is one whose rollout hard-terminates (falls) before the clip ends — the SuperMimic-family protocol. Reported numbers are the mean of the three seeds. Training time is the learner wall time of the 8,000 iterations with one-off compilation removed: the first-iteration `torch.compile` stall (5–12 s in these runs, depending on the compile cache) is subtracted, so the number does not depend on the cache state.
 
-| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | training time (compile excluded) |
-|---|---:|---:|---:|---:|---:|
-| default recipe with `env.autoreset_cuda_graph` | **0.9314** | **0.9271** | **226** | **99.83%** | **15.3 min** |
+| default recipe (8000 iterations) | GPU | norm return | frame-weighted | failed clips | success rate | training time (compile excluded) |
+|---|---|---:|---:|---:|---:|---:|
+| `env.autoreset_cuda_graph` + learner CUDA graphs | 1× RTX 4090 | **0.9313** | **0.9270** | **230** | **99.82%** | **15.1 min** |
+| `env.autoreset_cuda_graph` + learner CUDA graphs | 1× RTX 5090 | **0.9300** | **0.9258** | **213** | **99.84%** | **13.8 min** |
 
-Steady-state learner throughput is ~8.7 it/s (iterations 1000–8000); the 8,000 iterations take about 15 minutes on a single RTX 4090.
+Steady-state learner throughput is ~8.8 it/s on one RTX 4090 and ~9.7 it/s on one RTX 5090 (iterations 1000–8000). The RTX 5090 host (Xeon Platinum 8380) has roughly a third of the single-core speed of the RTX 4090 hosts (Ryzen 9 9950X); with the learner-side CUDA graphs the host's remaining work per iteration is below the GPU time on both machines, so the iteration time is set by the GPU.
 
-![Training curves, mean of 3 seeds](docs/assets/graph8k_curves.png)
+![Training curves, per-iteration mean of 3 seeds, RTX 4090 vs RTX 5090](docs/assets/graph8k_curves.png)
 
 ## Tests
 

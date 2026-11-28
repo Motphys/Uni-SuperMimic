@@ -81,4 +81,14 @@ The first results with `env.autoreset_cuda_graph` enabled, measured on unilab 1.
 
 Steady-state learner throughput was ~6.2 it/s.
 
+## Default recipe before the optimizer and collector CUDA graphs (8000 iterations)
+
+Measured on main at `5cbbf13` (unilab 1.6.4, after #68–#72 and before the optimizer-step and collect-step CUDA graphs and the asynchronous iteration reads). Three seeds (mjwarp, 4096 environments, one RTX 4090 per seed, the complete 129,487-clip library); deterministic full-library evaluation with 16,384 environments from frame zero without noise. Training time is the learner wall time with the one-off compilation removed, as in the README.
+
+| policy (8000 iterations) | norm return | frame-weighted | failed clips | success rate | training time (compile excluded) |
+|---|---:|---:|---:|---:|---:|
+| default recipe with `env.autoreset_cuda_graph` | 0.9314 | 0.9271 | 226 | 99.83% | 15.3 min |
+
+Steady-state learner throughput was ~8.7 it/s.
+
 [`perf/unilab-115-masked-autoreset-compile`]: https://github.com/Motphys/Uni-SuperMimic/pull/61
